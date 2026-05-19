@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.venv/
+venv/
+.env
+.env.*
+
+# Data — ses dosyaları ve model ağırlıkları repo'ya girmez
+data/raw/*
+!data/raw/.gitkeep
+!data/raw/MANIFEST.md
+data/models/
+*.wav
+*.flac
+*.mp3
+*.ogg
+*.m4a
+*.opus
+*.ckpt
+*.pt
+*.pth
+*.safetensors
+*.bin
+*.onnx
+*.gguf
+
+# Experiments output
+experiments/*/output/
+experiments/*/wandb/
+experiments/*/checkpoints/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Private (üst-katman kuralıyla aynı)
+private/
+secrets/
+*.pem
+*.key
+credentials.*
