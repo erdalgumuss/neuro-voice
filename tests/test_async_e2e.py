@@ -397,6 +397,153 @@ async def test_sync_tts_stream_proxy_yields_riff_wav(setup):
         app.dependency_overrides.clear()
 
 
+async def test_xautoclaim_recovers_job_after_transient_failure(setup):
+    """D-06 at-least-once chaos path: engine crashes on the first
+    attempt (TransientFailure → no XACK), then the consumer's periodic
+    XAUTOCLAIM re-claims the stale PEL entry, the engine has recovered,
+    job completes, client sees status=complete.
+
+    We use a SINGLE worker with a flaky engine (crash once, succeed
+    after) instead of two workers because aiosqlite's single-connection
+    model makes two concurrent worker sessions race on the same DB
+    cursor (real Postgres would be fine; production deployment is
+    inherently multi-worker)."""
+    from fastapi.testclient import TestClient
+
+    from server.auth import get_redis
+    from server.main import app
+    from server.queue import DEFAULT_STREAM, TtsJobQueue, get_queue
+    from worker.consumer import WorkerConsumer
+
+    class _FlakyEngine(_StubEngine):
+        """Crash on first synthesize_stream call, succeed thereafter."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self._calls = 0
+
+        def synthesize_stream(self, **kw):
+            self._calls += 1
+            if self._calls == 1:
+                raise RuntimeError("simulated transient GPU OOM")
+            yield from super().synthesize_stream(**kw)
+
+    fake_redis = fakeredis.aioredis.FakeRedis()
+    queue = TtsJobQueue(fake_redis, stream=DEFAULT_STREAM)
+    app.dependency_overrides[get_redis] = lambda: fake_redis
+    app.dependency_overrides[get_queue] = lambda: queue
+
+    stop = asyncio.Event()
+    # Short xautoclaim_min_idle_ms so we don't wait 30s in the test.
+    consumer = WorkerConsumer(
+        redis=fake_redis, engine=_FlakyEngine(),
+        archive_to_r2=setup["archive"],
+        stop_event=stop, block_ms=10,
+        xautoclaim_min_idle_ms=100,
+        xautoclaim_period_s=0.1,
+    )
+    worker_task = asyncio.create_task(consumer.run())
+
+    try:
+        with TestClient(app) as client:
+            client.headers["Authorization"] = f"Bearer {setup['bearer']}"
+            _enroll_voice(client, voice_id="chaos-voice")
+
+            rid = str(uuid.uuid4())
+            r = client.post(
+                "/v1/tts/jobs",
+                headers={"Idempotency-Key": rid},
+                json={"text": "Chaos test.", "voice_id": "chaos-voice"},
+            )
+            assert r.status_code == 202
+
+            deadline = asyncio.get_event_loop().time() + 5.0
+            body = None
+            while asyncio.get_event_loop().time() < deadline:
+                r = client.get(f"/v1/tts/jobs/{rid}")
+                body = r.json()
+                if body["status"] == "complete":
+                    break
+                await asyncio.sleep(0.05)
+
+            assert body is not None
+            assert body["status"] == "complete", (
+                f"XAUTOCLAIM never recovered: {body}\n"
+                f"transient={consumer.transient_failures} "
+                f"acked={consumer.acked} claimed={consumer.claimed}"
+            )
+            # Exactly one transient failure (the first call) and one
+            # ACK after the retry; XAUTOCLAIM re-handed the same entry.
+            assert consumer.transient_failures == 1
+            assert consumer.acked >= 1
+    finally:
+        stop.set()
+        try:
+            await asyncio.wait_for(worker_task, timeout=2.0)
+        except asyncio.TimeoutError:
+            worker_task.cancel()
+        app.dependency_overrides.clear()
+
+
+async def test_job_body_hash_conflict_returns_409_e2e(setup):
+    """End-to-end version of the Stripe-style body_hash guard. Issuing
+    the same Idempotency-Key with a different text triggers 409 with a
+    structured error envelope (audit fix F1 + #4 in pipeline tests).
+    Confirms the contract holds with a real worker running."""
+    from fastapi.testclient import TestClient
+
+    from server.auth import get_redis
+    from server.main import app
+    from server.queue import DEFAULT_STREAM, TtsJobQueue, get_queue
+    from worker.consumer import WorkerConsumer
+
+    fake_redis = fakeredis.aioredis.FakeRedis()
+    queue = TtsJobQueue(fake_redis, stream=DEFAULT_STREAM)
+    app.dependency_overrides[get_redis] = lambda: fake_redis
+    app.dependency_overrides[get_queue] = lambda: queue
+
+    stop = asyncio.Event()
+    consumer = WorkerConsumer(
+        redis=fake_redis, engine=_StubEngine(),
+        archive_to_r2=setup["archive"],
+        stop_event=stop, block_ms=10,
+    )
+    worker_task = asyncio.create_task(consumer.run())
+
+    try:
+        with TestClient(app) as client:
+            client.headers["Authorization"] = f"Bearer {setup['bearer']}"
+            _enroll_voice(client, voice_id="conflict-voice")
+
+            rid = str(uuid.uuid4())
+            r1 = client.post(
+                "/v1/tts/jobs",
+                headers={"Idempotency-Key": rid},
+                json={"text": "Original text.", "voice_id": "conflict-voice"},
+            )
+            assert r1.status_code == 202
+
+            # Same key + DIFFERENT body → 409.
+            r2 = client.post(
+                "/v1/tts/jobs",
+                headers={"Idempotency-Key": rid},
+                json={"text": "Tampered text.", "voice_id": "conflict-voice"},
+            )
+            assert r2.status_code == 409
+            detail = r2.json()["detail"]
+            assert detail["error"] == "idempotency_conflict"
+            assert detail["original_status"] in {
+                "processing", "complete", "failed",
+            }
+    finally:
+        stop.set()
+        try:
+            await asyncio.wait_for(worker_task, timeout=2.0)
+        except asyncio.TimeoutError:
+            worker_task.cancel()
+        app.dependency_overrides.clear()
+
+
 async def test_gateway_idempotency_complete_status_after_worker(setup):
     """Same key replay AFTER worker completed must return deduplicated +
     status=complete (no double-processing)."""
