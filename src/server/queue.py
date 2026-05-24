@@ -37,6 +37,7 @@ from redis.asyncio import Redis
 logger = logging.getLogger("nqai_voice.queue")
 
 DEFAULT_STREAM = "nqai.tts.jobs"
+DEFAULT_DLQ_STREAM = "nqai.tts.jobs.dlq"
 DEFAULT_MAXLEN = 10_000  # XADD MAXLEN ~ trims the stream to this approx size
 
 RESULTS_STREAM_PREFIX = "nqai.tts.results."
@@ -70,6 +71,11 @@ class TtsJobPayload:
     params: dict[str, Any] | None = None  # cfg_value, inference_timesteps overrides
     app_label: str | None = None  # product attribution from X-NQAI-App header
     callback_url: str | None = None  # Faz B+: server-to-server completion hook
+    # B.1 hardening metadata. Retry authority is Redis PEL delivery
+    # count; `attempt` travels with the payload for DLQ/requeue
+    # diagnostics and future explicit requeue flows.
+    attempt: int = 0
+    enqueued_at_ms: int | None = None
 
     def encode(self) -> dict[str, str]:
         """Render to Redis-friendly field/value pairs. Streams accept

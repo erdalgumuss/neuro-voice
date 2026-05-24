@@ -58,7 +58,9 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from redis.asyncio import Redis
+from sqlalchemy import select
 
+from db.models import UsageRecord
 from db.session import AsyncSessionLocal
 from repos import IdempotencyRepo, UsageRepo, VoiceRepo
 from server.queue import (
@@ -174,6 +176,64 @@ async def publish_error(
     )
 
 
+def _queue_wait_ms(job: TtsJobPayload, started_wall_ms: int | None = None) -> int | None:
+    if job.enqueued_at_ms is None:
+        return None
+    now_ms = started_wall_ms if started_wall_ms is not None else int(time.time() * 1000)
+    return max(0, now_ms - int(job.enqueued_at_ms))
+
+
+async def mark_terminal_failure(
+    job: TtsJobPayload,
+    *,
+    redis: Redis,
+    error_code: str,
+    message: str | None = None,
+    seq: int = 0,
+    worker_id: str | None = None,
+    elapsed_ms: int = 0,
+    session_factory: Callable[[], Any] = AsyncSessionLocal,
+) -> None:
+    """Publish the terminal error surface and persist failed state.
+
+    Used by poison paths in the pipeline and by the consumer once a
+    transient/unknown failure exceeds the retry budget. The usage row is
+    idempotent by request_id: if an earlier terminal path already wrote
+    it, we only keep the idempotency row failed.
+    """
+    rid = uuid.UUID(job.request_id)
+    tenant_id = uuid.UUID(job.tenant_id)
+    api_key_id = uuid.UUID(job.api_key_id)
+
+    await publish_error(redis, rid, seq=seq, message=message or error_code)
+    async with session_factory() as s:
+        await IdempotencyRepo(s, tenant_id).fail(rid)
+        existing_usage = (await s.execute(
+            select(UsageRecord).where(
+                UsageRecord.tenant_id == tenant_id,
+                UsageRecord.request_id == rid,
+            )
+        )).scalar_one_or_none()
+        if existing_usage is None:
+            await UsageRepo(s, tenant_id).record(
+                api_key_id=api_key_id,
+                voice_id=job.voice_id,
+                request_id=rid,
+                text_char_count=len(job.text),
+                sentence_count=0,
+                duration_ms=0,
+                elapsed_ms=max(0, elapsed_ms),
+                queue_wait_ms=_queue_wait_ms(job),
+                inference_ms=None,
+                rtf=None,
+                status="error",
+                error_code=error_code,
+                worker_id=worker_id,
+                app_label=job.app_label,
+            )
+        await s.commit()
+
+
 # --------------------------------------------------------------------------- #
 # The pipeline itself
 # --------------------------------------------------------------------------- #
@@ -200,6 +260,7 @@ async def process_one_job(
     session_factory: Callable[[], Any] = AsyncSessionLocal,
     resolve_reference: ReferenceResolver | None = None,
     archive_to_r2: ArchiveCallable | None = None,
+    worker_id: str | None = None,
 ) -> None:
     """Process a single TTS job end-to-end.
 
@@ -216,26 +277,47 @@ async def process_one_job(
     rid = uuid.UUID(job.request_id)
     tenant_id = uuid.UUID(job.tenant_id)
     api_key_id = uuid.UUID(job.api_key_id)
+    started_wall_ms = int(time.time() * 1000)
+    started = time.monotonic()
+
+    # Retry safety: if a previous attempt emitted partial chunks and
+    # then failed before final, the next attempt owns a clean per-request
+    # stream. Gateway also dedupes by seq, but deleting here removes the
+    # most confusing client-visible failure mode at the source.
+    await redis.delete(result_stream_name(rid))
 
     # ---------- 1. resolve voice (DB, viewer = job tenant) ---------------
     async with session_factory() as s:
         voice_row = await VoiceRepo(s, tenant_id).get_accessible(job.voice_id)
-        if voice_row is None:
-            await publish_error(redis, rid, seq=0, message="voice_not_found")
-            await IdempotencyRepo(s, tenant_id).fail(rid)
-            await s.commit()
-            raise PoisonJob(f"voice {job.voice_id!r} not visible to tenant")
-        voice_view = voice_view_from_db(voice_row)
-        reference_uri = voice_row.reference_uri
+    if voice_row is None:
+        await mark_terminal_failure(
+            job,
+            redis=redis,
+            error_code="voice_not_found",
+            message="voice_not_found",
+            seq=0,
+            worker_id=worker_id,
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            session_factory=session_factory,
+        )
+        raise PoisonJob(f"voice {job.voice_id!r} not visible to tenant")
+    voice_view = voice_view_from_db(voice_row)
+    reference_uri = voice_row.reference_uri
 
     # ---------- 2. resolve reference audio (R2 download in a thread) -----
     try:
         ref_path = await asyncio.to_thread(resolve_reference, reference_uri)
     except FileNotFoundError as e:
-        await publish_error(redis, rid, seq=0, message=f"reference_missing: {e}")
-        async with session_factory() as s:
-            await IdempotencyRepo(s, tenant_id).fail(rid)
-            await s.commit()
+        await mark_terminal_failure(
+            job,
+            redis=redis,
+            error_code="reference_missing",
+            message=f"reference_missing: {e}",
+            seq=0,
+            worker_id=worker_id,
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            session_factory=session_factory,
+        )
         raise PoisonJob(f"reference for {job.voice_id!r} missing") from e
 
     # ---------- 3-4. generate + publish chunks (NO final yet) -----------
@@ -249,7 +331,6 @@ async def process_one_job(
     #   chunks into the queue; this coroutine awaits queue.get_nowait
     #   in a loop and XADDs as each chunk lands. Tracked by
     #   `test_pipeline_chunks_currently_drained_before_publish` below.
-    started = time.monotonic()
     seq = 0
     pcm_buffer = bytearray()
     sample_rate = engine.sample_rate
@@ -262,6 +343,7 @@ async def process_one_job(
             language_id=job.language,
         ))
 
+    inference_started = time.monotonic()
     try:
         chunks = await asyncio.to_thread(_drain_engine)
     except Exception as e:
@@ -272,6 +354,7 @@ async def process_one_job(
         # and only THEN converts to a terminal failure visible to client.
         logger.exception("engine.synthesize_stream failed for %s (transient)", rid)
         raise TransientFailure(str(e)) from e
+    inference_ms = int((time.monotonic() - inference_started) * 1000)
 
     for chunk in chunks:
         await publish_chunk(
@@ -289,6 +372,16 @@ async def process_one_job(
             "complete without an artifact (would leave audio_url=null)"
         )
     if not pcm_buffer:
+        await mark_terminal_failure(
+            job,
+            redis=redis,
+            error_code="empty_pcm",
+            message="empty_pcm: engine produced no PCM",
+            seq=seq,
+            worker_id=worker_id,
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            session_factory=session_factory,
+        )
         raise PoisonJob(
             "engine produced no PCM — nothing to archive or stream"
         )
@@ -329,8 +422,11 @@ async def process_one_job(
                 sentence_count=seq,
                 duration_ms=duration_ms,
                 elapsed_ms=elapsed_ms,
+                queue_wait_ms=_queue_wait_ms(job, started_wall_ms),
+                inference_ms=inference_ms,
                 rtf=rtf,
                 status="ok",
+                worker_id=worker_id,
                 app_label=job.app_label,
             )
             await s.commit()

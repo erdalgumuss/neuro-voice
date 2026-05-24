@@ -40,6 +40,7 @@ except ImportError:  # pragma: no cover — only the test stub path needs this
 logger = logging.getLogger("nqai_voice.storage.r2")
 
 DEFAULT_PRESIGN_TTL = 3600  # 1 hour; tune per call
+DEFAULT_CACHE_MAX_BYTES = 5 * 1024 * 1024 * 1024  # 5 GiB
 
 
 # --------------------------------------------------------------------------- #
@@ -92,6 +93,7 @@ class R2Storage:
         secret_access_key: str | None = None,
         region_name: str = "auto",
         cache_dir: Path | None = None,
+        cache_max_bytes: int | None = None,
         s3_client=None,  # for moto-injection in tests
     ) -> None:
         self.default_bucket = default_bucket
@@ -99,6 +101,11 @@ class R2Storage:
             os.environ.get("NQAI_R2_CACHE_DIR", "/tmp/nqai-r2-cache")
         )
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        if cache_max_bytes is None:
+            cache_max_bytes = int(
+                os.environ.get("NQAI_R2_CACHE_MAX_BYTES", str(DEFAULT_CACHE_MAX_BYTES))
+            )
+        self.cache_max_bytes = cache_max_bytes
         self._client_lock = threading.Lock()
         # Per-URI download locks — prevents two threads in the same
         # process from racing on the same cache key (audit F2 fix).
@@ -240,9 +247,55 @@ class R2Storage:
             except Exception:
                 tmp.unlink(missing_ok=True)
                 raise
+            self._enforce_cache_limit(protected=local)
         logger.info("r2 download cached bucket=%s key=%s → %s",
                     parsed.bucket, parsed.key, local)
         return local
+
+    def _enforce_cache_limit(self, *, protected: Path) -> None:
+        """Evict oldest cached files until total cache size is under cap.
+
+        The file just downloaded is protected even when it alone exceeds
+        the limit: deleting it would turn a successful request into a
+        cache miss loop. `.part` files are ignored here; download cleanup
+        owns them.
+        """
+        max_bytes = self.cache_max_bytes
+        if max_bytes <= 0:
+            return
+
+        files: list[tuple[float, Path, int]] = []
+        total = 0
+        for path in self.cache_dir.iterdir():
+            if not path.is_file() or path.name.endswith(".part"):
+                continue
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                continue
+            total += stat.st_size
+            files.append((stat.st_mtime, path, stat.st_size))
+
+        if total <= max_bytes:
+            return
+
+        for _mtime, path, size in sorted(files, key=lambda item: item[0]):
+            if path == protected:
+                continue
+            try:
+                path.unlink()
+                total -= size
+                logger.info("r2 cache evicted %s size=%d", path, size)
+            except FileNotFoundError:
+                pass
+            if total <= max_bytes:
+                return
+
+        if total > max_bytes:
+            logger.warning(
+                "r2 cache remains over limit bytes=%d limit=%d protected=%s",
+                total, max_bytes, protected,
+            )
 
     # ----- presigned URLs --------------------------------------------------
 

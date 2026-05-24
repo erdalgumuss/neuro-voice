@@ -477,6 +477,7 @@ async def synthesize(
 
     rid = _request_id_for(request)
     redis = queue._redis  # use the same client the queue is bound to
+    await _check_queue_depth_or_503(queue, session, ctx)
 
     # Reserve idempotency upfront so a duplicate sync POST with the
     # same X-Request-Id replays cleanly (same path as async jobs).
@@ -496,6 +497,7 @@ async def synthesize(
         language=body.language,
         audio_format=body.audio_format,
         app_label=_app_label_from(request),
+        enqueued_at_ms=int(time() * 1000),
     )
     try:
         await queue.submit(payload)
@@ -527,9 +529,8 @@ async def synthesize(
             status.HTTP_502_BAD_GATEWAY, detail=f"worker error: {error}",
         )
 
-    # Worker emits 48 kHz PCM int16; sample_rate fixed by the engine.
-    # If clients ever need to override, they pass `sample_rate` on the
-    # request and the worker resamples (Faz B.2).
+    # Worker emits fixed-rate PCM int16; a future client-controlled
+    # resampling contract should be added explicitly when implemented.
     sample_rate = settings.target_sample_rate
     duration_ms = int(len(pcm) // 2 / max(sample_rate, 1) * 1000)
     rtf = (elapsed_ms / duration_ms) if duration_ms > 0 else None
@@ -587,6 +588,7 @@ async def synthesize_stream(
     )
     rid = _request_id_for(request)
     redis = queue._redis
+    await _check_queue_depth_or_503(queue, session, ctx)
 
     idem = IdempotencyRepo(session, ctx.tenant_id)
     await idem.reserve(
@@ -604,6 +606,7 @@ async def synthesize_stream(
         language=body.language,
         audio_format=body.audio_format,
         app_label=_app_label_from(request),
+        enqueued_at_ms=int(time() * 1000),
     )
     try:
         await queue.submit(payload)
@@ -690,6 +693,32 @@ def _hash_sync_body(body) -> str:
 QUEUE_DEPTH_BACKPRESSURE = int(os.environ.get("NQAI_QUEUE_DEPTH_LIMIT", "200"))
 
 
+async def _check_queue_depth_or_503(
+    queue: TtsJobQueue,
+    session: AsyncSession,
+    ctx: AuthContext,
+) -> None:
+    """Apply the same Redis stream backpressure to every submit path."""
+    depth = await queue.depth()
+    if depth <= QUEUE_DEPTH_BACKPRESSURE:
+        return
+    await AuditRepo(session).record(
+        actor_type="api_key",
+        actor_id=ctx.api_key_id,
+        actor_label=ctx.api_key.prefix,
+        action="tts.backpressure",
+        result="denied",
+        tenant_id=ctx.tenant_id,
+        payload={"queue_depth": depth, "limit": QUEUE_DEPTH_BACKPRESSURE},
+    )
+    await session.commit()
+    raise HTTPException(
+        status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="queue is saturated; retry shortly",
+        headers={"Retry-After": "5"},
+    )
+
+
 @app.post(
     "/v1/tts/jobs",
     response_model=TTSJobAccepted,
@@ -757,23 +786,7 @@ async def create_tts_job(
 
         # Backpressure check before reserving — we don't want to leave
         # half-baked rows behind when the queue is saturated.
-        depth = await queue.depth()
-        if depth > QUEUE_DEPTH_BACKPRESSURE:
-            await AuditRepo(session).record(
-                actor_type="api_key",
-                actor_id=ctx.api_key_id,
-                actor_label=ctx.api_key.prefix,
-                action="tts.backpressure",
-                result="denied",
-                tenant_id=ctx.tenant_id,
-                payload={"queue_depth": depth, "limit": QUEUE_DEPTH_BACKPRESSURE},
-            )
-            await session.commit()
-            raise HTTPException(
-                status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="queue is saturated; retry shortly",
-                headers={"Retry-After": "5"},
-            )
+        await _check_queue_depth_or_503(queue, session, ctx)
 
         reserved, _is_new = await idem.reserve_or_get(
             request_id=idempotency_key,
@@ -806,6 +819,7 @@ async def create_tts_job(
         audio_format=body.audio_format,
         params=body.params.model_dump(exclude_none=True) if body.params else None,
         app_label=_app_label_from(request),
+        enqueued_at_ms=int(time() * 1000),
     )
     try:
         await queue.submit(payload)
@@ -882,8 +896,8 @@ async def get_tts_job(
         usage_row = await _find_usage_row(session, ctx.tenant_id, rid)
         if usage_row is not None:
             response["metrics"] = TTSJobMetrics(
-                queue_wait_ms=None,  # Faz B worker writes this
-                inference_ms=usage_row.elapsed_ms,
+                queue_wait_ms=usage_row.queue_wait_ms,
+                inference_ms=usage_row.inference_ms or usage_row.elapsed_ms,
                 generated_audio_ms=usage_row.duration_ms,
                 rtf=usage_row.rtf,
             )

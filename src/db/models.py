@@ -398,6 +398,8 @@ class UsageRecord(Base):
     sentence_count: Mapped[int] = mapped_column(Integer, nullable=False)
     duration_ms: Mapped[int] = mapped_column(Integer, nullable=False)
     elapsed_ms: Mapped[int] = mapped_column(Integer, nullable=False)
+    queue_wait_ms: Mapped[int | None] = mapped_column(Integer)
+    inference_ms: Mapped[int | None] = mapped_column(Integer)
     ttfb_ms: Mapped[int | None] = mapped_column(Integer)
     rtf: Mapped[float | None] = mapped_column(Float)
     status: Mapped[str] = mapped_column(Text, nullable=False)
@@ -415,6 +417,14 @@ class UsageRecord(Base):
         CheckConstraint("sentence_count >= 0", name="sentence_count_nonneg"),
         CheckConstraint("duration_ms >= 0", name="duration_ms_nonneg"),
         CheckConstraint("elapsed_ms >= 0", name="elapsed_ms_nonneg"),
+        CheckConstraint(
+            "queue_wait_ms IS NULL OR queue_wait_ms >= 0",
+            name="queue_wait_ms_nonneg",
+        ),
+        CheckConstraint(
+            "inference_ms IS NULL OR inference_ms >= 0",
+            name="inference_ms_nonneg",
+        ),
         CheckConstraint("ttfb_ms IS NULL OR ttfb_ms >= 0", name="ttfb_ms_nonneg"),
         CheckConstraint(
             "status IN ('ok','error','timeout','partial')",

@@ -15,12 +15,10 @@ class TTSRequest(BaseModel):
     voice_id: str = Field(..., min_length=3, max_length=64)
     language: Literal["tr"] = "tr"
     audio_format: AudioFormat = "wav"
-    sample_rate: int | None = Field(default=None, ge=8000, le=48000)
 
 
 class TTSStreamRequest(TTSRequest):
     audio_format: StreamFormat = "wav"
-    chunk_format: Literal["sentence", "raw_pcm"] = "sentence"
 
 
 class VoicePublic(BaseModel):

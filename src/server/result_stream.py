@@ -66,41 +66,65 @@ async def consume_result_stream(
     stream = result_stream_name(request_id)
     last_id = "0"
     deadline = asyncio.get_event_loop().time() + overall_timeout_s
+    seen_seq: set[int] = set()
+    cleaned_up = False
 
-    while True:
-        if asyncio.get_event_loop().time() > deadline:
-            if delete_on_finish:
+    async def _cleanup() -> None:
+        nonlocal cleaned_up
+        if delete_on_finish and not cleaned_up:
+            try:
                 await redis.delete(stream)
-            raise ResultStreamTimeout(
-                f"no final chunk on {stream} within {overall_timeout_s}s"
+            finally:
+                cleaned_up = True
+
+    try:
+        while True:
+            if asyncio.get_event_loop().time() > deadline:
+                await _cleanup()
+                raise ResultStreamTimeout(
+                    f"no final chunk on {stream} within {overall_timeout_s}s"
+                )
+
+            # XREAD on a single stream — block_ms slice so we yield to the
+            # event loop frequently and the overall_timeout check is tight.
+            response: Any = await redis.xread(
+                streams={stream: last_id},
+                count=64,
+                block=block_ms,
             )
+            if not response:
+                # Empty slice — loop and re-check the deadline. Real Redis
+                # blocked server-side for `block_ms`; fakeredis short-
+                # circuits, so we add a tiny sleep to yield in that case.
+                await asyncio.sleep(block_ms / 1000.0 if block_ms > 0 else 0)
+                continue
 
-        # XREAD on a single stream — block_ms slice so we yield to the
-        # event loop frequently and the overall_timeout check is tight.
-        response: Any = await redis.xread(
-            streams={stream: last_id},
-            count=64,
-            block=block_ms,
-        )
-        if not response:
-            # Empty slice — loop and re-check the deadline. Real Redis
-            # blocked server-side for `block_ms`; fakeredis short-
-            # circuits, so we add a tiny sleep to yield in that case.
-            await asyncio.sleep(block_ms / 1000.0 if block_ms > 0 else 0)
-            continue
-
-        # response = [(stream_name, [(entry_id, fields), ...])]
-        for _stream_name, entries in response:
-            for entry_id, fields in entries:
-                # Track last_id so we don't re-read entries — XREAD
-                # returns entries strictly greater than last_id.
-                last_id = entry_id if isinstance(entry_id, str) else entry_id.decode()
-                chunk = TtsResult.decode(fields)
-                yield chunk
-                if chunk.error or chunk.final:
-                    if delete_on_finish:
-                        await redis.delete(stream)
-                    return
+            # response = [(stream_name, [(entry_id, fields), ...])]
+            for _stream_name, entries in response:
+                for entry_id, fields in entries:
+                    # Track last_id so we don't re-read entries — XREAD
+                    # returns entries strictly greater than last_id.
+                    last_id = (
+                        entry_id if isinstance(entry_id, str) else entry_id.decode()
+                    )
+                    chunk = TtsResult.decode(fields)
+                    is_terminal = bool(chunk.error or chunk.final)
+                    if chunk.seq in seen_seq and not is_terminal:
+                        logger.info(
+                            "duplicate result seq ignored stream=%s seq=%s",
+                            stream, chunk.seq,
+                        )
+                        continue
+                    if not is_terminal:
+                        seen_seq.add(chunk.seq)
+                    yield chunk
+                    if is_terminal:
+                        await _cleanup()
+                        return
+    finally:
+        # Normal terminal paths have already cleaned; this covers client
+        # cancellation/disconnect while the worker is still writing.
+        await _cleanup()
 
 
 async def collect_pcm_until_final(

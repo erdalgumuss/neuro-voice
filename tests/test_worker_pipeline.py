@@ -17,6 +17,7 @@ assert wire behaviour and side-effect semantics, not byte-exact audio.
 from __future__ import annotations
 
 import sys
+import time
 import types as _types
 import uuid
 from dataclasses import dataclass
@@ -146,7 +147,7 @@ async def setup_db(tmp_path, monkeypatch):
 
 
 def _job(setup, *, voice_id: str | None = None, app_label: str | None = None,
-          text: str = "Bir varmış."):
+          text: str = "Bir varmış.", enqueued_at_ms: int | None = None):
     from server.queue import TtsJobPayload
 
     return TtsJobPayload(
@@ -158,6 +159,7 @@ def _job(setup, *, voice_id: str | None = None, app_label: str | None = None,
         language="tr",
         audio_format="wav",
         app_label=app_label,
+        enqueued_at_ms=enqueued_at_ms,
     )
 
 
@@ -205,13 +207,18 @@ async def test_pipeline_happy_path_commits_then_publishes_final(setup_db):
 
     redis = fakeredis.aioredis.FakeRedis()
     engine = _StubEngine(sentences=["Cümle bir.", "Cümle iki.", "Cümle üç."])
-    job = _job(setup, app_label="neeko-mobile")
+    job = _job(
+        setup,
+        app_label="neeko-mobile",
+        enqueued_at_ms=int(time.time() * 1000) - 25,
+    )
     await _reserve(setup, job)
 
     await process_one_job(
         job, redis=redis, engine=engine,
         resolve_reference=_stub_resolver(setup),
         archive_to_r2=_local_archiver(setup),
+        worker_id="worker-test-1",
     )
 
     # 3 sentence chunks + 1 final = 4 entries on the result stream.
@@ -240,6 +247,11 @@ async def test_pipeline_happy_path_commits_then_publishes_final(setup_db):
         usage = await UsageRepo(s, setup["tenant_id"]).recent(limit=10)
         assert len(usage) == 1
         assert usage[0].app_label == "neeko-mobile"
+        assert usage[0].worker_id == "worker-test-1"
+        assert usage[0].queue_wait_ms is not None
+        assert usage[0].queue_wait_ms >= 0
+        assert usage[0].inference_ms is not None
+        assert usage[0].inference_ms >= 0
         assert usage[0].sentence_count == 3
         assert usage[0].status == "ok"
         # 3 sentences × 1024 samples × int16 = 6144 bytes; duration =
@@ -331,9 +343,8 @@ async def test_pipeline_reference_missing_raises_poison_with_error_chunk(setup_d
 
 async def test_pipeline_empty_engine_output_is_poison(setup_db):
     """Engine returned without yielding → unrecoverable input/model bug.
-    Treated as poison (XACK + no retry); idempotency NOT marked failed
-    here because no terminal client-visible state was established
-    before discovery — retry would just produce the same empty output."""
+    Treated as poison (XACK + no retry) and now surfaced terminally so
+    clients do not poll a forever-processing idempotency row."""
     setup = setup_db
     from worker.pipeline import PoisonJob, process_one_job
 
@@ -346,7 +357,22 @@ async def test_pipeline_empty_engine_output_is_poison(setup_db):
             job, redis=redis, engine=_StubEngine(empty_output=True),
             resolve_reference=_stub_resolver(setup),
             archive_to_r2=_local_archiver(setup),
+            worker_id="worker-empty",
         )
+
+    from db import AsyncSessionLocal
+    from repos import IdempotencyRepo, UsageRepo
+
+    async with AsyncSessionLocal() as s:
+        row = await IdempotencyRepo(s, setup["tenant_id"]).get(
+            uuid.UUID(job.request_id)
+        )
+        assert row is not None and row.status == "failed"
+        usage = await UsageRepo(s, setup["tenant_id"]).recent(limit=10)
+        assert len(usage) == 1
+        assert usage[0].status == "error"
+        assert usage[0].error_code == "empty_pcm"
+        assert usage[0].worker_id == "worker-empty"
 
 
 # --------------------------------------------------------------------------- #

@@ -136,6 +136,52 @@ def test_download_to_cache_preserves_suffix(r2, tmp_path):
     assert cached.suffix == ".mp3"
 
 
+def test_download_to_cache_evicts_oldest_over_limit(tmp_path):
+    with mock_aws():
+        client = boto3.client("s3", region_name="us-east-1")
+        client.create_bucket(Bucket=BUCKET)
+        storage = R2Storage(
+            default_bucket=BUCKET,
+            cache_dir=tmp_path / "cache-lru",
+            cache_max_bytes=10,
+            s3_client=client,
+        )
+        uri_a = storage.upload_file(
+            _write_local(tmp_path, "a.wav", b"A" * 6), "voices/a.wav"
+        )
+        uri_b = storage.upload_file(
+            _write_local(tmp_path, "b.wav", b"B" * 6), "voices/b.wav"
+        )
+
+        cached_a = storage.download_to_cache(uri_a.uri)
+        assert cached_a.exists()
+        cached_b = storage.download_to_cache(uri_b.uri)
+
+        assert not cached_a.exists()
+        assert cached_b.exists()
+        assert cached_b.read_bytes() == b"B" * 6
+
+
+def test_download_to_cache_keeps_new_file_when_larger_than_limit(tmp_path):
+    with mock_aws():
+        client = boto3.client("s3", region_name="us-east-1")
+        client.create_bucket(Bucket=BUCKET)
+        storage = R2Storage(
+            default_bucket=BUCKET,
+            cache_dir=tmp_path / "cache-protected",
+            cache_max_bytes=5,
+            s3_client=client,
+        )
+        uri = storage.upload_file(
+            _write_local(tmp_path, "big.wav", b"X" * 12), "voices/big.wav"
+        )
+
+        cached = storage.download_to_cache(uri.uri)
+
+        assert cached.exists()
+        assert cached.read_bytes() == b"X" * 12
+
+
 def test_download_to_cache_concurrent_same_uri_no_part_orphan(r2, tmp_path):
     """Audit F2 fix: two threads fetching the same URI must not corrupt
     the cache file, and no `.part` orphan must survive past the calls."""

@@ -245,6 +245,57 @@ async def test_consumer_transient_failure_does_not_xack(setup):
     assert pending["pending"] == 1
 
 
+async def test_consumer_transient_failure_max_retry_dlqs_and_fails(setup):
+    """Retry budget exhausted → terminal error + DLQ + XACK.
+
+    We set max_retries=1 so the first delivery is already over budget;
+    default production value stays 3 and still leaves early attempts in
+    PEL for XAUTOCLAIM.
+    """
+    from server.queue import DEFAULT_DLQ_STREAM, DEFAULT_STREAM, TtsJobQueue
+    from worker.consumer import DEFAULT_GROUP, WorkerConsumer
+
+    redis = fakeredis.aioredis.FakeRedis()
+    queue = TtsJobQueue(redis, stream=DEFAULT_STREAM)
+    rid = await _enqueue_job(redis, queue, setup)
+
+    consumer = WorkerConsumer(
+        redis=redis,
+        engine=_StubEngine(raise_on_generate=True),
+        resolve_reference=_resolver(setup),
+        archive_to_r2=_local_archiver(setup),
+        max_retries=1,
+        consumer_name="worker-dlq-test",
+    )
+    await consumer.run(max_iterations=1)
+
+    assert consumer.transient_failures == 1
+    assert consumer.dlqed == 1
+    pending = await redis.xpending(DEFAULT_STREAM, DEFAULT_GROUP)
+    assert pending["pending"] == 0
+
+    dlq = await redis.xrange(DEFAULT_DLQ_STREAM)
+    assert len(dlq) == 1
+    assert dlq[0][1][b"request_id"] == str(rid).encode()
+    assert dlq[0][1][b"reason"] == b"transient_max_retries"
+
+    from db import AsyncSessionLocal
+    from repos import IdempotencyRepo, UsageRepo
+    from server.queue import result_stream_name
+
+    stream_entries = await redis.xrange(result_stream_name(rid))
+    assert stream_entries[-1][1][b"error"].startswith(b"transient_max_retries")
+
+    async with AsyncSessionLocal() as s:
+        idem = await IdempotencyRepo(s, setup["tenant_id"]).get(rid)
+        assert idem is not None and idem.status == "failed"
+        usage = await UsageRepo(s, setup["tenant_id"]).recent(limit=10)
+        assert len(usage) == 1
+        assert usage[0].status == "error"
+        assert usage[0].error_code == "transient_max_retries"
+        assert usage[0].worker_id == "worker-dlq-test"
+
+
 async def test_consumer_unknown_exception_does_not_xack(setup, monkeypatch):
     """Programmer error (anything not Poison/Transient) → keep in PEL.
     Operator sees the trace, message can be retried after a fix-and-deploy."""

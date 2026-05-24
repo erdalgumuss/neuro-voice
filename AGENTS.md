@@ -213,6 +213,11 @@ B.1 is done when:
 - Async job E2E passes with real gateway + real worker consumer + fake engine/R2 in tests.
 - Sync `/v1/tts` is queue-proxied and marked as compatibility/deprecation path.
 - Worker crash/retry semantics are documented and covered by targeted tests.
+- Transient/unknown failures have bounded retry + DLQ + terminal idempotency/usage side effects.
+- Result stream retry duplicates are not client-visible (`seq` dedupe + attempt-start cleanup).
+- Queue backpressure applies consistently to sync, stream, and async submit paths.
+- Usage rows include enough worker/latency metadata for B.1.5 waterfall analysis.
+- R2 reference cache has a bounded eviction policy.
 
 B.1.5 is done when:
 

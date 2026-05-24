@@ -19,18 +19,17 @@ XACK matrix (D-06 at-least-once):
     TransientFailure raised          → NO XACK (engine/DB hiccup —
                                                  XAUTOCLAIM will hand it
                                                  to another worker)
-    Unknown Exception bubbled        → NO XACK (safer to retry than to
-                                                 drop a job on an
-                                                 unanticipated bug)
+    Unknown Exception bubbled        → NO XACK until max retries, then
+                                       terminal failure + DLQ + XACK
 
 XAUTOCLAIM is deliberately conservative: after `idle_ms` of no progress
 on a message in PEL, it migrates to this consumer for another attempt.
-Faz C adds a DLQ for messages that fail past N retries.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import socket
@@ -38,7 +37,7 @@ import socket
 from redis.asyncio import Redis
 from redis.exceptions import ResponseError
 
-from server.queue import DEFAULT_STREAM, TtsJobPayload
+from server.queue import DEFAULT_DLQ_STREAM, DEFAULT_STREAM, TtsJobPayload
 
 from .engine import BaseSynthEngine
 from .pipeline import (
@@ -48,6 +47,7 @@ from .pipeline import (
     PoisonJob,
     ReferenceResolver,
     TransientFailure,
+    mark_terminal_failure,
     process_one_job,
 )
 
@@ -118,6 +118,8 @@ class WorkerConsumer:
         block_ms: int = 5_000,
         xautoclaim_min_idle_ms: int = 30_000,
         xautoclaim_period_s: float = 5.0,
+        max_retries: int | None = None,
+        dlq_stream: str | None = None,
         resolve_reference: ReferenceResolver | None = None,
         archive_to_r2: _ArchiveCallable | None = None,
         stop_event: asyncio.Event | None = None,
@@ -135,6 +137,12 @@ class WorkerConsumer:
         # could otherwise strand a message for ages.
         self._xautoclaim_period_s = xautoclaim_period_s
         self._last_xautoclaim_at = 0.0
+        self._max_retries = max_retries or int(
+            os.environ.get("NQAI_WORKER_MAX_RETRIES", "3")
+        )
+        self._dlq_stream = dlq_stream or os.environ.get(
+            "NQAI_WORKER_DLQ_STREAM", DEFAULT_DLQ_STREAM
+        )
         self._resolve_reference = resolve_reference
         self._archive_to_r2 = archive_to_r2
         self._stop = stop_event or asyncio.Event()
@@ -144,6 +152,7 @@ class WorkerConsumer:
         self.transient_failures = 0
         self.unknown_failures = 0
         self.claimed = 0
+        self.dlqed = 0
 
     @property
     def consumer_name(self) -> str:
@@ -232,14 +241,22 @@ class WorkerConsumer:
         try:
             job = TtsJobPayload.decode(fields)
             rid_str = job.request_id
-        except Exception:
+        except Exception as e:
             # Malformed payload — the only safe thing is to XACK so it
             # doesn't loop forever, and log loudly for the operator.
             logger.exception(
                 "malformed job payload on entry %s — XACKing to drain", entry_id,
             )
+            await self._send_raw_to_dlq(
+                entry_id=entry_id,
+                fields=fields,
+                reason="malformed_payload",
+                error=e,
+                delivery_count=await self._delivery_count(entry_id),
+            )
             await self._ack(entry_id)
             self.poisoned += 1
+            self.dlqed += 1
             return
 
         try:
@@ -249,6 +266,7 @@ class WorkerConsumer:
                 engine=self._engine,
                 resolve_reference=self._resolve_reference,
                 archive_to_r2=self._archive_to_r2,
+                worker_id=self._consumer_name,
             )
         except PoisonJob:
             # No point retrying — voice missing, ref missing, etc.
@@ -257,19 +275,37 @@ class WorkerConsumer:
             await self._ack(entry_id)
             self.poisoned += 1
             return
-        except TransientFailure:
+        except TransientFailure as e:
             # Engine/DB hiccup. DO NOT XACK — XAUTOCLAIM will retry on
-            # this or another worker after idle_ms.
-            logger.info("transient failure rid=%s — leaving in PEL", rid_str)
+            # this or another worker after idle_ms, until retry budget
+            # is exhausted and the job is terminally failed.
+            if await self._maybe_dlq_and_ack(
+                entry_id=entry_id,
+                fields=fields,
+                job=job,
+                reason="transient_max_retries",
+                error=e,
+            ):
+                self.dlqed += 1
+            else:
+                logger.info("transient failure rid=%s — leaving in PEL", rid_str)
             self.transient_failures += 1
             return
-        except Exception:
+        except Exception as e:
             # Unanticipated. Safer to keep the message in PEL than to
-            # XACK and silently lose work. Operator will see the trace.
+            # XACK and silently lose work until retry budget is spent.
             logger.exception(
                 "unexpected exception processing rid=%s — leaving in PEL",
                 rid_str,
             )
+            if await self._maybe_dlq_and_ack(
+                entry_id=entry_id,
+                fields=fields,
+                job=job,
+                reason="unknown_exception",
+                error=e,
+            ):
+                self.dlqed += 1
             self.unknown_failures += 1
             return
 
@@ -281,6 +317,113 @@ class WorkerConsumer:
             await self._redis.xack(self._stream, self._group, entry_id)
         except ResponseError:
             logger.exception("xack failed for entry %s", entry_id)
+
+    async def _delivery_count(self, entry_id) -> int:
+        """Return Redis PEL `times_delivered` for this stream entry."""
+        try:
+            rows = await self._redis.xpending_range(
+                self._stream, self._group, entry_id, entry_id, 1
+            )
+        except Exception:
+            logger.exception("xpending_range failed for entry %s", entry_id)
+            return 1
+        if not rows:
+            return 1
+        return int(rows[0].get("times_delivered") or 1)
+
+    async def _maybe_dlq_and_ack(
+        self,
+        *,
+        entry_id,
+        fields,
+        job: TtsJobPayload,
+        reason: str,
+        error: BaseException,
+    ) -> bool:
+        delivery_count = await self._delivery_count(entry_id)
+        if delivery_count < self._max_retries:
+            return False
+
+        logger.error(
+            "job rid=%s exceeded retries delivery_count=%s max=%s reason=%s",
+            job.request_id, delivery_count, self._max_retries, reason,
+        )
+        await mark_terminal_failure(
+            job,
+            redis=self._redis,
+            error_code=reason,
+            message=f"{reason}: {error}",
+            worker_id=self._consumer_name,
+        )
+        await self._send_job_to_dlq(
+            entry_id=entry_id,
+            fields=fields,
+            job=job,
+            reason=reason,
+            error=error,
+            delivery_count=delivery_count,
+        )
+        await self._ack(entry_id)
+        return True
+
+    async def _send_job_to_dlq(
+        self,
+        *,
+        entry_id,
+        fields,
+        job: TtsJobPayload,
+        reason: str,
+        error: BaseException,
+        delivery_count: int,
+    ) -> None:
+        await self._redis.xadd(
+            self._dlq_stream,
+            {
+                "entry_id": self._entry_id_str(entry_id),
+                "request_id": job.request_id,
+                "tenant_id": job.tenant_id,
+                "voice_id": job.voice_id,
+                "reason": reason,
+                "error": str(error),
+                "delivery_count": str(delivery_count),
+                "consumer": self._consumer_name,
+                "payload": self._payload_from_fields(fields),
+            },
+        )
+
+    async def _send_raw_to_dlq(
+        self,
+        *,
+        entry_id,
+        fields,
+        reason: str,
+        error: BaseException,
+        delivery_count: int,
+    ) -> None:
+        await self._redis.xadd(
+            self._dlq_stream,
+            {
+                "entry_id": self._entry_id_str(entry_id),
+                "reason": reason,
+                "error": str(error),
+                "delivery_count": str(delivery_count),
+                "consumer": self._consumer_name,
+                "payload": self._payload_from_fields(fields),
+            },
+        )
+
+    @staticmethod
+    def _entry_id_str(entry_id) -> str:
+        return entry_id.decode("utf-8") if isinstance(entry_id, bytes) else str(entry_id)
+
+    @staticmethod
+    def _payload_from_fields(fields) -> str:
+        raw = fields[b"payload"] if b"payload" in fields else fields.get("payload", "")
+        if isinstance(raw, (bytes, bytearray)):
+            return raw.decode("utf-8", errors="replace")
+        if isinstance(raw, str):
+            return raw
+        return json.dumps(str(raw), ensure_ascii=False)
 
     async def _xautoclaim_sweep(self) -> None:
         """Claim any pending message older than `idle_ms` so a crashed

@@ -156,6 +156,66 @@ async def test_collect_pcm_concatenates_until_final():
     assert err is None
 
 
+async def test_collect_pcm_ignores_duplicate_seq():
+    """Retry visibility hardening: if a failed attempt emitted seq=0
+    and a retry emits seq=0 again, the sync buffer must not duplicate
+    the sentence."""
+    from server.queue import TtsResult
+    from server.result_stream import collect_pcm_until_final
+
+    redis = fakeredis.aioredis.FakeRedis()
+    rid = str(uuid.uuid4())
+    await _publish_chunks(redis, rid, [
+        TtsResult(request_id=rid, seq=0, pcm_bytes=b"old"),
+        TtsResult(request_id=rid, seq=0, pcm_bytes=b"new"),
+        TtsResult(request_id=rid, seq=1, pcm_bytes=b"", final=True),
+    ])
+    pcm, n, err = await collect_pcm_until_final(redis, rid, block_ms=10)
+    assert pcm == b"old"
+    assert n == 1
+    assert err is None
+
+
+async def test_duplicate_seq_terminal_error_is_not_ignored():
+    """A retry may fail terminally after an earlier attempt already
+    emitted seq=0. Audio duplicate is ignored; terminal error must still
+    reach the caller so sync clients do not hang until timeout."""
+    from server.queue import TtsResult
+    from server.result_stream import collect_pcm_until_final
+
+    redis = fakeredis.aioredis.FakeRedis()
+    rid = str(uuid.uuid4())
+    await _publish_chunks(redis, rid, [
+        TtsResult(request_id=rid, seq=0, pcm_bytes=b"audio"),
+        TtsResult(request_id=rid, seq=0, pcm_bytes=b"", error="dlq"),
+    ])
+
+    pcm, n, err = await collect_pcm_until_final(redis, rid, block_ms=10)
+    assert pcm == b"audio"
+    assert n == 1
+    assert err == "dlq"
+
+
+async def test_consume_deletes_stream_on_generator_close():
+    """Client disconnect/cancellation should not leave result streams
+    around until TTL when delete_on_finish is enabled."""
+    from server.queue import TtsResult, result_stream_name
+    from server.result_stream import consume_result_stream
+
+    redis = fakeredis.aioredis.FakeRedis()
+    rid = str(uuid.uuid4())
+    stream = result_stream_name(rid)
+    await _publish_chunks(redis, rid, [
+        TtsResult(request_id=rid, seq=0, pcm_bytes=b"x"),
+        TtsResult(request_id=rid, seq=1, pcm_bytes=b"", final=True),
+    ])
+    gen = consume_result_stream(redis, rid, block_ms=10)
+    first = await anext(gen)
+    assert first.seq == 0
+    await gen.aclose()
+    assert await redis.exists(stream) == 0
+
+
 async def test_collect_pcm_surfaces_error():
     from server.queue import TtsResult
     from server.result_stream import collect_pcm_until_final

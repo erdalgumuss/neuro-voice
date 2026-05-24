@@ -423,6 +423,8 @@ def test_status_after_worker_completion(client, setup):
                 sentence_count=1,
                 duration_ms=2000,
                 elapsed_ms=900,
+                queue_wait_ms=40,
+                inference_ms=700,
                 rtf=0.45,
                 status="ok",
             )
@@ -436,7 +438,8 @@ def test_status_after_worker_completion(client, setup):
     assert body["status"] == "complete"
     assert body["output"]["audio_url"] == "s3://outputs/demo-01/abc.wav"
     assert body["output"]["content_type"] == "audio/wav"
-    assert body["metrics"]["inference_ms"] == 900
+    assert body["metrics"]["queue_wait_ms"] == 40
+    assert body["metrics"]["inference_ms"] == 700
     assert body["metrics"]["generated_audio_ms"] == 2000
     assert body["metrics"]["rtf"] == pytest.approx(0.45)
 
@@ -564,6 +567,48 @@ def test_backpressure_when_queue_saturated(client, monkeypatch):
     asyncio.run(_fill_queue())
 
     r = _create_job(client, idempotency_key=str(uuid.uuid4()))
+    assert r.status_code == 503
+    assert "Retry-After" in r.headers
+
+
+def test_sync_tts_backpressure_when_queue_saturated(client):
+    _enroll_voice(client)
+    import asyncio
+
+    async def _fill_queue():
+        for i in range(110):
+            await client.fake_redis.xadd(
+                "nqai.tts.jobs.test", {"payload": f"filler-{i}"}
+            )
+
+    asyncio.run(_fill_queue())
+
+    r = client.post(
+        "/v1/tts",
+        headers={"X-Request-Id": str(uuid.uuid4())},
+        json={"text": "Merhaba.", "voice_id": "demo-01"},
+    )
+    assert r.status_code == 503
+    assert "Retry-After" in r.headers
+
+
+def test_sync_stream_backpressure_when_queue_saturated(client):
+    _enroll_voice(client)
+    import asyncio
+
+    async def _fill_queue():
+        for i in range(110):
+            await client.fake_redis.xadd(
+                "nqai.tts.jobs.test", {"payload": f"filler-{i}"}
+            )
+
+    asyncio.run(_fill_queue())
+
+    r = client.post(
+        "/v1/tts/stream",
+        headers={"X-Request-Id": str(uuid.uuid4())},
+        json={"text": "Merhaba.", "voice_id": "demo-01"},
+    )
     assert r.status_code == 503
     assert "Retry-After" in r.headers
 
