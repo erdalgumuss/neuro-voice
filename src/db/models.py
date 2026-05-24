@@ -401,6 +401,15 @@ class UsageRecord(Base):
     queue_wait_ms: Mapped[int | None] = mapped_column(Integer)
     inference_ms: Mapped[int | None] = mapped_column(Integer)
     ttfb_ms: Mapped[int | None] = mapped_column(Integer)
+    # Faz C step 1 — latency waterfall expansion (migration 0004).
+    # `worker_pickup_ms`     = (worker start) - payload.enqueued_at_ms
+    # `reference_resolve_ms` = resolve_reference_uri duration
+    # `first_pcm_ms`         = inference start → first engine SynthChunk
+    # `first_audio_ms`       = inference start → first publish_chunk XADD
+    worker_pickup_ms: Mapped[int | None] = mapped_column(Integer)
+    reference_resolve_ms: Mapped[int | None] = mapped_column(Integer)
+    first_pcm_ms: Mapped[int | None] = mapped_column(Integer)
+    first_audio_ms: Mapped[int | None] = mapped_column(Integer)
     rtf: Mapped[float | None] = mapped_column(Float)
     status: Mapped[str] = mapped_column(Text, nullable=False)
     error_code: Mapped[str | None] = mapped_column(Text)
@@ -426,6 +435,22 @@ class UsageRecord(Base):
             name="inference_ms_nonneg",
         ),
         CheckConstraint("ttfb_ms IS NULL OR ttfb_ms >= 0", name="ttfb_ms_nonneg"),
+        CheckConstraint(
+            "worker_pickup_ms IS NULL OR worker_pickup_ms >= 0",
+            name="worker_pickup_ms_nonneg",
+        ),
+        CheckConstraint(
+            "reference_resolve_ms IS NULL OR reference_resolve_ms >= 0",
+            name="reference_resolve_ms_nonneg",
+        ),
+        CheckConstraint(
+            "first_pcm_ms IS NULL OR first_pcm_ms >= 0",
+            name="first_pcm_ms_nonneg",
+        ),
+        CheckConstraint(
+            "first_audio_ms IS NULL OR first_audio_ms >= 0",
+            name="first_audio_ms_nonneg",
+        ),
         CheckConstraint(
             "status IN ('ok','error','timeout','partial')",
             name="status_enum",

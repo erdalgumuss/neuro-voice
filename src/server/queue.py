@@ -198,6 +198,12 @@ class TtsJobQueue:
     def stream_name(self) -> str:
         return self._stream
 
+    @property
+    def redis(self) -> Redis:
+        """Underlying Redis client. Used by Faz C heartbeat + /metrics gauges
+        to issue SCAN/HGETALL on `nqai.worker.heartbeat.*` keys."""
+        return self._redis
+
     async def submit(self, job: TtsJobPayload) -> str:
         """XADD a job onto the stream. Returns the Redis-assigned message
         id (`<ms>-<seq>`). The id is **not** the request_id we expose to

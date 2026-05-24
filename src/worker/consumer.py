@@ -33,10 +33,12 @@ import json
 import logging
 import os
 import socket
+import time
 
 from redis.asyncio import Redis
 from redis.exceptions import ResponseError
 
+from observability import TTS_ERRORS, TTS_REQUESTS, WORKER_DLQ
 from server.queue import DEFAULT_DLQ_STREAM, DEFAULT_STREAM, TtsJobPayload
 
 from .engine import BaseSynthEngine
@@ -91,6 +93,19 @@ async def ensure_consumer_group(
             raise
         # Group already exists — that's fine. Faz B.0 worker restarts
         # hit this path on every boot.
+
+
+def _safe_metric(counter, **labels) -> None:
+    """Increment a Prometheus counter without ever raising into the
+    consumer hot path. Metric infrastructure must not turn into a worker
+    crash vector — best-effort increments only, swallow everything."""
+    try:
+        if labels:
+            counter.labels(**labels).inc()
+        else:
+            counter.inc()
+    except Exception:
+        logger.exception("metric increment failed (labels=%s) — ignoring", labels)
 
 
 class WorkerConsumer:
@@ -153,6 +168,14 @@ class WorkerConsumer:
         self.unknown_failures = 0
         self.claimed = 0
         self.dlqed = 0
+        # Faz C heartbeat state — gateway aggregates these via Redis HSET
+        # to decide capacity-aware admission. Single-process consumer:
+        # capacity is 1 (one job in-flight at a time). NQAI_WORKER_CAPACITY
+        # lets ops bump it later if/when concurrent dispatch lands.
+        self.capacity: int = int(os.environ.get("NQAI_WORKER_CAPACITY", "1"))
+        self.in_flight: int = 0
+        self.last_pickup_ms: int = int(time.time() * 1000)
+        self.started_at_ms: int = int(time.time() * 1000)
 
     @property
     def consumer_name(self) -> str:
@@ -231,9 +254,16 @@ class WorkerConsumer:
             return False
 
         # response = [(stream_name, [(entry_id, {field: value, ...}), ...])]
+        # Faz C heartbeat: mark pickup time on every successful read so the
+        # gateway can detect stuck workers (last_pickup_ms not advancing).
+        self.last_pickup_ms = int(time.time() * 1000)
         for _stream_name, entries in response:
             for entry_id, fields in entries:
-                await self._handle_one(entry_id, fields)
+                self.in_flight += 1
+                try:
+                    await self._handle_one(entry_id, fields)
+                finally:
+                    self.in_flight = max(0, self.in_flight - 1)
         return True
 
     async def _handle_one(self, entry_id, fields) -> None:
@@ -257,7 +287,23 @@ class WorkerConsumer:
             await self._ack(entry_id)
             self.poisoned += 1
             self.dlqed += 1
+            _safe_metric(TTS_ERRORS, type="poison")
+            _safe_metric(WORKER_DLQ)
             return
+
+        # Faz C step 1: capture the worker-pickup latency at the
+        # boundary where the consumer first owns the message. The
+        # gateway stamped `enqueued_at_ms` onto the payload when it
+        # XADD'd the job; the difference between then and now is how
+        # long the message waited in PEL before a worker began handling
+        # it. None when the payload predates B.1 hardening or the field
+        # is otherwise absent — keep the column NULL rather than
+        # synthesising a value.
+        worker_pickup_ms: int | None = None
+        if job.enqueued_at_ms is not None:
+            worker_pickup_ms = max(
+                0, int(time.time() * 1000) - int(job.enqueued_at_ms),
+            )
 
         try:
             await process_one_job(
@@ -267,6 +313,7 @@ class WorkerConsumer:
                 resolve_reference=self._resolve_reference,
                 archive_to_r2=self._archive_to_r2,
                 worker_id=self._consumer_name,
+                worker_pickup_ms=worker_pickup_ms,
             )
         except PoisonJob:
             # No point retrying — voice missing, ref missing, etc.
@@ -274,6 +321,13 @@ class WorkerConsumer:
             logger.warning("poison job rid=%s — XACK to drain", rid_str)
             await self._ack(entry_id)
             self.poisoned += 1
+            _safe_metric(TTS_ERRORS, type="poison")
+            _safe_metric(
+                TTS_REQUESTS,
+                tenant=str(job.tenant_id),
+                voice=job.voice_id,
+                status="error",
+            )
             return
         except TransientFailure as e:
             # Engine/DB hiccup. DO NOT XACK — XAUTOCLAIM will retry on
@@ -287,9 +341,21 @@ class WorkerConsumer:
                 error=e,
             ):
                 self.dlqed += 1
+                _safe_metric(WORKER_DLQ)
+                _safe_metric(TTS_ERRORS, type="dlq")
+                # Only emit the SLO-denominator counter once the request
+                # has reached a terminal failure (DLQ). Mid-retry doesn't
+                # count — the same request_id may yet succeed.
+                _safe_metric(
+                    TTS_REQUESTS,
+                    tenant=str(job.tenant_id),
+                    voice=job.voice_id,
+                    status="error",
+                )
             else:
                 logger.info("transient failure rid=%s — leaving in PEL", rid_str)
             self.transient_failures += 1
+            _safe_metric(TTS_ERRORS, type="transient")
             return
         except Exception as e:
             # Unanticipated. Safer to keep the message in PEL than to
@@ -306,7 +372,16 @@ class WorkerConsumer:
                 error=e,
             ):
                 self.dlqed += 1
+                _safe_metric(WORKER_DLQ)
+                _safe_metric(TTS_ERRORS, type="dlq")
+                _safe_metric(
+                    TTS_REQUESTS,
+                    tenant=str(job.tenant_id),
+                    voice=job.voice_id,
+                    status="error",
+                )
             self.unknown_failures += 1
+            _safe_metric(TTS_ERRORS, type="unknown")
             return
 
         await self._ack(entry_id)

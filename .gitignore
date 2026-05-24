@@ -68,3 +68,6 @@ cloudflared.log
 # Test outputs (per-session experiment directories under experiments/
 # are kept by design; only ephemeral platform-smoke runs are excluded)
 experiments/platform-smoke/
+
+# Claude Code local state
+.claude/

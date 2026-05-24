@@ -219,6 +219,7 @@ async def test_pipeline_happy_path_commits_then_publishes_final(setup_db):
         resolve_reference=_stub_resolver(setup),
         archive_to_r2=_local_archiver(setup),
         worker_id="worker-test-1",
+        worker_pickup_ms=12,
     )
 
     # 3 sentence chunks + 1 final = 4 entries on the result stream.
@@ -252,6 +253,22 @@ async def test_pipeline_happy_path_commits_then_publishes_final(setup_db):
         assert usage[0].queue_wait_ms >= 0
         assert usage[0].inference_ms is not None
         assert usage[0].inference_ms >= 0
+        # Faz C step 1 — latency waterfall expansion.
+        # worker_pickup_ms is threaded through from the consumer (here
+        # injected directly into process_one_job for the unit test).
+        assert usage[0].worker_pickup_ms == 12
+        # reference_resolve_ms is measured around the resolver call; the
+        # stub resolver is in-process so the value is small but valid.
+        assert usage[0].reference_resolve_ms is not None
+        assert usage[0].reference_resolve_ms >= 0
+        # The stub engine yields immediately and publish_chunk runs on
+        # fakeredis — both first_pcm_ms / first_audio_ms must be set and
+        # non-negative; first_audio_ms >= first_pcm_ms by construction
+        # (the PCM-yield timestamp is recorded before publish returns).
+        assert usage[0].first_pcm_ms is not None
+        assert usage[0].first_pcm_ms >= 0
+        assert usage[0].first_audio_ms is not None
+        assert usage[0].first_audio_ms >= usage[0].first_pcm_ms
         assert usage[0].sentence_count == 3
         assert usage[0].status == "ok"
         # 3 sentences × 1024 samples × int16 = 6144 bytes; duration =

@@ -215,6 +215,25 @@ async def test_async_job_completes_when_worker_is_running(setup):
         artifacts = list(setup["artifact_dir"].iterdir())
         assert len(artifacts) == 1
         assert artifacts[0].read_bytes()[:4] == b"RIFF"  # valid WAV
+
+        # Faz C step 1 — the full latency waterfall must be persisted on
+        # the usage row at job completion. Worker captured
+        # worker_pickup_ms from payload.enqueued_at_ms, pipeline filled
+        # reference_resolve_ms / first_pcm_ms / first_audio_ms.
+        from db import AsyncSessionLocal
+        from repos import UsageRepo
+        async with AsyncSessionLocal() as s:
+            usage_rows = await UsageRepo(s, setup["tenant_id"]).recent(limit=5)
+        assert usage_rows, "worker never wrote a usage row"
+        row = usage_rows[0]
+        assert row.worker_pickup_ms is not None
+        assert row.worker_pickup_ms >= 0
+        assert row.reference_resolve_ms is not None
+        assert row.reference_resolve_ms >= 0
+        assert row.first_pcm_ms is not None
+        assert row.first_pcm_ms >= 0
+        assert row.first_audio_ms is not None
+        assert row.first_audio_ms >= row.first_pcm_ms
     finally:
         stop.set()
         try:

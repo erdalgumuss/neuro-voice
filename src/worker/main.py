@@ -18,10 +18,53 @@ import os
 import signal
 import sys
 
+from prometheus_client import start_http_server
+
+from observability import REGISTRY
+
 from .consumer import WorkerConsumer
+from .heartbeat import WorkerHeartbeatState, start_heartbeat_loop
 from .runtime import boot_worker
 
 logger = logging.getLogger("nqai_voice.worker")
+
+
+_metrics_server_started = False
+
+
+def _start_metrics_server() -> None:
+    """Bind Prometheus exposition on NQAI_WORKER_METRICS_PORT (default 9100).
+
+    Skip if the env var is '0' / 'off' (single-box dev, tests).
+    Idempotent: only the first call actually binds; subsequent calls in
+    the same process are no-ops. This matters in tests that invoke
+    `worker.main.run()` multiple times within one pytest process.
+    `OSError` (address in use, permission denied) is logged and swallowed
+    so a metrics-port glitch can never block worker startup."""
+    global _metrics_server_started
+    if _metrics_server_started:
+        return
+    raw = os.environ.get("NQAI_WORKER_METRICS_PORT", "9100").strip()
+    if raw in {"0", "off", "false", "no", ""}:
+        logger.info("worker metrics http server disabled (NQAI_WORKER_METRICS_PORT=%r)", raw)
+        _metrics_server_started = True
+        return
+    try:
+        port = int(raw)
+    except ValueError:
+        logger.warning("invalid NQAI_WORKER_METRICS_PORT=%r — disabling", raw)
+        _metrics_server_started = True
+        return
+    addr = os.environ.get("NQAI_WORKER_METRICS_BIND", "0.0.0.0")
+    try:
+        start_http_server(port, addr=addr, registry=REGISTRY)
+        logger.info("worker metrics http server listening on %s:%d", addr, port)
+    except OSError as e:
+        logger.warning(
+            "metrics http server bind on %s:%d failed (%s) — continuing without /metrics",
+            addr, port, e,
+        )
+    _metrics_server_started = True
 
 
 async def _run_async() -> int:
@@ -61,13 +104,43 @@ async def _run_async() -> int:
     )
 
     logger.info(
-        "worker consumer ready (consumer=%s stream=%s group=%s block=%dms)",
+        "worker consumer ready (consumer=%s stream=%s group=%s block=%dms cap=%d)",
         consumer.consumer_name, consumer._stream, consumer._group,
-        consumer._block_ms,
+        consumer._block_ms, consumer.capacity,
     )
+
+    # Faz C heartbeat: publish capacity/in_flight to Redis so the gateway
+    # can do capacity-aware admission instead of XLEN-only backpressure.
+    def _get_heartbeat_state() -> WorkerHeartbeatState:
+        return WorkerHeartbeatState(
+            capacity=consumer.capacity,
+            in_flight=consumer.in_flight,
+            last_pickup_ms=consumer.last_pickup_ms,
+            started_at_ms=consumer.started_at_ms,
+        )
+
+    heartbeat_task = asyncio.create_task(
+        start_heartbeat_loop(
+            redis,
+            worker_id=consumer.consumer_name,
+            get_state=_get_heartbeat_state,
+            stop_event=stop,
+        ),
+        name="worker-heartbeat",
+    )
+
     try:
         await consumer.run()
     finally:
+        # Stop the heartbeat loop and wait for its best-effort DEL.
+        stop.set()
+        try:
+            await asyncio.wait_for(heartbeat_task, timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.warning("heartbeat task did not exit within 5s — cancelling")
+            heartbeat_task.cancel()
+        except Exception:
+            logger.exception("heartbeat task raised on shutdown")
         try:
             await redis.aclose()
         except Exception:
@@ -88,6 +161,7 @@ def run() -> int:
         level=os.environ.get("NQAI_LOG_LEVEL", "INFO"),
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
+    _start_metrics_server()
     try:
         return asyncio.run(_run_async())
     except KeyboardInterrupt:

@@ -262,12 +262,19 @@ async def process_one_job(
     resolve_reference: ReferenceResolver | None = None,
     archive_to_r2: ArchiveCallable | None = None,
     worker_id: str | None = None,
+    worker_pickup_ms: int | None = None,
 ) -> None:
     """Process a single TTS job end-to-end.
 
     Raises:
       PoisonJob       — caller should XACK (no point retrying)
       TransientFailure — caller should NOT XACK (let XAUTOCLAIM retry)
+
+    `worker_pickup_ms` is the consumer-measured latency from
+    `payload.enqueued_at_ms` to the moment the worker began handling
+    this job. Threaded down so the usage row carries the same
+    millisecond stamp the consumer observed (the pipeline itself never
+    sees the XREADGROUP timestamp).
     """
     if resolve_reference is None:
         # Lazy import — keeps `worker.pipeline` import-light for tests
@@ -306,8 +313,15 @@ async def process_one_job(
     reference_uri = voice_row.reference_uri
 
     # ---------- 2. resolve reference audio (R2 download in a thread) -----
+    # Faz C step 1: time the reference-resolve hop so we can attribute
+    # latency spikes to R2 cold reads vs engine vs archive separately.
+    ref_resolve_started = time.monotonic()
+    reference_resolve_ms: int | None = None
     try:
         ref_path = await asyncio.to_thread(resolve_reference, reference_uri)
+        reference_resolve_ms = int(
+            (time.monotonic() - ref_resolve_started) * 1000,
+        )
     except FileNotFoundError as e:
         await mark_terminal_failure(
             job,
@@ -333,6 +347,12 @@ async def process_one_job(
     pcm_buffer = bytearray()
     sample_rate = engine.sample_rate
     inference_started = time.monotonic()
+    # `first_pcm_ms`  = when the engine yielded its first SynthChunk
+    #                   (engine-local TTFB)
+    # `first_audio_ms` = when publish_chunk(...) returned for that first
+    #                   chunk (what the gateway can observe). Difference
+    #                   between the two = bridge / publish overhead.
+    first_pcm_ms: int | None = None
     first_audio_ms: int | None = None
 
     try:
@@ -343,8 +363,8 @@ async def process_one_job(
             reference_path=ref_path,
             language_id=job.language,
         ):
-            if first_audio_ms is None:
-                first_audio_ms = int(
+            if first_pcm_ms is None:
+                first_pcm_ms = int(
                     (time.monotonic() - inference_started) * 1000,
                 )
             await publish_chunk(
@@ -353,6 +373,10 @@ async def process_one_job(
                 pcm=chunk.pcm_int16,
                 sentence_text=getattr(chunk, "sentence_text", None),
             )
+            if first_audio_ms is None:
+                first_audio_ms = int(
+                    (time.monotonic() - inference_started) * 1000,
+                )
             pcm_buffer.extend(chunk.pcm_int16)
             seq += 1
     except Exception as e:
@@ -425,6 +449,10 @@ async def process_one_job(
                 elapsed_ms=elapsed_ms,
                 queue_wait_ms=_queue_wait_ms(job, started_wall_ms),
                 inference_ms=inference_ms,
+                worker_pickup_ms=worker_pickup_ms,
+                reference_resolve_ms=reference_resolve_ms,
+                first_pcm_ms=first_pcm_ms,
+                first_audio_ms=first_audio_ms,
                 rtf=rtf,
                 status="ok",
                 worker_id=worker_id,
@@ -437,6 +465,34 @@ async def process_one_job(
         # in Faz C), but client correctness is preserved.
         logger.exception("idempotency.complete + usage.record commit failed for %s", rid)
         raise TransientFailure(f"db_commit_failed: {e}") from e
+
+    # ---------- 6b. Prometheus waterfall histograms (Faz C step 2) -------
+    # Observe each populated waterfall stage. None values are skipped
+    # silently by record_waterfall so retries / partial failures don't
+    # pollute the histograms with phantom zeros.
+    try:
+        from observability import TTS_REQUESTS, record_waterfall
+
+        record_waterfall(
+            tenant=str(tenant_id),
+            voice=voice_view.voice_id,
+            queue_wait_ms=_queue_wait_ms(job, started_wall_ms),
+            worker_pickup_ms=worker_pickup_ms,
+            reference_resolve_ms=reference_resolve_ms,
+            first_pcm_ms=first_pcm_ms,
+            first_audio_ms=first_audio_ms,
+            inference_ms=inference_ms,
+            total_ms=elapsed_ms,
+        )
+        TTS_REQUESTS.labels(
+            tenant=str(tenant_id),
+            voice=voice_view.voice_id,
+            status="success",
+        ).inc()
+    except Exception:
+        # Metrics MUST NOT break the request path. Observability is
+        # best-effort; a misbehaving Prometheus client gets swallowed.
+        logger.exception("waterfall metric observation failed for %s", rid)
 
     # ---------- 7. publish final marker (ONLY after commit succeeded) ---
     # Gateway invariant: seeing final=True ⇒ GET /v1/tts/jobs/{id}

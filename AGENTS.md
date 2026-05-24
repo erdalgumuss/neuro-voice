@@ -235,3 +235,43 @@ B.1.5 is done when:
 - R2 artifact finalization happens AFTER the live chunks have been published, not before.
 - A measured latency waterfall (queue wait, worker pickup, reference resolve, first PCM,
   gateway first chunk, total inference, RTF) is reachable from `usage_records`.
+
+C (v0) is done when:
+
+- `usage_records` persists the waterfall: `queue_wait_ms`, `worker_pickup_ms`,
+  `reference_resolve_ms`, `first_pcm_ms`, `first_audio_ms`, `inference_ms` (5 of 6 land;
+  `gateway_first_byte_ms` deferred — gateway is pure I/O, doesn't measure it).
+- Prometheus exposition surface (`src/observability`) shipped: `/metrics` route on the
+  gateway, `start_http_server` on `NQAI_WORKER_METRICS_PORT` for the worker, dedicated
+  `CollectorRegistry`, bounded label discipline (no `request_id`, no user-controlled
+  `app_label`).
+- Worker → Redis heartbeats via `src/worker/heartbeat.py`; gateway aggregates via
+  `src/server/heartbeat.py::read_cluster_capacity`; `_check_queue_depth_or_503` is
+  capacity-aware with XLEN-only fallback when no heartbeats are visible.
+- SLO denominator: every terminal outcome bumps `nqai_tts_requests_total{status=...}` —
+  `success` (worker), `error` (worker poison/DLQ), `backpressure` (gateway 503).
+- Gateway SIGTERM drain is opt-in via `NQAI_GATEWAY_DRAIN_TIMEOUT_S` (default 0,
+  production sets 10).
+- Integration tests cover `/metrics` + capacity-aware backpressure
+  (`tests/test_metrics_endpoint.py`).
+
+Deferred to Faz C v1 (next round, decision-log entry will record the scope):
+
+- Real-GPU first_audio_ms measurement (runbook + numbers in the closure doc).
+- Per-voice sticky routing + `nqai_worker_cold_load_seconds{voice_id}` metric.
+- pgBouncer transaction-mode pool config.
+- `pgroll` zero-downtime migration tooling.
+- Grafana dashboard JSON checked into `deploy/`.
+
+## Env vars (Faz C additions)
+
+| Var | Default | Effect |
+|---|---|---|
+| `NQAI_WORKER_METRICS_PORT` | `9100` | Prometheus exposition port; set to `0`/`off` to disable |
+| `NQAI_WORKER_METRICS_BIND` | `0.0.0.0` | Bind address for the metrics server |
+| `NQAI_WORKER_CAPACITY` | `1` | Declared concurrent-job capacity in heartbeats |
+| `NQAI_WORKER_HEARTBEAT_INTERVAL_S` | `1.0` | Refresh cadence |
+| `NQAI_WORKER_HEARTBEAT_TTL_S` | `3.0` | TTL on the heartbeat hash |
+| `NQAI_WORKER_HEARTBEAT_PREFIX` | `nqai.worker.heartbeat` | Key prefix (must match gateway) |
+| `NQAI_GATEWAY_HEARTBEAT_STALE_MS` | `5000` | Workers older than this are excluded from cluster capacity |
+| `NQAI_GATEWAY_DRAIN_TIMEOUT_S` | `0` | SIGTERM drain delay; production sets 10 |

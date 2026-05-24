@@ -17,6 +17,7 @@ time.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import uuid
@@ -43,6 +44,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from audio.wav import pcm16_to_wav_bytes
 from db.session import get_session
+from observability import (
+    QUEUE_DEPTH,
+    TTS_REQUESTS,
+    WORKER_CAPACITY,
+    WORKER_COUNT,
+    WORKER_INFLIGHT,
+    render_metrics,
+)
 from registry.audio_io import trim_and_resample_to_wav  # still used by enroll
 from registry.catalog import (
     ALLOWED_AUDIO_SUFFIXES,
@@ -60,6 +69,7 @@ from repos import (
 from .admin import admin_router
 from .auth import AuthContext, require_auth
 from .config import settings
+from .heartbeat import read_cluster_capacity
 from .queue import TtsJobPayload, TtsJobQueue, get_queue, parse_idempotency_key
 from .result_stream import (
     ResultStreamTimeout,
@@ -149,8 +159,24 @@ async def lifespan(_app: FastAPI):
         settings.tenant_rate_limit_per_minute,
     )
     yield
-    # In-flight drain is a Faz A.6+ item (lifespan shutdown hook). For now
-    # we just log so the K8s eviction trail is visible.
+    # Faz C SIGTERM graceful drain. uvicorn already stops accepting new
+    # connections before invoking lifespan shutdown and waits for the
+    # in-flight request handlers itself. This extra delay just gives
+    # background tasks (audit writes, result-stream consumers) a chance
+    # to flush before the loop tears down.
+    #
+    # Default 0 (opt-in): production deployments set
+    # `NQAI_GATEWAY_DRAIN_TIMEOUT_S=10`. CI/tests leave it unset so
+    # TestClient teardown stays fast and deterministic.
+    drain_s = float(os.environ.get("NQAI_GATEWAY_DRAIN_TIMEOUT_S", "0"))
+    if drain_s > 0:
+        logger.info("gateway draining (timeout=%.1fs)", drain_s)
+        try:
+            await asyncio.sleep(min(drain_s, 30.0))
+        except asyncio.CancelledError:
+            # Hard-kill (SIGKILL or second SIGTERM) — exit immediately.
+            logger.warning("gateway drain cancelled — exiting")
+            raise
     logger.info("nqai-voice gateway shutting down")
 
 
@@ -209,6 +235,30 @@ async def health() -> HealthResponse:
         voice_count=0,
         version=VERSION,
     )
+
+
+# --------------------------------------------------------------------------- #
+# /metrics — Prometheus exposition (Faz C step 2)
+# --------------------------------------------------------------------------- #
+@app.get("/metrics", tags=["meta"], include_in_schema=False)
+async def metrics(
+    queue: Annotated[TtsJobQueue, Depends(get_queue)],
+) -> Response:
+    """Prometheus scrape endpoint. Refreshes cluster gauges (worker count,
+    capacity, in-flight, queue depth) from Redis on every scrape so a
+    Prometheus pull always sees fresh values without a background task."""
+    try:
+        cap = await read_cluster_capacity(queue.redis)
+        WORKER_COUNT.set(cap.worker_count)
+        WORKER_CAPACITY.set(cap.total_capacity)
+        WORKER_INFLIGHT.set(cap.total_inflight)
+        QUEUE_DEPTH.labels(stream="jobs").set(await queue.depth())
+    except Exception:
+        # Don't fail the scrape on a Redis blip — Prometheus would alarm
+        # on /metrics 500s. Stale gauges are tolerable for one cycle.
+        logger.exception("metrics gauge refresh failed; serving stale values")
+    body, content_type = render_metrics()
+    return Response(content=body, media_type=content_type)
 
 
 # --------------------------------------------------------------------------- #
@@ -478,7 +528,7 @@ async def synthesize(
 
     rid = _request_id_for(request)
     redis = queue._redis  # use the same client the queue is bound to
-    await _check_queue_depth_or_503(queue, session, ctx)
+    await _check_queue_depth_or_503(queue, session, ctx, voice_id=body.voice_id)
 
     # Reserve idempotency upfront so a duplicate sync POST with the
     # same X-Request-Id replays cleanly (same path as async jobs).
@@ -589,7 +639,7 @@ async def synthesize_stream(
     )
     rid = _request_id_for(request)
     redis = queue._redis
-    await _check_queue_depth_or_503(queue, session, ctx)
+    await _check_queue_depth_or_503(queue, session, ctx, voice_id=body.voice_id)
 
     idem = IdempotencyRepo(session, ctx.tenant_id)
     await idem.reserve(
@@ -698,11 +748,63 @@ async def _check_queue_depth_or_503(
     queue: TtsJobQueue,
     session: AsyncSession,
     ctx: AuthContext,
+    *,
+    voice_id: str | None = None,
 ) -> None:
-    """Apply the same Redis stream backpressure to every submit path."""
+    """Faz C capacity-aware backpressure.
+
+    Strategy:
+    1. Read cluster capacity from worker heartbeats. If any healthy workers
+       exist, admit when the cluster has enough total throughput to absorb
+       the already-queued jobs plus this one within a bounded window.
+       Concretely: ``depth <= total_capacity + headroom`` where ``headroom
+       = total_capacity - total_inflight``. Interpretation: "next wave of
+       jobs (one tick of full-cluster work, plus the slots that are free
+       right now) is enough to consume what's queued." A hard XLEN ceiling
+       still applies as a fail-safe so a slow cluster can't accept
+       unbounded jobs even if its self-reported capacity says otherwise.
+    2. If NO healthy workers (cold start, all workers crashed, or the
+       heartbeat read itself failed): fall back to the original XLEN-only
+       path — the queue ceiling is the only signal we trust. This keeps
+       backpressure safe even when the heartbeat plane is degraded.
+    """
     depth = await queue.depth()
-    if depth <= QUEUE_DEPTH_BACKPRESSURE:
-        return
+    capacity_known = False
+    try:
+        cluster = await read_cluster_capacity(queue.redis)
+        capacity_known = cluster.worker_count > 0
+    except Exception as e:
+        # Throttle the noise — under a degraded Redis every admission
+        # path would otherwise emit a stack trace per request. Drop the
+        # traceback; the exception type + message is enough signal.
+        logger.warning(
+            "read_cluster_capacity failed — falling back to XLEN-only: %s", e,
+        )
+        cluster = None
+        capacity_known = False
+
+    if capacity_known and cluster is not None:
+        headroom = cluster.total_capacity - cluster.total_inflight
+        if (
+            headroom >= 0
+            and depth <= QUEUE_DEPTH_BACKPRESSURE
+            and depth <= headroom + cluster.total_capacity
+        ):
+            return
+        denied_reason = "capacity_exhausted"
+        payload = {
+            "queue_depth": depth,
+            "limit": QUEUE_DEPTH_BACKPRESSURE,
+            "worker_count": cluster.worker_count,
+            "total_capacity": cluster.total_capacity,
+            "total_inflight": cluster.total_inflight,
+        }
+    else:
+        if depth <= QUEUE_DEPTH_BACKPRESSURE:
+            return
+        denied_reason = "queue_depth_limit"
+        payload = {"queue_depth": depth, "limit": QUEUE_DEPTH_BACKPRESSURE}
+
     await AuditRepo(session).record(
         actor_type="api_key",
         actor_id=ctx.api_key_id,
@@ -710,9 +812,20 @@ async def _check_queue_depth_or_503(
         action="tts.backpressure",
         result="denied",
         tenant_id=ctx.tenant_id,
-        payload={"queue_depth": depth, "limit": QUEUE_DEPTH_BACKPRESSURE},
+        payload={**payload, "reason": denied_reason},
     )
     await session.commit()
+    # SLO denominator: every terminal outcome bumps TTS_REQUESTS so
+    # dashboards can compute error_rate = errors / requests from one
+    # family. Backpressure rejections count as a refusal outcome.
+    try:
+        TTS_REQUESTS.labels(
+            tenant=str(ctx.tenant_id),
+            voice=voice_id or "unknown",
+            status="backpressure",
+        ).inc()
+    except Exception:
+        logger.exception("TTS_REQUESTS backpressure increment failed — ignoring")
     raise HTTPException(
         status.HTTP_503_SERVICE_UNAVAILABLE,
         detail="queue is saturated; retry shortly",
@@ -787,7 +900,7 @@ async def create_tts_job(
 
         # Backpressure check before reserving — we don't want to leave
         # half-baked rows behind when the queue is saturated.
-        await _check_queue_depth_or_503(queue, session, ctx)
+        await _check_queue_depth_or_503(queue, session, ctx, voice_id=body.voice_id)
 
         reserved, _is_new = await idem.reserve_or_get(
             request_id=idempotency_key,

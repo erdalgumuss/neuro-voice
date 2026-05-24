@@ -42,6 +42,7 @@ dependencies = [
 
     # Observability
     "structlog>=24.4",
+    "prometheus_client>=0.21",
 
     # Config
     "pyyaml>=6.0",
@@ -88,6 +89,7 @@ include = [
     "db*",
     "frontend*",
     "live*",
+    "observability*",
     "registry*",
     "repos*",
     "server*",
