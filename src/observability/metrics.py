@@ -166,6 +166,26 @@ TTS_FIRST_AUDIO_SECONDS: Histogram = Histogram(
     registry=REGISTRY,
 )
 
+WORKER_COLD_LOAD_SECONDS: Histogram = Histogram(
+    "nqai_worker_cold_load_seconds",
+    "Time spent loading a voice's model + LoRA adapter into VRAM "
+    "when the per-voice cache missed. Fires ONCE per voice per "
+    "worker process at boot (NQAI_WORKER_WARMUP_VOICES eager path) "
+    "OR on the first inference for an un-cached voice. Watching p95 "
+    "tells operators whether per-voice sticky routing or a bigger "
+    "NQAI_LORA_CACHE_SIZE is worth the engineering.",
+    labelnames=("voice",),
+    buckets=(
+        # Cold-load is dominated by VRAM I/O + safetensors mmap; for
+        # VoxCPM2 + a per-voice LoRA on L4 we expect 1-5s, A100 0.5-2s.
+        # Buckets span dev-stub (sub-second) through worst-case (60 s
+        # = adapter-pull-from-cold-R2 scenario).
+        0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0,
+    ),
+    registry=REGISTRY,
+)
+
+
 TTS_GATEWAY_FIRST_BYTE_SECONDS: Histogram = Histogram(
     "nqai_tts_gateway_first_byte_seconds",
     "Client-facing TTFB on /v1/tts/stream: time from gateway receiving "
@@ -302,6 +322,7 @@ __all__ = [
     "TTS_WORKER_PICKUP_SECONDS",
     "WATERFALL_BUCKETS",
     "WORKER_CAPACITY",
+    "WORKER_COLD_LOAD_SECONDS",
     "WORKER_COUNT",
     "WORKER_DLQ",
     "WORKER_INFLIGHT",

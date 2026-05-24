@@ -86,6 +86,79 @@ def build_archive_to_r2():
     return _archive
 
 
+def _parse_warmup_voice_list(raw: str | None) -> list[str]:
+    """Parse NQAI_WORKER_WARMUP_VOICES — comma-separated voice_id
+    slugs. Empty / unset → []. Whitespace trimmed, empties dropped.
+    """
+    if not raw:
+        return []
+    return [v.strip() for v in raw.split(",") if v.strip()]
+
+
+async def _warmup_voices_from_env(engine: BaseSynthEngine) -> None:
+    """Faz B.5 Dalga 1.3 — eager-load any voice_ids listed in
+    NQAI_WORKER_WARMUP_VOICES so the first inference for each is hot.
+
+    Each voice's LoRA adapter is loaded into the engine's per-voice
+    cache (the LRU eviction policy still applies — if the list is
+    longer than NQAI_LORA_CACHE_SIZE the later entries evict the
+    earlier ones, defeating the purpose; operators must size the
+    cache to fit the list).
+
+    Failures are logged + skipped — one un-resolvable voice MUST NOT
+    prevent the worker from starting. The cold-load metric still
+    fires from inside _model_for_adapter so an operator can see what
+    succeeded vs failed."""
+    voice_ids = _parse_warmup_voice_list(
+        os.environ.get("NQAI_WORKER_WARMUP_VOICES"),
+    )
+    if not voice_ids:
+        return
+
+    logger.info(
+        "warmup voice list: %s (cache_size=%s)",
+        voice_ids,
+        getattr(engine, "_cache_size", "n/a"),
+    )
+
+    # Best-effort: each voice is loaded against its OWNER tenant's
+    # catalog row (the slug is globally unique only within a tenant,
+    # but the warmup env list is a single global list — we resolve
+    # the first matching row regardless of tenant).
+    from sqlalchemy import select
+
+    from db import AsyncSessionLocal
+    from db.models import Voice
+    from storage.reference_resolver import resolve_reference_uri
+
+    for voice_id in voice_ids:
+        try:
+            async with AsyncSessionLocal() as s:
+                row = (await s.execute(
+                    select(Voice).where(
+                        Voice.voice_id == voice_id,
+                        Voice.deleted_at.is_(None),
+                    ).limit(1)
+                )).scalar_one_or_none()
+            if row is None:
+                logger.warning("warmup skip: voice_id=%s not found", voice_id)
+                continue
+            # Resolve the reference too so a stub R2 download error
+            # surfaces at warmup time, not on the first request.
+            await asyncio.to_thread(
+                resolve_reference_uri, row.reference_uri,
+            )
+            # warmup_voice loads the adapter; engine emits the
+            # cold-load histogram with voice=voice_id.
+            await asyncio.to_thread(engine.warmup_voice, row)
+            logger.info("warmup voice ready: %s", voice_id)
+        except Exception:
+            logger.exception(
+                "warmup voice failed: voice_id=%s — continuing",
+                voice_id,
+            )
+
+
 async def boot_worker(
     *,
     engine: BaseSynthEngine | None = None,
@@ -99,7 +172,12 @@ async def boot_worker(
 
     Warmup (when enabled) loads VoxCPM2 weights into VRAM eagerly so
     the first job a worker handles doesn't pay the 30-60s cold-load
-    cost on the user-visible critical path."""
+    cost on the user-visible critical path.
+
+    Faz B.5 Dalga 1.3 — additionally pre-loads any voice_id slugs
+    listed in NQAI_WORKER_WARMUP_VOICES so per-voice LoRA adapters
+    are hot on the first inference. The cold-load Prometheus metric
+    (nqai_worker_cold_load_seconds{voice}) fires for each preload."""
     engine = engine or build_engine()
     redis = redis or build_redis()
     if archive_to_r2 is None:
@@ -111,6 +189,10 @@ async def boot_worker(
         # don't block other startup awaits (e.g. Redis ping).
         await asyncio.to_thread(engine.warmup)
         logger.info("worker warmup: done")
+        # Per-voice warmup runs AFTER base warmup so the per-voice
+        # load uses the freshly-warm base. A failure here doesn't
+        # abort boot — the worker still starts and serves cold-load.
+        await _warmup_voices_from_env(engine)
 
     # Ping Redis so we fail fast on bad URL / unreachable host instead
     # of hanging on the first XREADGROUP.

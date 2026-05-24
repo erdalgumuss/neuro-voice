@@ -78,6 +78,10 @@ EXPECTED_METRICS: dict[str, dict[str, object]] = {
         "type": "histogram",
         "labels": {"tenant", "voice"},
     },
+    "nqai_worker_cold_load_seconds": {
+        "type": "histogram",
+        "labels": {"voice"},
+    },
     "nqai_tts_inference_seconds": {
         "type": "histogram",
         "labels": {"tenant", "voice"},

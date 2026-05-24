@@ -216,6 +216,21 @@ class VoxCPM2Engine:
     def warmup(self) -> None:
         self._load()
 
+    def warmup_voice(self, voice: Voice) -> None:
+        """Faz B.5 Dalga 1.3 — eager-load a specific voice's adapter
+        into the cache so the FIRST inference for that voice doesn't
+        pay cold-load latency.
+
+        Called by the worker boot path for every voice listed in
+        `NQAI_WORKER_WARMUP_VOICES`. The cold-load metric fires from
+        inside `_model_for_adapter` so warmups show up in the same
+        histogram as in-band cache misses — operators see both."""
+        self._load()  # base model first
+        self._model_for_adapter(
+            self._adapter_for_voice(voice),
+            voice_id=voice.voice_id,
+        )
+
     # ----- internals ----------------------------------------------------
 
     def _adapter_for_voice(self, voice: Voice) -> LoRAAdapterSpec | None:
@@ -246,7 +261,18 @@ class VoxCPM2Engine:
             # will reclaim eventually; we just lose a tick of VRAM headroom.
             pass
 
-    def _model_for_adapter(self, adapter: LoRAAdapterSpec | None):
+    def _model_for_adapter(
+        self,
+        adapter: LoRAAdapterSpec | None,
+        *,
+        voice_id: str | None = None,
+    ):
+        """Return a (possibly cached) base+adapter model.
+
+        `voice_id` is the catalog slug used to label cold-load metrics.
+        When omitted (background warmup paths that don't have a voice
+        slug) the metric is labelled `_base_` so the cardinality stays
+        bounded and operators can still see un-attributed cold loads."""
         key = (self._model_id, adapter.cache_key if adapter else None)
         cached = self._models.get(key)
         if cached is not None:
@@ -295,15 +321,29 @@ class VoxCPM2Engine:
                 self.sample_rate = int(inner_sr)
             self._models[key] = model
             self._model = model
+            duration = time.time() - t0
             logger.info(
                 "model ready in %.1fs (sr=%d Hz, device=%s, cfg=%.2f, steps=%d, adapter=%s)",
-                time.time() - t0,
+                duration,
                 self.sample_rate,
                 self._device,
                 self._cfg_value,
                 self._inference_timesteps,
                 adapter_label,
             )
+            # Faz B.5 Dalga 1.3 — cold-load metric. Label voice=_base_
+            # for the no-voice warmup path so the series stays bounded
+            # (catalog voice slugs + "_base_" is the full label domain).
+            try:
+                from observability import WORKER_COLD_LOAD_SECONDS
+                WORKER_COLD_LOAD_SECONDS.labels(
+                    voice=voice_id or "_base_",
+                ).observe(duration)
+            except Exception:
+                logger.exception(
+                    "cold-load metric emission failed for adapter=%s — ignoring",
+                    adapter_label,
+                )
             return model
 
     def _engine_params_for_voice(
@@ -340,7 +380,10 @@ class VoxCPM2Engine:
         engine_overrides: dict[str, float | int] | None = None,
     ) -> np.ndarray:
         """Single synthesis call. Returns float32 mono numpy at self.sample_rate."""
-        model = self._model_for_adapter(self._adapter_for_voice(voice))
+        model = self._model_for_adapter(
+            self._adapter_for_voice(voice),
+            voice_id=voice.voice_id,
+        )
         cfg_value, inference_timesteps = self._engine_params_for_voice(
             voice, overrides=engine_overrides,
         )

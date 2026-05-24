@@ -281,6 +281,20 @@
         "expr": "sum by (endpoint) (rate(nqai_tts_deprecated_endpoint_total[1m]))",
         "legendFormat": "{{endpoint}}"
       }]
+    },
+    {
+      "id": 34,
+      "type": "timeseries",
+      "title": "Voice cold-load p95 (per-voice cache miss)",
+      "description": "Time spent loading a voice's adapter into VRAM on a cache miss. Sustained p95 > 5s for a voice → consider adding it to NQAI_WORKER_WARMUP_VOICES or bumping NQAI_LORA_CACHE_SIZE.",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 44},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "targets": [{
+        "refId": "A",
+        "expr": "histogram_quantile(0.95, sum by (le, voice) (rate(nqai_worker_cold_load_seconds_bucket[5m])))",
+        "legendFormat": "{{voice}} p95"
+      }]
     }
   ]
 }

@@ -116,6 +116,9 @@ def test_dashboard_covers_critical_metrics() -> None:
         "nqai_worker_capacity_total",
         "nqai_worker_inflight_total",
         "nqai_worker_dlq_total",
+        # Faz B.5 Dalga 1.3 — per-voice cold-load. Pinned because the
+        # whole point is operators see WHICH voices need warmup.
+        "nqai_worker_cold_load_seconds_bucket",
     )
     data = json.dumps(json.loads(DASHBOARD_PATH.read_text()))
     missing = [m for m in must_reference if m not in data]
