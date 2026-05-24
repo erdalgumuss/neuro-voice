@@ -366,6 +366,39 @@ async def process_one_job(
     first_pcm_ms: int | None = None
     first_audio_ms: int | None = None
 
+    # Faz B.5 Dalga 1.2 — resolve model_id preset to engine_overrides.
+    # Unknown model_ids surface as PoisonJob (no point retrying — the
+    # client sent garbage and a retry would garbage-in/garbage-out).
+    # Explicit `params` (cfg_value, inference_timesteps) override the
+    # preset when both are present — request-level wins per-key.
+    try:
+        from server.models import UnknownModelError, resolve_model
+        preset = resolve_model(job.model_id)
+    except UnknownModelError as e:
+        await mark_terminal_failure(
+            job,
+            redis=redis,
+            error_code="unknown_model_id",
+            message=str(e),
+            worker_id=worker_id,
+            elapsed_ms=int((time.monotonic() - started) * 1000),
+            session_factory=session_factory,
+            attempt=attempt,
+        )
+        raise PoisonJob(str(e)) from e
+
+    engine_overrides: dict[str, float | int] = {
+        "cfg_value": preset.cfg_value,
+        "inference_timesteps": preset.inference_timesteps,
+    }
+    if job.params:
+        # Explicit request-level params win — pre-validated by pydantic
+        # via TTSJobParams (cfg_value in [1.0, 3.5], steps in [4, 40]).
+        for k in ("cfg_value", "inference_timesteps"):
+            v = job.params.get(k)
+            if v is not None:
+                engine_overrides[k] = v
+
     try:
         async for chunk in iter_engine_chunks(
             engine,
@@ -373,6 +406,7 @@ async def process_one_job(
             voice=voice_view,
             reference_path=ref_path,
             language_id=job.language,
+            engine_overrides=engine_overrides,
         ):
             if first_pcm_ms is None:
                 first_pcm_ms = int(

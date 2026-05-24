@@ -73,6 +73,7 @@ from .admin import admin_router
 from .auth import AuthContext, require_auth
 from .config import settings
 from .heartbeat import read_cluster_capacity
+from .models import UnknownModelError, list_models, resolve_model
 from .queue import TtsJobPayload, TtsJobQueue, get_queue, parse_idempotency_key
 from .result_stream import (
     ResultStreamTimeout,
@@ -84,6 +85,8 @@ from .schemas import (
     EnrollResponse,
     ErrorResponse,
     HealthResponse,
+    ModelListResponse,
+    ModelPublic,
     TTSJobAccepted,
     TTSJobCreate,
     TTSJobMetrics,
@@ -215,6 +218,7 @@ app.add_middleware(
     expose_headers=[
         "X-NQAI-Sample-Rate",
         "X-NQAI-Voice-Id",
+        "X-NQAI-Model-Id",
         "X-NQAI-Sentences",
         "X-NQAI-Duration-Seconds",
         "X-NQAI-Elapsed-Seconds",
@@ -296,6 +300,38 @@ def _voice_to_public(v) -> VoicePublic:
         visibility=v.visibility,
         created_at=v.created_at.isoformat(),
         created_by=str(v.created_by_key_id) if v.created_by_key_id else "system",
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Model catalog (public, no auth — same as ElevenLabs /v1/models)
+# --------------------------------------------------------------------------- #
+@app.get("/v1/models", response_model=ModelListResponse, tags=["meta"])
+async def list_tts_models() -> ModelListResponse:
+    """Faz B.5 Dalga 1.2 — public model registry.
+
+    Clients call this to discover available `model_id` values
+    (turbo / hd / character presets on the VoxCPM2 base) along with
+    the underlying inference knobs. Mirrors the vendor pattern
+    (ElevenLabs `GET /v1/models`); unauthenticated because the
+    catalog is the same for every tenant.
+    """
+    from .models import DEFAULT_MODEL_ID
+    models = [
+        ModelPublic(
+            model_id=p.model_id,
+            display_name=p.display_name,
+            description=p.description,
+            cfg_value=p.cfg_value,
+            inference_timesteps=p.inference_timesteps,
+            is_default=p.is_default,
+        )
+        for p in list_models()
+    ]
+    return ModelListResponse(
+        models=models,
+        count=len(models),
+        default_model_id=DEFAULT_MODEL_ID,
     )
 
 
@@ -555,6 +591,16 @@ async def synthesize(
         body.voice_id, ctx.tenant_id, session,
     )
 
+    # Faz B.5 Dalga 1.2 — validate model_id early so the client gets
+    # a clean 400 instead of a worker-side PoisonJob. Resolves to the
+    # registry default when body.model_id is None.
+    try:
+        preset = resolve_model(body.model_id)
+    except UnknownModelError as e:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, detail=str(e),
+        ) from e
+
     rid = _request_id_for(request)
     redis = queue._redis  # use the same client the queue is bound to
     await _check_queue_depth_or_503(queue, session, ctx, voice_id=body.voice_id)
@@ -600,6 +646,7 @@ async def synthesize(
             text=body.text,
             language=body.language,
             audio_format=body.audio_format,
+            model_id=preset.model_id,
             app_label=_app_label_from(request),
             enqueued_at_ms=int(time() * 1000),
         )
@@ -648,6 +695,7 @@ async def synthesize(
         "X-NQAI-Request-Id": str(rid),
         "X-NQAI-Sample-Rate": str(sample_rate),
         "X-NQAI-Voice-Id": db_voice.voice_id,
+        "X-NQAI-Model-Id": preset.model_id,
         "X-NQAI-Sentences": str(sentences),
         "X-NQAI-Duration-Seconds": f"{duration_ms / 1000.0:.3f}",
         "X-NQAI-Elapsed-Seconds": f"{elapsed_ms / 1000.0:.3f}",
@@ -726,6 +774,15 @@ async def synthesize_stream(
     db_voice = await _assert_voice_accessible_or_404(
         body.voice_id, ctx.tenant_id, session,
     )
+
+    # Faz B.5 Dalga 1.2 — validate model_id early (400 instead of poison).
+    try:
+        preset = resolve_model(body.model_id)
+    except UnknownModelError as e:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, detail=str(e),
+        ) from e
+
     rid = _request_id_for(request)
     redis = queue._redis
     await _check_queue_depth_or_503(queue, session, ctx, voice_id=body.voice_id)
@@ -753,6 +810,7 @@ async def synthesize_stream(
             text=body.text,
             language=body.language,
             audio_format=body.audio_format,
+            model_id=preset.model_id,
             app_label=_app_label_from(request),
             enqueued_at_ms=int(time() * 1000),
         )
@@ -780,6 +838,7 @@ async def synthesize_stream(
         "X-NQAI-Request-Id": str(rid),
         "X-NQAI-Sample-Rate": str(sample_rate),
         "X-NQAI-Voice-Id": db_voice.voice_id,
+        "X-NQAI-Model-Id": preset.model_id,
     }
 
     # Faz C v1 item 1 — gateway-side TTFB measurement.
@@ -1115,6 +1174,14 @@ async def create_tts_job(
         body.voice_id, ctx.tenant_id, session,
     )
 
+    # Faz B.5 Dalga 1.2 — model_id validation up front.
+    try:
+        preset = resolve_model(body.model_id)
+    except UnknownModelError as e:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, detail=str(e),
+        ) from e
+
     # Stripe-style guarded reserve: same key + same body → replay; same
     # key + different body → 409. The body_hash check is critical —
     # without it a typo-fix POST under the same key silently no-ops.
@@ -1180,6 +1247,7 @@ async def create_tts_job(
         text=body.text,
         language=body.language,
         audio_format=body.audio_format,
+        model_id=preset.model_id,
         params=body.params.model_dump(exclude_none=True) if body.params else None,
         app_label=_app_label_from(request),
         enqueued_at_ms=int(time() * 1000),

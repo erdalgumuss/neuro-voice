@@ -166,6 +166,37 @@ def test_health_does_not_require_auth(client):
     assert body["version"].count(".") == 2
 
 
+def test_v1_models_lists_registry(client):
+    """Faz B.5 Dalga 1.2 — `GET /v1/models` returns the preset
+    registry. Public (no bearer required), mirroring ElevenLabs."""
+    client.headers.pop("Authorization", None)
+    r = client.get("/v1/models")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["count"] >= 3, body
+    ids = {m["model_id"] for m in body["models"]}
+    assert "nqai-voxcpm2-tr-turbo" in ids
+    assert "nqai-voxcpm2-tr-hd" in ids
+    assert "nqai-voxcpm2-tr-character" in ids
+    # Default is exactly one — `default_model_id` must point to a
+    # registered model.
+    assert body["default_model_id"] in ids
+    # Each entry exposes the inference knobs so a sophisticated client
+    # can show "X steps, cfg=Y" to power users.
+    for m in body["models"]:
+        assert m["cfg_value"] > 0
+        assert m["inference_timesteps"] > 0
+        assert m["display_name"]
+        assert m["description"]
+
+
+def test_v1_models_does_not_require_auth(client):
+    """Match the vendor mental model: the model catalog is public
+    metadata, not a tenant-scoped resource."""
+    client.headers.pop("Authorization", None)
+    assert client.get("/v1/models").status_code == 200
+
+
 # --------------------------------------------------------------------------- #
 # Auth gates
 # --------------------------------------------------------------------------- #

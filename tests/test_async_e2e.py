@@ -63,7 +63,7 @@ class _StubEngine:
     def warmup(self) -> None:
         pass
 
-    def synthesize_stream(self, *, text, voice, reference_path, language_id="tr"):
+    def synthesize_stream(self, *, text, voice, reference_path, language_id="tr", engine_overrides=None):
         # 2 sentences of silence.
         for i, s in enumerate(("İlk cümle.", "İkinci cümle.")):
             yield _FakeChunk(
@@ -440,6 +440,109 @@ async def test_first_chunk_in_result_stream_before_engine_finishes(setup):
                 f"first chunk at {saw_chunk_at_ms:.1f}ms — bridge present "
                 "but too slow"
             )
+    finally:
+        stop.set()
+        try:
+            await asyncio.wait_for(worker_task, timeout=2.0)
+        except asyncio.TimeoutError:
+            worker_task.cancel()
+        app.dependency_overrides.clear()
+
+
+async def test_stream_rejects_unknown_model_id_with_400(setup):
+    """Faz B.5 Dalga 1.2 — gateway resolves `model_id` at request entry
+    so a bad value returns 400 (clean client error) instead of a
+    worker-side PoisonJob (slow + opaque). Default `model_id` (None)
+    falls through to the registry default and works fine; tested by
+    the existing happy-path E2E tests."""
+    import httpx
+
+    from server.auth import get_redis
+    from server.main import app
+    from server.queue import DEFAULT_STREAM, TtsJobQueue, get_queue
+
+    fake_redis = fakeredis.aioredis.FakeRedis()
+    queue = TtsJobQueue(fake_redis, stream=DEFAULT_STREAM)
+    app.dependency_overrides[get_redis] = lambda: fake_redis
+    app.dependency_overrides[get_queue] = lambda: queue
+
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test",
+            headers={"Authorization": f"Bearer {setup['bearer']}"},
+            timeout=5.0,
+        ) as client:
+            wav = _make_wav_bytes()
+            await client.post(
+                "/v1/voices",
+                data={"voice_id": "bm-voice", "display_name": "BM"},
+                files={"reference_audio": ("b.wav", wav, "audio/wav")},
+            )
+            r = await client.post(
+                "/v1/tts/stream",
+                json={
+                    "text": "Merhaba.",
+                    "voice_id": "bm-voice",
+                    "model_id": "nqai-flash-v99-does-not-exist",
+                },
+            )
+            assert r.status_code == 400, r.text
+            assert "unknown model_id" in r.text
+    finally:
+        app.dependency_overrides.clear()
+
+
+async def test_stream_echoes_model_id_response_header(setup):
+    """Faz B.5 Dalga 1.2 — `X-NQAI-Model-Id` response header echoes
+    the resolved preset id (the registry default when client sent
+    None). Vendor parity: ElevenLabs surfaces model id in response."""
+    import httpx
+
+    from server.auth import get_redis
+    from server.main import app
+    from server.queue import DEFAULT_STREAM, TtsJobQueue, get_queue
+    from worker.consumer import WorkerConsumer
+
+    fake_redis = fakeredis.aioredis.FakeRedis()
+    queue = TtsJobQueue(fake_redis, stream=DEFAULT_STREAM)
+    app.dependency_overrides[get_redis] = lambda: fake_redis
+    app.dependency_overrides[get_queue] = lambda: queue
+
+    stop = asyncio.Event()
+    consumer = WorkerConsumer(
+        redis=fake_redis, engine=_StubEngine(),
+        archive_to_r2=setup["archive"],
+        stop_event=stop, block_ms=10,
+    )
+    worker_task = asyncio.create_task(consumer.run())
+
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test",
+            headers={"Authorization": f"Bearer {setup['bearer']}"},
+            timeout=10.0,
+        ) as client:
+            wav = _make_wav_bytes()
+            await client.post(
+                "/v1/voices",
+                data={"voice_id": "mh-voice", "display_name": "MH"},
+                files={"reference_audio": ("m.wav", wav, "audio/wav")},
+            )
+            async with client.stream(
+                "POST",
+                "/v1/tts/stream",
+                json={
+                    "text": "Test.",
+                    "voice_id": "mh-voice",
+                    "model_id": "nqai-voxcpm2-tr-turbo",
+                },
+            ) as r:
+                assert r.status_code == 200
+                assert r.headers["x-nqai-model-id"] == "nqai-voxcpm2-tr-turbo"
+                async for _ in r.aiter_bytes():
+                    pass
     finally:
         stop.set()
         try:

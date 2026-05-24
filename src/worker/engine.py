@@ -66,6 +66,7 @@ class BaseSynthEngine(Protocol):
         voice: Voice,
         reference_path: Path,
         language_id: str = "tr",
+        engine_overrides: dict[str, float | int] | None = None,
     ) -> Iterator[SynthChunk]: ...
     def synthesize(
         self,
@@ -74,6 +75,7 @@ class BaseSynthEngine(Protocol):
         voice: Voice,
         reference_path: Path,
         language_id: str = "tr",
+        engine_overrides: dict[str, float | int] | None = None,
     ) -> SynthResult: ...
 
 
@@ -304,18 +306,44 @@ class VoxCPM2Engine:
             )
             return model
 
-    def _engine_params_for_voice(self, voice: Voice) -> tuple[float, int]:
-        params = voice.engine_params or {}
-        cfg_value = float(params.get("cfg_value", self._cfg_value))
+    def _engine_params_for_voice(
+        self,
+        voice: Voice,
+        *,
+        overrides: dict[str, float | int] | None = None,
+    ) -> tuple[float, int]:
+        """Resolve cfg_value + inference_timesteps with precedence:
+            explicit `overrides` (request-level: model_id preset OR
+                                  explicit params)
+            > voice.engine_params (catalog-level default)
+            > engine constructor default
+        """
+        base = voice.engine_params or {}
+        if overrides:
+            # Merge — request-level wins per-key.
+            base = {**base, **overrides}
+        cfg_value = float(base.get("cfg_value", self._cfg_value))
         inference_timesteps = int(
-            params.get("inference_timesteps", params.get("timesteps", self._inference_timesteps))
+            base.get(
+                "inference_timesteps",
+                base.get("timesteps", self._inference_timesteps),
+            )
         )
         return cfg_value, inference_timesteps
 
-    def _generate_one(self, text: str, voice: Voice, reference_path: Path) -> np.ndarray:
+    def _generate_one(
+        self,
+        text: str,
+        voice: Voice,
+        reference_path: Path,
+        *,
+        engine_overrides: dict[str, float | int] | None = None,
+    ) -> np.ndarray:
         """Single synthesis call. Returns float32 mono numpy at self.sample_rate."""
         model = self._model_for_adapter(self._adapter_for_voice(voice))
-        cfg_value, inference_timesteps = self._engine_params_for_voice(voice)
+        cfg_value, inference_timesteps = self._engine_params_for_voice(
+            voice, overrides=engine_overrides,
+        )
         with self._inference_lock:
             wav = model.generate(
                 text=text,
@@ -343,6 +371,7 @@ class VoxCPM2Engine:
         voice: Voice,
         reference_path: Path,
         language_id: str = "tr",
+        engine_overrides: dict[str, float | int] | None = None,
     ) -> Iterator[SynthChunk]:
         """Yield one `SynthChunk` per logical sentence.
 
@@ -353,6 +382,11 @@ class VoxCPM2Engine:
         VoxCPM2's own `generate_streaming` is great for real-time playback
         of a single utterance, but for multi-sentence responses we still
         prefer sentence-level boundaries to keep prosody coherent.
+
+        `engine_overrides` carries per-request `cfg_value` and/or
+        `inference_timesteps` overrides (e.g. resolved from a `model_id`
+        preset at the worker pipeline). See `server.models` for the
+        registry.
         """
         self._load()
         if not reference_path.is_file():
@@ -367,7 +401,10 @@ class VoxCPM2Engine:
 
         for idx, segment in enumerate(segments):
             t0 = time.time()
-            wav_np = self._generate_one(segment, voice, reference_path)
+            wav_np = self._generate_one(
+                segment, voice, reference_path,
+                engine_overrides=engine_overrides,
+            )
             elapsed_ms = (time.time() - t0) * 1000.0
             yield SynthChunk(
                 pcm_int16=_float_to_pcm16(wav_np),
@@ -384,6 +421,7 @@ class VoxCPM2Engine:
         voice: Voice,
         reference_path: Path,
         language_id: str = "tr",
+        engine_overrides: dict[str, float | int] | None = None,
     ) -> SynthResult:
         t0 = time.time()
         pcm_parts: list[bytes] = []
@@ -392,7 +430,8 @@ class VoxCPM2Engine:
         count = 0
         for i, chunk in enumerate(
             self.synthesize_stream(
-                text=text, voice=voice, reference_path=reference_path, language_id=language_id
+                text=text, voice=voice, reference_path=reference_path,
+                language_id=language_id, engine_overrides=engine_overrides,
             )
         ):
             if i > 0:

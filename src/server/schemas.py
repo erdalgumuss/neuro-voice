@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 # Faz B.5 Dalga 1 — codec layer (audit 2026-05-25): mp3 + opus added
 # alongside the existing wav/pcm16. mp3 (~3-5x smaller than wav) and
@@ -16,10 +16,19 @@ StreamFormat = Literal["wav", "pcm16", "mp3", "opus"]
 
 
 class TTSRequest(BaseModel):
+    # `model_id` collides with pydantic v2's protected namespace; silence
+    # the warning — this is intentional vendor parity (ElevenLabs and
+    # MiniMax both use `model_id` as the preset selector).
+    model_config = ConfigDict(protected_namespaces=())
+
     text: str = Field(..., min_length=1, max_length=20000)
     voice_id: str = Field(..., min_length=3, max_length=64)
     language: Literal["tr"] = "tr"
     audio_format: AudioFormat = "wav"
+    # Faz B.5 Dalga 1.2 — preset knob (turbo / hd / character). Resolved
+    # at the worker against `server.models.resolve_model`; unknown ids
+    # surface as 400 from the gateway. None = registry default.
+    model_id: str | None = Field(default=None, max_length=64)
 
 
 class TTSStreamRequest(TTSRequest):
@@ -55,6 +64,29 @@ class DeleteResponse(BaseModel):
     detail: str = "voice deleted"
 
 
+class ModelPublic(BaseModel):
+    """One row in `GET /v1/models`. Mirrors the vendor pattern
+    (ElevenLabs `/v1/models`, MiniMax model list) so clients can
+    pick a `model_id` from a discoverable catalog instead of
+    hard-coding strings."""
+    model_config = ConfigDict(protected_namespaces=())
+
+    model_id: str
+    display_name: str
+    description: str
+    cfg_value: float
+    inference_timesteps: int
+    is_default: bool
+
+
+class ModelListResponse(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
+    models: list[ModelPublic]
+    count: int
+    default_model_id: str
+
+
 class HealthResponse(BaseModel):
     status: Literal["ok", "warming", "degraded"]
     model_id: str
@@ -82,10 +114,13 @@ class TTSJobParams(BaseModel):
 
 
 class TTSJobCreate(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
     text: str = Field(..., min_length=1, max_length=20000)
     voice_id: str = Field(..., min_length=3, max_length=64)
     language: Literal["tr", "en"] = "tr"
     audio_format: AudioFormat = "wav"
+    model_id: str | None = Field(default=None, max_length=64)
     params: TTSJobParams | None = None
 
 
