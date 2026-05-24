@@ -71,6 +71,7 @@ from server.queue import (
 )
 
 from .engine import BaseSynthEngine
+from .live import iter_engine_chunks
 
 logger = logging.getLogger("nqai_voice.worker.pipeline")
 
@@ -321,49 +322,49 @@ async def process_one_job(
         raise PoisonJob(f"reference for {job.voice_id!r} missing") from e
 
     # ---------- 3-4. generate + publish chunks (NO final yet) -----------
-    # TODO(faz-b1.5): real streaming bridge.
-    #   We currently `list(engine.synthesize_stream(...))` inside a
-    #   thread, which serialises generation and only emits chunks AFTER
-    #   the full inference finishes — so the gateway sees them in one
-    #   burst rather than as they're produced. Once WS / sync proxy
-    #   need true low-TTFB, replace `_drain_engine` with a queue.Queue
-    #   bridge: producer thread runs the sync generator and pushes
-    #   chunks into the queue; this coroutine awaits queue.get_nowait
-    #   in a loop and XADDs as each chunk lands. Tracked by
-    #   `test_pipeline_chunks_currently_drained_before_publish` below.
+    # Sentence-level streaming bridge: the engine sync generator runs
+    # on a thread, each yielded SynthChunk lands on an asyncio queue,
+    # and we publish_chunk immediately. First-byte latency drops from
+    # `total_inference_ms` to `first_sentence_inference_ms`. The seq
+    # numbering stays "one per sentence" so result-stream consumers
+    # (sync proxy, /v1/tts/stream, future WebSocket) keep their
+    # dedup-by-seq invariant. See `worker.live.iter_engine_chunks`.
     seq = 0
     pcm_buffer = bytearray()
     sample_rate = engine.sample_rate
-
-    def _drain_engine() -> list[Any]:
-        """Sync generator wrapper — engine is GIL+GPU-bound, push to a
-        thread so the event loop stays responsive. See TODO above."""
-        return list(engine.synthesize_stream(
-            text=job.text, voice=voice_view, reference_path=ref_path,
-            language_id=job.language,
-        ))
-
     inference_started = time.monotonic()
+    first_audio_ms: int | None = None
+
     try:
-        chunks = await asyncio.to_thread(_drain_engine)
+        async for chunk in iter_engine_chunks(
+            engine,
+            text=job.text,
+            voice=voice_view,
+            reference_path=ref_path,
+            language_id=job.language,
+        ):
+            if first_audio_ms is None:
+                first_audio_ms = int(
+                    (time.monotonic() - inference_started) * 1000,
+                )
+            await publish_chunk(
+                redis, rid,
+                seq=seq,
+                pcm=chunk.pcm_int16,
+                sentence_text=getattr(chunk, "sentence_text", None),
+            )
+            pcm_buffer.extend(chunk.pcm_int16)
+            seq += 1
     except Exception as e:
         # TRANSIENT — DO NOT publish error chunk or fail the idempotency
         # row. The consumer will skip XACK; XAUTOCLAIM hands the same
         # job to another worker after `idle_ms`. If the failure is
-        # actually deterministic, Faz C's DLQ catches it after N retries
-        # and only THEN converts to a terminal failure visible to client.
-        logger.exception("engine.synthesize_stream failed for %s (transient)", rid)
+        # actually deterministic, the DLQ path catches it after N
+        # retries and only THEN converts to a terminal failure visible
+        # to the client.
+        logger.exception("engine streaming failed for %s (transient)", rid)
         raise TransientFailure(str(e)) from e
     inference_ms = int((time.monotonic() - inference_started) * 1000)
-
-    for chunk in chunks:
-        await publish_chunk(
-            redis, rid,
-            seq=seq, pcm=chunk.pcm_int16,
-            sentence_text=chunk.sentence_text,
-        )
-        pcm_buffer.extend(chunk.pcm_int16)
-        seq += 1
 
     # ---------- 5. archive — REQUIRED for client GET to see audio_url ---
     if archive_to_r2 is None:

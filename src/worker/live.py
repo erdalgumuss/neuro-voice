@@ -28,7 +28,7 @@ import contextlib
 import logging
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from live import (
     DEFAULT_FRAME_MS,
@@ -39,7 +39,11 @@ from live import (
 )
 
 from .engine import BaseSynthEngine
-from .pipeline import VoiceView
+
+if TYPE_CHECKING:
+    # Forward reference only — `worker.pipeline` imports `worker.live`
+    # at runtime, so we must NOT import VoiceView at module-load time.
+    from .pipeline import VoiceView
 
 logger = logging.getLogger("nqai_voice.worker.live")
 
@@ -77,31 +81,34 @@ class InMemoryLiveMediaSink:
         self.closed = True
 
 
-async def iter_live_audio_frames(
+async def iter_engine_chunks(
     engine: BaseSynthEngine,
     *,
     text: str,
     voice: VoiceView,
     reference_path: Path,
     language_id: str = "tr",
-    frame_ms: int = DEFAULT_FRAME_MS,
     cancel_event: asyncio.Event | None = None,
-) -> AsyncIterator[LiveAudioFrame]:
-    """Yield PCM frames as soon as the blocking engine yields chunks.
+) -> AsyncIterator[object]:
+    """Bridge the blocking sync engine generator into async.
 
-    The producer thread never builds a list of all chunks. It pushes each
-    model chunk into the asyncio queue immediately, split into 20ms frames.
-    If the engine only supports sentence-level chunks today, the first
-    sentence still flows before later sentences are generated.
+    The engine runs on a thread; each `SynthChunk` it yields is pushed
+    onto an asyncio queue immediately. The caller consumes chunks one
+    at a time and can XADD / write each as soon as the engine produces
+    it — no `list(...)` drain.
+
+    Returns the raw SynthChunk objects (not LiveAudioFrame), so the
+    caller controls framing. For HTTP chunked streaming we publish
+    one sentence-chunk per result-stream entry; for WebRTC we'd
+    split into 20ms frames via `split_pcm16_frames` instead.
     """
     loop = asyncio.get_running_loop()
-    queue: asyncio.Queue[LiveAudioFrame | BaseException | None] = asyncio.Queue()
+    queue: asyncio.Queue[object | BaseException | None] = asyncio.Queue()
 
-    def _put(item: LiveAudioFrame | BaseException | None) -> None:
+    def _put(item: object | BaseException | None) -> None:
         loop.call_soon_threadsafe(queue.put_nowait, item)
 
     def _producer() -> None:
-        seq = 0
         try:
             for chunk in engine.synthesize_stream(
                 text=text,
@@ -111,25 +118,7 @@ async def iter_live_audio_frames(
             ):
                 if cancel_event is not None and cancel_event.is_set():
                     return
-                sample_rate = int(getattr(chunk, "sample_rate", DEFAULT_SAMPLE_RATE))
-                sentence_text = getattr(chunk, "sentence_text", None)
-                for pcm in split_pcm16_frames(
-                    chunk.pcm_int16,
-                    sample_rate=sample_rate,
-                    frame_ms=frame_ms,
-                ):
-                    if cancel_event is not None and cancel_event.is_set():
-                        return
-                    _put(
-                        LiveAudioFrame(
-                            seq=seq,
-                            pcm_int16=pcm,
-                            sample_rate=sample_rate,
-                            duration_ms=frame_ms,
-                            sentence_text=sentence_text,
-                        )
-                    )
-                    seq += 1
+                _put(chunk)
         except BaseException as exc:
             _put(exc)
         finally:
@@ -152,6 +141,44 @@ async def iter_live_audio_frames(
                 await asyncio.wait_for(producer_task, timeout=1.0)
         else:
             await producer_task
+
+
+async def iter_live_audio_frames(
+    engine: BaseSynthEngine,
+    *,
+    text: str,
+    voice: VoiceView,
+    reference_path: Path,
+    language_id: str = "tr",
+    frame_ms: int = DEFAULT_FRAME_MS,
+    cancel_event: asyncio.Event | None = None,
+) -> AsyncIterator[LiveAudioFrame]:
+    """Same as `iter_engine_chunks` but emits fixed-duration
+    `LiveAudioFrame` objects (default 20ms) for transports that need
+    constant frame rate. The HTTP chunked path uses `iter_engine_chunks`
+    directly; WebRTC-style transports use this."""
+    seq = 0
+    async for chunk in iter_engine_chunks(
+        engine, text=text, voice=voice, reference_path=reference_path,
+        language_id=language_id, cancel_event=cancel_event,
+    ):
+        sample_rate = int(getattr(chunk, "sample_rate", DEFAULT_SAMPLE_RATE))
+        sentence_text = getattr(chunk, "sentence_text", None)
+        for pcm in split_pcm16_frames(
+            chunk.pcm_int16,
+            sample_rate=sample_rate,
+            frame_ms=frame_ms,
+        ):
+            if cancel_event is not None and cancel_event.is_set():
+                return
+            yield LiveAudioFrame(
+                seq=seq,
+                pcm_int16=pcm,
+                sample_rate=sample_rate,
+                duration_ms=frame_ms,
+                sentence_text=sentence_text,
+            )
+            seq += 1
 
 
 async def run_live_synthesis(

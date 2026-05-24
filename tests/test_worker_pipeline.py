@@ -537,58 +537,69 @@ async def test_pipeline_publishes_final_only_after_db_commit(setup_db, monkeypat
 # --------------------------------------------------------------------------- #
 # Streaming bridge TODO (audit fix #5)
 # --------------------------------------------------------------------------- #
-async def test_pipeline_chunks_currently_drained_before_publish(setup_db, monkeypatch):
-    """Pinning current behaviour: the pipeline collects all engine chunks
-    into a list BEFORE publishing any. True streaming (chunk available
-    on Redis as soon as engine yields it) needs a thread→asyncio queue
-    bridge — see TODO(faz-b1.5) in worker.pipeline.
+async def test_pipeline_publishes_first_chunk_before_engine_finishes(
+    setup_db, monkeypatch,
+):
+    """The B.1.5 streaming bridge contract: the first `publish_chunk`
+    call must reach Redis BEFORE the engine has finished yielding all
+    sentences. Replaces the old "drain-then-emit" pin with the
+    inverted invariant — confirms `iter_live_audio_frames` actually
+    plumbs into the pipeline."""
+    import time as _time
 
-    When that bridge lands, this test should be updated to assert the
-    *opposite* (chunks appear on the stream incrementally, not in a
-    burst after generation completes)."""
     setup = setup_db
-    from worker.pipeline import process_one_job
-
-    captured: dict[str, list] = {"chunk_yield_then_xadd": []}
-
-    # Spy on engine yields vs. publish_chunk calls — they must NOT
-    # interleave under current behaviour (all yields then all xadds).
     import worker.pipeline as pmod
+    from worker.pipeline import process_one_job
     real_publish_chunk = pmod.publish_chunk
 
-    chunks_yielded: list[str] = []
+    # Engine that artificially blocks between sentence yields so the
+    # event loop has plenty of time to publish the first sentence
+    # before the second one is generated.
+    class _SlowSentenceEngine(_StubEngine):
+        def __init__(self) -> None:
+            super().__init__(sentences=["Birinci.", "İkinci.", "Üçüncü."])
+            self.yields_at_ms: list[int] = []
 
-    class _SpyEngine(_StubEngine):
         def synthesize_stream(self, **kw):
+            t0 = _time.monotonic()
             for c in super().synthesize_stream(**kw):
-                chunks_yielded.append(c.sentence_text)
+                self.yields_at_ms.append(
+                    int((_time.monotonic() - t0) * 1000),
+                )
                 yield c
+                _time.sleep(0.05)  # 50ms between sentence yields
 
-    publish_calls: list[str] = []
+    publish_at_ms: list[int] = []
+    started = _time.monotonic()
 
     async def spy_publish_chunk(redis, rid, **kw):
-        publish_calls.append(kw.get("sentence_text") or "")
+        publish_at_ms.append(
+            int((_time.monotonic() - started) * 1000),
+        )
         await real_publish_chunk(redis, rid, **kw)
 
     monkeypatch.setattr(pmod, "publish_chunk", spy_publish_chunk)
 
     redis = fakeredis.aioredis.FakeRedis()
+    engine = _SlowSentenceEngine()
     job = _job(setup)
     await _reserve(setup, job)
     await process_one_job(
-        job, redis=redis, engine=_SpyEngine(),
+        job, redis=redis, engine=engine,
         resolve_reference=_stub_resolver(setup),
         archive_to_r2=_local_archiver(setup),
     )
 
-    # All yields happened before any publish — drain-then-emit, NOT
-    # true streaming. When the queue bridge replaces _drain_engine,
-    # invert this assertion to prove the new contract holds.
-    yields_seen_at_first_publish = len(chunks_yielded) if publish_calls else 0
-    assert yields_seen_at_first_publish == len(chunks_yielded), (
-        "CURRENT (drain-then-emit) behaviour expected; if this fires "
-        "the streaming bridge has landed — update both the assertion "
-        "and the TODO(faz-b1.5) in worker/pipeline.py"
+    # All three sentences eventually publish.
+    assert len(publish_at_ms) == 3, publish_at_ms
+
+    # The first publish must happen BEFORE the engine yields the
+    # second sentence. Engine sleeps 50ms between yields; we give
+    # ourselves a generous 40ms window — the first publish must
+    # land inside it.
+    second_yield_ms = engine.yields_at_ms[1] if len(engine.yields_at_ms) > 1 else None
+    assert second_yield_ms is not None
+    assert publish_at_ms[0] < second_yield_ms, (
+        f"first publish at {publish_at_ms[0]}ms came AFTER second "
+        f"sentence yielded at {second_yield_ms}ms — bridge not active"
     )
-    captured["chunk_yield_then_xadd"] = list(chunks_yielded)
-    assert captured["chunk_yield_then_xadd"]
