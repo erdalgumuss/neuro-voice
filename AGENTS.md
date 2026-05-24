@@ -114,10 +114,10 @@ label it explicitly and keep the B.1 correctness path stable.
 - Reference audio and LoRA adapter access should be cache-aware and bounded.
 - Measure latency as a waterfall: queue wait, worker pickup, reference resolve, adapter load,
   first model frame, first PCM, gateway first chunk, client TTFB, total inference, RTF.
-- B.1.5 live TTS is WebRTC-first through LiveKit. WebSocket/HTTP streaming are compatibility
-  or debug paths, not the primary low-latency media path.
-- Live requests must use admission control from `nqai.worker.live.*` heartbeats; they should
-  not sit in the durable Redis job queue waiting for capacity.
+- B.1.5 ships as a one-way streaming TTS API (HTTP chunked primary, async jobs for
+  long-running + presigned artifacts). Duplex voice-agent / WebRTC is a separate product
+  surface and lives behind a different transport when that product ships — do not
+  re-introduce LiveKit/WebRTC into the TTS API path.
 
 ## Commands
 
@@ -225,10 +225,13 @@ B.1 is done when:
 
 B.1.5 is done when:
 
-- First audio is emitted before full generation completes.
-- Live session endpoint exists and returns a LiveKit room/token only when warm worker capacity exists.
-- Latency waterfall metrics are recorded.
-- Warm worker/reference/adapter cache behavior is explicit.
-- R2 artifact finalization is not on the live first-audio critical path.
-- A measured report distinguishes infra latency from model/runtime latency.
-- `src/worker/live.py` keeps latency-sensitive generation on a thread-to-async frame bridge, not a full-drain list.
+- First audio is emitted to the result stream before full generation completes (proven by
+  `tests/test_worker_pipeline.py::test_pipeline_publishes_first_chunk_before_engine_finishes`
+  and `tests/test_async_e2e.py::test_first_chunk_in_result_stream_before_engine_finishes`).
+- `POST /v1/tts/stream` chunked HTTP is the primary live path, no LiveKit/WebRTC scaffold.
+- `worker.live.iter_engine_chunks` keeps latency-sensitive generation on a thread-to-async
+  bridge, never `list(engine.synthesize_stream(...))`.
+- Warm worker / reference / adapter cache behavior is explicit (bounded LRU, env-tunable).
+- R2 artifact finalization happens AFTER the live chunks have been published, not before.
+- A measured latency waterfall (queue wait, worker pickup, reference resolve, first PCM,
+  gateway first chunk, total inference, RTF) is reachable from `usage_records`.
