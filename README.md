@@ -1,39 +1,68 @@
 # neuro-voice
 
-NQAI'nin Türkçe + voice-cloning + streaming TTS yığını. **VoxCPM2** (Apache 2.0, OpenBMB, 2B param) üzerine voice catalog + Türkçe text frontend + sentence-chunked streaming API.
+NQAI'nin Türkçe + voice-cloning + streaming TTS yığını. **VoxCPM2** (Apache 2.0, OpenBMB, 2B param) üzerine multi-tenant API gateway + Türkçe text frontend + sentence-chunked synthesis + Stripe-style async job queue.
 
-## Şu an
+## Şu an (2026-05-24, commit `ba6be69`)
 
-**Platform v0.2 hazır** — repo çalıştırılabilir bir TTS API'sı.
+**Faz A bitti, Faz B'nin gateway tarafı %40 hazır.** Repo bir multi-tenant TTS platform iskeleti — auth + storage + idempotency + backpressure yerinde, GPU work hâlâ gateway içinde (worker süreci Faz B.1'de ayrılır).
 
-- Mimari: [docs/architecture/platform-v0.2.md](docs/architecture/platform-v0.2.md)
-- VoxCPM2 entegrasyon detayları: [docs/architecture/voxcpm2-integration.md](docs/architecture/voxcpm2-integration.md)
+- Checkpoint + Faz B yol haritası: [docs/audit/checkpoint-2026-05-24-faz-a-exit.md](docs/audit/checkpoint-2026-05-24-faz-a-exit.md)
+- Kanonik mimari (v1.0 hedefi): [docs/architecture/scale-roadmap.md](docs/architecture/scale-roadmap.md)
 - Karar log'u: [docs/decisions/README.md](docs/decisions/README.md)
-- Damıtma (NQAI ses omurgası vizyonu): [docs/research/02-distilled-findings.md](docs/research/02-distilled-findings.md)
+- VoxCPM2 entegrasyon detayları: [docs/architecture/voxcpm2-integration.md](docs/architecture/voxcpm2-integration.md)
+- Mimari index: [docs/architecture/README.md](docs/architecture/README.md)
+
+**Şu an çalışan:** 4 tenant × N API key, DB-backed Bearer auth (argon2id), filesystem + R2 dual-mode voice catalog, sync `POST /v1/tts` (tek-process), async `POST /v1/tts/jobs` (Redis Streams XADD + Stripe idempotency, worker yok), admin UI (FastAPI + Jinja2 + HTMX).
+
+**Bilinen yarı-durumlar:** async job XADD ediyor ama tüketici yok → `queued` durumunda kalır; WebSocket yok; sync path canlı tutuldu (deprecation kararı bekliyor). Detaylar checkpoint doc'unda §5.
 
 ## Hedef
 
-12 ay içinde **Türkçe + 3-7 yaş çocuk konuşması + sürdürülebilir karakter sesi** alt-domain'inde premium kalite. VoxCPM2 base + Türkçe SFT + per-character LoRA + production-grade streaming. Genel TTS yarışına girmiyoruz; dar niche'te derinleşiyoruz.
+12 ay içinde **Türkçe + 3-7 yaş çocuk konuşması + sürdürülebilir karakter sesi** alt-domain'inde premium kalite. VoxCPM2 base + Türkçe SFT + per-character LoRA + production-grade streaming. Genel TTS yarışına girmiyoruz; dar niche'te derinleşiyoruz. 4 tenant × 5 concurrent başlangıç, yatay ölçek ile 200 user.
 
-## Quickstart — Colab (en hızlı)
-
-[notebooks/03-platform-server-colab.ipynb](notebooks/03-platform-server-colab.ipynb)'yi Colab'da aç → T4 / A100 GPU seç → cell 1 → kernel restart → cell 3-9. ~6-8 dakika sonra `https://*.trycloudflare.com` URL'in ve iki API key'in olur. NEEKO köprü sesi referansını Drive root'una koyarsan cell 4'te otomatik enroll eder.
-
-Tek tıklama: <https://colab.research.google.com/github/erdalgumuss/neuro-voice/blob/main/notebooks/03-platform-server-colab.ipynb>
-
-## Quickstart — lokal (GPU varsa, ~8 GB VRAM)
+## Quickstart — Docker Compose (önerilen)
 
 ```bash
 git clone git@github.com:erdalgumuss/neuro-voice.git
 cd neuro-voice
-python -m venv .venv && source .venv/bin/activate
-pip install -e .                       # üretim
-pip install -e ".[dev]"                # + testler
 
 cp .env.example .env
-# .env içine en az NQAI_API_KEYS doldur:
-#   python -c "import secrets; print('nqai-' + secrets.token_urlsafe(24))"
-set -a; source .env; set +a
+# .env içindeki minimum set:
+#   NQAI_JWT_SECRET=<min 32 char random>
+#   NQAI_REQUIRE_AUTH=true
+
+docker compose -f docker-compose.dev.yaml up -d
+docker compose -f docker-compose.dev.yaml exec gateway alembic upgrade head
+docker compose -f docker-compose.dev.yaml exec gateway \
+    python scripts/seed_operator.py --email <your-email>
+
+open http://localhost:8000/admin/         # operator login + tenant/key CRUD
+```
+
+Stack: gateway (FastAPI + admin UI) + Postgres 16 + Redis 7. Worker servisi henüz yok — TTS endpoint'leri tek-process'te koşar (Faz B.1'de ayrılır).
+
+## Quickstart — Colab (GPU'lu uçtan uca)
+
+[notebooks/03-platform-server-colab.ipynb](notebooks/03-platform-server-colab.ipynb)'yi Colab'da aç → T4 / A100 GPU → cell 1 → kernel restart → cell 3-9. ~6-8 dakika sonra `https://*.trycloudflare.com` URL'i ve iki API key.
+
+Tek tıklama: <https://colab.research.google.com/github/erdalgumuss/neuro-voice/blob/main/notebooks/03-platform-server-colab.ipynb>
+
+> **Not:** Notebook hâlâ v0.2 era flow'unu (legacy env-list auth + filesystem catalog) gösterir. A.6 cutover sonrası DB-backed auth ile uyumlu güncelleme Faz B'nin Ö3 kararından sonra yapılacak.
+
+## Quickstart — bare metal (GPU varsa, ~8 GB VRAM)
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+
+cp .env.example .env
+# DB + Redis ayağa kalkmalı (docker compose veya manuel)
+export NQAI_DATABASE_URL=postgresql+asyncpg://...
+export NQAI_REDIS_URL=redis://localhost:6379
+export NQAI_JWT_SECRET=<random>
+
+alembic upgrade head
+python scripts/seed_operator.py --email <your-email>
 
 PYTHONPATH=src python -m uvicorn server.main:app --host 0.0.0.0 --port 8000
 ```
@@ -42,69 +71,85 @@ PYTHONPATH=src python -m uvicorn server.main:app --host 0.0.0.0 --port 8000
 
 ## API yüzeyi
 
+### Tenant API (Bearer `Authorization: Bearer nqai_<prefix>_<secret>`)
+
+| Method | Yol | Scope | Ne yapar |
+|---|---|---|---|
+| GET | `/health` | — | model yüklendi mi, voice sayısı, sürüm |
+| POST | `/admin/warmup` | — | VoxCPM2 ağırlıklarını eager yükle (auth zorunlu) |
+| GET | `/v1/voices` | `voice:read` | tenant'a görünen voice catalog |
+| GET | `/v1/voices/{id}` | `voice:read` | tek voice manifest |
+| POST | `/v1/voices` | `voice:write` | yeni voice enroll (multipart: `reference_audio` + form) |
+| DELETE | `/v1/voices/{id}` | `voice:write` | voice + reference dosyasını sil |
+| POST | `/v1/tts` | `tts:write` | sync 48 kHz WAV / PCM16 (tek-process) |
+| POST | `/v1/tts/stream` | `tts:write` | sentence-chunked streaming WAV / PCM16 |
+| POST | `/v1/tts/jobs` | `tts:write` | **async** — `Idempotency-Key` header (UUID) zorunlu, 202 + `job_id` |
+| GET | `/v1/tts/jobs/{job_id}` | `tts:read` | job durumu (queued / running / complete / failed) + presigned audio URL |
+
+### Operator API (JWT cookie, ayrı login)
+
 | Method | Yol | Ne yapar |
 |---|---|---|
-| GET | `/health` | model yüklenmiş mi, voice sayısı, sürüm |
-| POST | `/admin/warmup` | VoxCPM2 ağırlıklarını eager yükle |
-| GET | `/v1/voices` | catalog |
-| GET | `/v1/voices/{id}` | tek voice manifest |
-| POST | `/v1/voices` | yeni voice enroll (multipart: `reference_audio` + form alanları) |
-| DELETE | `/v1/voices/{id}` | voice + reference dosyasını sil |
-| POST | `/v1/tts` | non-streaming WAV / PCM16 (48 kHz) |
-| POST | `/v1/tts/stream` | sentence-chunked streaming WAV / PCM16 |
+| GET | `/admin/` | tenant list + API key CRUD UI |
+| POST | `/admin/login` | operator login → JWT cookie |
+| POST | `/admin/tenants` | yeni tenant |
+| POST | `/admin/tenants/{id}/keys` | yeni API key (secret tek seferlik gösterilir) |
+| DELETE | `/admin/tenants/{id}/keys/{kid}` | revoke |
+| GET | `/admin/usage` | son 30 g usage |
 
 OpenAPI: server ayaktayken `GET /docs` (Swagger UI) ve `GET /openapi.json`.
 
+### Async job örneği
+
 ```bash
-KEY="nqai-..."
-URL="https://<your-tunnel>.trycloudflare.com"
+KEY="nqai-prod-..."
+URL="http://localhost:8000"
+RID=$(python -c 'import uuid; print(uuid.uuid4())')
 
-# voice catalog
-curl -H "Authorization: Bearer $KEY" $URL/v1/voices
-
-# yeni voice enroll (15s referans, WAV/MP3 OK — 16 kHz mono'ya resample edilir)
-curl -X POST $URL/v1/voices \
+# 1. Submit
+curl -X POST $URL/v1/tts/jobs \
   -H "Authorization: Bearer $KEY" \
-  -F voice_id=ayse-warm-01 \
-  -F 'display_name=Ayşe (warm)' \
-  -F gender=female \
-  -F 'style_tags=warm,storyteller' \
-  -F reference_audio=@./ayse_ref_15s.wav
+  -H "Idempotency-Key: $RID" \
+  -H "Content-Type: application/json" \
+  -d '{"text":"Merhaba, ben Neeko.","voice_id":"neeko-v01"}'
+# → 202 {"job_id":"<RID>","status":"queued",...}
 
-# sentezle (48 kHz WAV)
+# 2. Poll (worker yok hâlâ — `queued` döner)
+curl -H "Authorization: Bearer $KEY" $URL/v1/tts/jobs/$RID
+```
+
+### Sync örnek (Faz B.3 deprecation döngüsüne girecek)
+
+```bash
 curl -X POST $URL/v1/tts \
   -H "Authorization: Bearer $KEY" \
   -H "Content-Type: application/json" \
-  -d '{"text":"Merhaba, ben Neeko. Bugün seninle ne oynayalım?","voice_id":"neeko-v01"}' \
+  -d '{"text":"Bir varmış, bir yokmuş.","voice_id":"neeko-v01"}' \
   --output out.wav
-
-# streaming (ffplay anında çalmaya başlar)
-curl -X POST $URL/v1/tts/stream \
-  -H "Authorization: Bearer $KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"text":"Bir varmış, bir yokmuş. Çok uzak bir ülkede küçük bir tavşan yaşarmış.","voice_id":"neeko-v01"}' \
-  | ffplay -nodisp -autoexit -
 ```
 
 ## Testler
 
 ```bash
-python -m pytest             # 55 test: frontend + API smoke + seed lock
-python -m pytest tests/test_numbers.py -v
+python -m pytest                    # 182 test (~50 s)
+python -m pytest tests/test_async_jobs.py -v
+python -m pytest tests/test_repos.py::test_cross_tenant_isolation -v
+ruff check src tests                # lint
 ```
 
-API smoke testleri VoxCPM2'yi stub'larla — torch dışında ağır bağımlılık istemez. Tam end-to-end için Colab notebook veya GPU'lu lokal.
+API smoke + async + repo + auth + R2 testleri VoxCPM2'yi stub'larla; torch dışında ağır bağımlılık istemez. Tam end-to-end için Colab notebook veya GPU'lu lokal.
 
 ## Repo disiplini
 
-Üst-katman [`/home/alfonso/neeko-firmware/CLAUDE.md`](../CLAUDE.md) 7 disiplin kuralı + bu repo'nun [CLAUDE.md](CLAUDE.md)'sindeki ek 6 disiplin geçerli. Özet:
+Üst-katman [`/home/alfonso/neeko-firmware/CLAUDE.md`](../CLAUDE.md) 7 disiplin kuralı + bu repo'nun [CLAUDE.md](CLAUDE.md)'sindeki ek 7 disiplin geçerli. Özet:
 
 - Önce karar (decision log satırı), sonra kod
 - Her sayı / her benchmark / her "X iyi" cümlesi link + tarih
 - Eval kataloğu sabit, modeller değişir
-- Premium = dar domain (TR + karakter + call-center + child-directed), genel TTS yarışı yasak
+- Premium = dar domain (TR + karakter + child-directed), genel TTS yarışı yasak
 - NEEKO değil **NQAI ses omurgası** (4 ürün ortak altyapı)
-- **Birincil base model: VoxCPM2** (Apache 2.0). Engine adapter pattern arkasında — gerekirse swap edilir.
+- **Birincil base model: VoxCPM2** (Apache 2.0); engine adapter pattern arkasında
+- Forward-only Alembic; tenant_id filter mandatory (D-08); audit log append-only (D-04); idempotency required (D-05)
 
 ## Üst katmanla ilişki
 

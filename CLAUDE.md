@@ -2,33 +2,47 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-`neuro-voice` — NQAI'nin Türkçe + voice-cloning + streaming TTS yığını. **VoxCPM2 (Apache 2.0, OpenBMB, 2B param)** üzerine voice catalog + Türkçe text frontend + sentence-chunked streaming API. Üst-katman `/home/alfonso/neeko-firmware/CLAUDE.md` 7 disiplin kuralı geçerlidir; aşağıdakiler bu repoya özel ek disiplinlerdir.
+`neuro-voice` — NQAI'nin Türkçe + voice-cloning + streaming TTS yığını. **VoxCPM2 (Apache 2.0, OpenBMB, 2B param)** üzerine multi-tenant API gateway + Türkçe text frontend + Stripe-style async job queue + R2 object storage. Üst-katman `/home/alfonso/neeko-firmware/CLAUDE.md` 7 disiplin kuralı geçerlidir; aşağıdakiler bu repoya özel ek disiplinlerdir.
 
-## Şu anki durum
+## Şu anki durum (2026-05-24, commit `ba6be69`)
 
-**Platform v0.2 release** — repo çalıştırılabilir bir VoxCPM2 streaming TTS API'sı. 5-slot voice catalog + FastAPI HTTP/streaming + Bearer auth + sentence-chunked 48 kHz WAV streaming.
+**Faz A bitti, Faz B'nin gateway tarafı %40 hazır, worker süreci açık.** Repo bir multi-tenant TTS platform iskeleti: Postgres data plane + DB-backed Bearer auth (argon2id) + R2 storage + Stripe `Idempotency-Key` + Redis Streams backpressure. **GPU work hâlâ gateway içinde** (`src/worker/` paketi yazılmadı — Faz B.1).
 
-Detay:
-- Mimari → [docs/architecture/platform-v0.2.md](docs/architecture/platform-v0.2.md)
-- VoxCPM2 API yüzeyi + parametre tuning + LoRA hattı → [docs/architecture/voxcpm2-integration.md](docs/architecture/voxcpm2-integration.md)
+> **Faz B'ye geçmeden önce mutlaka oku:** [docs/audit/checkpoint-2026-05-24-faz-a-exit.md](docs/audit/checkpoint-2026-05-24-faz-a-exit.md) — uçtan uca durum, 5 ön-iş, 3 karar satırı.
+
+Canlı doc'lar:
+- Kanonik mimari (v1.0 hedefi): [docs/architecture/scale-roadmap.md](docs/architecture/scale-roadmap.md)
+- Mimari index: [docs/architecture/README.md](docs/architecture/README.md)
+- Veri modeli: [docs/architecture/data-model.md](docs/architecture/data-model.md)
+- Multi-tenant auth: [docs/architecture/auth-multi-tenant.md](docs/architecture/auth-multi-tenant.md)
+- Streaming protokol (WS + chunked): [docs/architecture/streaming-protocol.md](docs/architecture/streaming-protocol.md)
+- Observability (Faz C spec'i): [docs/architecture/observability.md](docs/architecture/observability.md)
+- VoxCPM2 entegrasyon detayları + LoRA hattı: [docs/architecture/voxcpm2-integration.md](docs/architecture/voxcpm2-integration.md)
+- v0.2 single-process MVP (referans, kısmen superseded): [docs/architecture/platform-v0.2.md](docs/architecture/platform-v0.2.md)
 
 | Komut | Ne yapar |
 | --- | --- |
-| `pip install -e ".[dev]"` | dev + test bağımlılıkları |
-| `python -m pytest` | 55 test (frontend + API smoke + seed lock, VoxCPM stub'lu) |
-| `PYTHONPATH=src python -m uvicorn server.main:app` | server'ı lokalde başlat (`.env` ile `NQAI_API_KEYS` zorunlu, ~8 GB VRAM) |
-| `python scripts/smoke_test.py --base-url ... --api-key ...` | 10-cümle × N-voice eval, per-call RTF + WAV dump |
+| `pip install -e ".[dev]"` | dev + test bağımlılıkları (boto3, fakeredis, moto, aiosqlite, argon2-cffi, pyjwt dahil) |
+| `python -m pytest` | **182 test** (~50 s) — frontend + auth + repos + R2 + async jobs + API smoke (VoxCPM stub'lu) |
+| `ruff check src tests` | lint (clean baseline) |
+| `docker compose -f docker-compose.dev.yaml up -d` | gateway + Postgres 16 + Redis 7 lokal stack |
+| `alembic upgrade head` | DB schema forward-only migrate |
+| `python scripts/seed_operator.py --email <you>` | admin UI için operator oluştur |
+| `PYTHONPATH=src python -m uvicorn server.main:app` | server'ı lokalde başlat (DB + Redis env zorunlu, ilk request'te ~8 GB VRAM) |
+| `python scripts/smoke_test.py --base-url ... --api-key ...` | sync `/v1/tts` eval, per-call RTF + WAV dump |
 | `python scripts/bootstrap_voices.py --base-url ... --api-key ...` | `configs/seed_voices.yaml` üzerinden 5-slot toplu enroll |
-| Colab → [notebooks/03-platform-server-colab.ipynb](notebooks/03-platform-server-colab.ipynb) | T4/A100'da server + cloudflared tunnel, ~6-8 dk |
+| `python scripts/migrate_filesystem_to_db.py` | filesystem voice YAML'ları → DB (+ opsiyonel R2 upload) |
+| Colab → [notebooks/03-platform-server-colab.ipynb](notebooks/03-platform-server-colab.ipynb) | T4/A100'de server + cloudflared tunnel, ~6-8 dk (v0.2 era — A.6 cutover sonrası refresh bekliyor) |
 
-Türkçe SFT + per-character LoRA Faz 2-3'e ertelendi — bkz. [platform-v0.2.md "Faz hattı"](docs/architecture/platform-v0.2.md) ve [voxcpm2-integration.md §10](docs/architecture/voxcpm2-integration.md).
+Türkçe SFT + per-character LoRA Faz 2-3'e ertelendi — bkz. [scale-roadmap.md §10-13](docs/architecture/scale-roadmap.md) ve [voxcpm2-integration.md §10](docs/architecture/voxcpm2-integration.md).
 
 Araştırma katmanı paralel devam ediyor:
 
 - `docs/research/02-distilled-findings.md` — NQAI ses omurgası v0.1 sentezi (12 karar, Faz-1/2/3 yol haritası)
-- `docs/decisions/README.md` — stratejik karar log'u (en yeni: 2026-05-24 VoxCPM2 birincil model + Chatterbox bırakıldı)
+- `docs/decisions/README.md` — stratejik karar log'u (en yeni: 2026-05-24 async TTS jobs + R2 + A.6 cutover + LoRA cache LRU)
+- `docs/audit/` — `faz-a-self-audit.md` (lint + dosya), `faz-a-mlops-audit.md` (mimari + $/saat tablosu), `checkpoint-2026-05-24-faz-a-exit.md` (mevcut faz checkpoint)
 - `notebooks/01-voxcpm2-tr-demo.ipynb` — VoxCPM2 baseline 10 cümle (Kaggle T4)
-- `notebooks/03-platform-server-colab.ipynb` — full platform deploy (Colab)
+- `notebooks/03-platform-server-colab.ipynb` — full platform deploy (Colab, v0.2 era)
 
 ## Çalışma akışı (sıkı sırada)
 
@@ -40,16 +54,40 @@ Araştırma katmanı paralel devam ediyor:
 
 **Önce karar, sonra kod.** Mimari/model/eval değişiklikleri decision log'a satır olmadan kodlanmaz.
 
-## Üç-katmanlı çekirdek mimari
+## Çekirdek mimari katmanları
 
-[docs/research/02-distilled-findings.md](docs/research/02-distilled-findings.md) bölüm 4'teki spec. v0.2'de katman 1 ve 2 minimum-viable dolduruldu; katman 3 Faz 3'te.
+Damıtmadaki üç-katmanlı spec ([02-distilled-findings.md §4](docs/research/02-distilled-findings.md)) Faz A'da multi-tenant data plane + auth + storage ile genişledi. Mevcut katmanlar:
 
-- `src/frontend/` → **`neeko-voice-frontend`** (Türkçe NFKC + cümle segmentasyonu + sayı/kısaltma/sembol açma + code-mix lexicon). v0.2: 32 birim test. Hedef: 300+ golden test, Zemberek + espeak-ng + geminasyon yaması + style mode tag enjekte etme.
-- `src/registry/` → **`voice-adapter-registry`** (filesystem-backed manifest YAML + reference audio trim/resample to 16 kHz mono + RLock; CRUD endpoint'ler). v0.2 manifest şeması Faz 3'te `adapter.*`, `watermark.*`, `fingerprint.*`, `eval.*` alanlarıyla genişler.
-- `src/server/` → **FastAPI app + VoxCPM2 engine adapter + streaming**. Engine `BaseSynthEngine` protocol — Türkçe-SFT'li checkpoint veya başka model drop-in swap için hazır.
-- `src/governance/` (henüz yok) → **`voice-governance-layer`** (KVKK + AudioSeal watermark + voice fingerprint + sözleşme registry + takedown). Faz 3.
+**Data plane (Faz A):**
+- `src/db/` — SQLAlchemy 2 async + asyncpg + aiosqlite (test); 7 ORM tablosu
+- `src/repos/` — repository pattern, **tenant_id constructor-zorunlu** (D-08); 7 repository
+- `src/storage/` — R2 (S3-compat) adapter; `s3://` URI ile her yer konuşur
+- `migrations/` — Alembic forward-only (downgrade `NotImplementedError`)
 
-Henüz boş yerler: `src/bench/` (Faz 1: baseline karşılaştırma scriptleri), `src/finetune/` (Faz 3: VoxCPM2 LoRA `train_voxcpm_finetune.py` adapter), `src/eval/` (Faz 1: 5-katmanlı eval suite — UTMOSv2 + NISQA + Whisper-TR-WER + WavLM-SECS + TTSDS2).
+**Inference plane (Faz B'de ayrılır — şu an gateway'de):**
+- `src/frontend/` → **`neeko-voice-frontend`** (Türkçe NFKC + cümle segmentasyonu + sayı/kısaltma/sembol açma + code-mix lexicon). 36 birim test. Hedef: 300+ golden test, Zemberek + espeak-ng + geminasyon yaması + style mode tag enjekte etme.
+- `src/registry/` → filesystem manifest YAML CRUD + reference audio trim/resample to 16 kHz mono + RLock. A.6 cutover sonrası enroll dışında kullanılmıyor; voice catalog DB'de yaşıyor. Faz B.1'de `src/worker/` altına taşınır.
+- `src/server/engine.py` → **`VoxCPM2Engine`** + `BaseSynthEngine` protocol + LRU LoRA cache (audit F1). Faz B.1'de `src/worker/` altına taşınır.
+- `src/server/streaming.py` → sentence-chunked WAV header trick + yield generator. Faz B.4'te WebSocket eş güzergâhı eklenir.
+
+**API gateway (Faz A.6 cutover):**
+- `src/server/main.py` — FastAPI app, 12 endpoint (sync TTS, async jobs, voice CRUD, health, admin warmup)
+- `src/server/auth.py` — DB-backed Bearer pipeline (parse → argon2id → tenant → scope → RL → audit)
+- `src/server/queue.py` — Redis Streams XADD wrapper + `TtsJobPayload` + `parse_idempotency_key`
+- `src/server/reference_resolver.py` — `file://` + bare path + `s3://` + `r2://` çözer
+- `src/server/admin/` — operator JWT + Jinja2 + HTMX 1-sayfa CRUD
+- `src/server/security/` — argon2id passwords + API key gen/parse + JWT HS256
+- `src/server/rate_limit.py` — Redis Lua sliding window (per-key + per-tenant)
+
+**Governance layer (Faz 3, henüz yok):**
+- `src/governance/` — KVKK + AudioSeal watermark + voice fingerprint + sözleşme registry + takedown
+
+**Henüz boş katmanlar:**
+- `src/worker/` — Faz B.1: Redis Streams consumer (engine + frontend buraya taşınır)
+- `src/bench/` — Faz 1: baseline karşılaştırma scriptleri
+- `src/finetune/` — Faz 3: VoxCPM2 LoRA pipeline (`train_voxcpm_finetune.py` wrap)
+- `src/eval/` — Faz 1: 5-katmanlı eval suite (UTMOSv2 + NISQA + Whisper-TR-WER + WavLM-SECS + TTSDS2)
+- `src/g2p/` — Faz 1: Zemberek + espeak-ng + geminasyon yaması
 
 ## Repo-özel disiplinler
 
@@ -60,6 +98,12 @@ Henüz boş yerler: `src/bench/` (Faz 1: baseline karşılaştırma scriptleri),
 5. **Premium = dar domain.** TR + karakter + call-center + child-directed kesişiminde ElevenLabs'ı geçmek; **genel TTS yarışına girmek yasak**. Ticari TTS API'lar (ElevenLabs/OpenAI/Google/Azure) "rakip" değil, sadece benchmark referansı.
 6. **NEEKO değil NQAI ses omurgası.** Mimariyi multi-product baştan kur. Tek karaktere özel hardcode yok — `voice-adapter-registry`'de yeni karakter = yeni YAML, yeni kod değil.
 7. **Birincil base model: VoxCPM2.** Adapter pattern (`BaseSynthEngine`) arkasında yaşıyor; alternatifler bench/eval üzerinden ölçülmeden swap yok.
+8. **Multi-tenant zorunlu disiplinler** (scale-roadmap §6):
+   - **D-04 audit log append-only** — `audit_log` tablosuna asla `UPDATE`/`DELETE` yok, sadece `INSERT`
+   - **D-05 idempotency** — her async iş `request_id` ile idempotent; `IdempotencyRepo.reserve()` body hash ile gate'lenir
+   - **D-08 tenant_id filter** — her cross-tenant query'de `WHERE tenant_id = ?` zorunlu; repo'lar constructor'da tenant_id alır, başka türlü instantiate edilmez
+   - Cross-tenant erişim girişimi → **404** (existence-leak prevention), 403 değil
+9. **Migrations forward-only.** Alembic `downgrade()` `NotImplementedError` raise eder. Schema değişikliği geri alınmaz; bozuk migration için yeni forward migration yazılır. Zero-downtime migration (`pgroll`) Faz D'de.
 
 ## Klasör yapısı
 
@@ -67,20 +111,28 @@ Henüz boş yerler: `src/bench/` (Faz 1: baseline karşılaştırma scriptleri),
 | --- | --- |
 | `docs/research/` | Araştırma brief'leri, dış çıktılar (01-*), damıtmalar (02-*) |
 | `docs/decisions/` | Stratejik karar log'u (en yeni üstte) |
-| `docs/architecture/` | `platform-v0.2.md` (mimari), `voxcpm2-integration.md` (model + LoRA cheatsheet) |
+| `docs/architecture/` | `scale-roadmap.md` (canlı kanonik), `platform-v0.2.md` (referans), `data-model.md`, `auth-multi-tenant.md`, `streaming-protocol.md`, `observability.md`, `voxcpm2-integration.md` |
+| `docs/audit/` | `faz-a-self-audit.md`, `faz-a-mlops-audit.md`, `checkpoint-2026-05-24-faz-a-exit.md` |
 | `docs/character/` | NEEKO karakter spec'i, casting brief, voice talent outreach şablonları |
 | `docs/legal/` | KVKK + FSEK + voice talent rider taslakları |
+| `src/db/` | SQLAlchemy 2 async + Alembic, 7 ORM tablosu (tenants, api_keys, voices, usage_records, audit_log, operators, job_idempotency) |
+| `src/repos/` | Repository pattern (tenant_id constructor-zorunlu); 7 repo |
+| `src/storage/` | Cloudflare R2 (S3-compat) adapter, `S3URI` parser, cache |
 | `src/frontend/` | Türkçe text frontend (NFKC + cümle segmentasyonu + sayı/kısaltma/sembol/code-mix) |
-| `src/registry/` | Voice manifest YAML CRUD + reference audio I/O (16 kHz mono) |
-| `src/server/` | FastAPI app, **VoxCPM2 engine adapter**, auth, streaming |
+| `src/registry/` | Voice manifest YAML CRUD + reference audio I/O (16 kHz mono) — A.6 sonrası enroll dışı kullanılmıyor |
+| `src/server/` | FastAPI app, **VoxCPM2 engine adapter**, auth, streaming, queue, admin UI, reference resolver |
+| `src/worker/` | (boş) Faz B.1: Redis Streams consumer (engine + frontend buraya taşınır) |
 | `src/g2p/` | (boş) Faz 1: Zemberek + espeak-ng + geminasyon yaması |
 | `src/bench/` | (boş) Faz 1: baseline karşılaştırma scriptleri |
 | `src/finetune/` | (boş) Faz 3: VoxCPM2 LoRA pipeline (`train_voxcpm_finetune.py` wrap) |
 | `src/eval/` | (boş) Faz 1: UTMOSv2 / NISQA / Whisper-TR-WER / WavLM-SECS / TTSDS2 |
+| `migrations/` | Alembic forward-only; ilk migration `2026_05_24_0001_*.py` (initial schema) |
 | `configs/voices/` | Voice manifest YAML'ları (seed: `neeko-v01.yaml`) |
 | `configs/seed_voices.yaml` | Bootstrap toplu enroll için 5-slot katalog (1 NEEKO + 2 NIVA + 2 NeuroCourse) |
-| `scripts/` | `bootstrap_voices.py`, `smoke_test.py` |
-| `tests/` | Frontend birim + API smoke + seed lock (55 test) |
+| `scripts/` | `bootstrap_voices.py`, `smoke_test.py`, `seed_operator.py`, `migrate_filesystem_to_db.py` |
+| `tests/` | 15 dosya, **182 test** — frontend + API smoke + auth + repos + admin + R2 + async jobs + LoRA cache |
+| `deploy/` | `gateway.Dockerfile`, `docker-compose.dev.yaml` (gateway + Postgres + Redis) |
+| `alembic.ini` | Alembic CLI config (env'den DB URL okur) |
 | `data/phonemes/` | Türkçe fonetik sözlük + kural seti + NEEKO lexicon overrides |
 | `data/test-sets/` | Kürate test cümleleri (versiyonlu) |
 | `data/casting-prompts/` | Voice talent audition prompt pack'leri |

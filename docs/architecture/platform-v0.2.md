@@ -1,6 +1,12 @@
 # Platform v0.2 — Mimari (VoxCPM2)
 
-**Tarih:** 2026-05-24 · **Durum:** v0.2 release, tek-node MVP, VoxCPM2 üzerine
+**Tarih:** 2026-05-24 · **Durum:** Tek-process MVP referansı — kısmen superseded
+
+> ⚠️ **Bu doc historical referanstır.** Canlı kanonik mimari **[scale-roadmap.md](scale-roadmap.md)** — 4-tenant × 5-concurrent multi-tenant omurga. Faz A'da Postgres veri planı + DB-backed auth + R2 storage + async job queue eklendi (bkz. [../audit/checkpoint-2026-05-24-faz-a-exit.md](../audit/checkpoint-2026-05-24-faz-a-exit.md)).
+>
+> Bu doc'un **hâlâ doğru** bölümleri: §Bileşenler (frontend, registry, engine adapter), §Voice manifest şeması, §Performans bütçesi, §Güvenlik notları (auth + reference cap dışında), §Bilinen sınırlar (1-5, 7-8).
+>
+> Bu doc'un **superseded** bölümleri: §Çağrı yolu (DB auth + async jobs eklendi), §Faz hattı (scale-roadmap §10-13 ile değişti), §Bilinen sınırlar madde 6 (filesystem catalog A.6'da DB'ye geçti).
 
 NQAI Voice'un birincil release'i. Tek bir **VoxCPM2 (Apache 2.0, OpenBMB, 2B param)** instance'ı üzerine voice catalog + HTTP/streaming API + auth ekler. Üstüne **Türkçe SFT yok**, **per-character LoRA yok** — bunlar Faz 2-3'te gelir. v0.2 zero-shot voice cloning kapasitesini canlı bir geliştirici platformuna dönüştürür.
 
