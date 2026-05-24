@@ -1,35 +1,25 @@
 """Shared streaming-TTS primitives for gateway and worker.
 
-Despite the package name, nothing here is WebRTC-specific. The
-abstractions (audio frame, latency waterfall, fixed-duration framing)
-are transport-agnostic; they back the HTTP chunked `/v1/tts/stream`
-path today, and would back a WebSocket or WebRTC path the same way
-tomorrow without changing this module.
+Despite the package name, nothing here is WebRTC-specific. The PCM
+framing helper backs any transport that needs fixed-duration frames
+(WebRTC Opus, future WebSocket binary frames, etc.). The production
+HTTP-chunked `/v1/tts/stream` path does NOT frame at the gateway —
+the worker emits sentence-sized PCM chunks and the gateway forwards
+them verbatim.
 
-Keeping the namespace as `live` is a historical accident — semantic
-correction is on the deletion side (LiveKit/session orchestration left
-the repo when we decided NQAI Voice ships as a standard streaming TTS
-API à la ElevenLabs/OpenAI, not a WebRTC voice-agent platform). A
-later rename to `src/streaming/` is fine; today it doesn't earn the
-churn.
+Keeping the namespace as `live` is a historical accident from the
+abandoned LiveKit scaffold (decision-log 2026-05-24). A later rename
+to `src/streaming/` is fine; today it doesn't earn the churn.
 """
 
 from .protocol import (
-    CONTROL_PROTOCOL,
     DEFAULT_FRAME_MS,
     DEFAULT_SAMPLE_RATE,
-    LiveAudioFrame,
-    LiveLatencyWaterfall,
-    now_ms,
     split_pcm16_frames,
 )
 
 __all__ = [
-    "CONTROL_PROTOCOL",
     "DEFAULT_FRAME_MS",
     "DEFAULT_SAMPLE_RATE",
-    "LiveAudioFrame",
-    "LiveLatencyWaterfall",
-    "now_ms",
     "split_pcm16_frames",
 ]

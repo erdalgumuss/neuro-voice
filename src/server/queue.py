@@ -30,6 +30,7 @@ import json
 import logging
 import uuid
 from dataclasses import asdict, dataclass, field
+from dataclasses import fields as fields_of
 from typing import Any
 
 from redis.asyncio import Redis
@@ -71,10 +72,13 @@ class TtsJobPayload:
     params: dict[str, Any] | None = None  # cfg_value, inference_timesteps overrides
     app_label: str | None = None  # product attribution from X-NQAI-App header
     callback_url: str | None = None  # Faz B+: server-to-server completion hook
-    # B.1 hardening metadata. Retry authority is Redis PEL delivery
-    # count; `attempt` travels with the payload for DLQ/requeue
-    # diagnostics and future explicit requeue flows.
-    attempt: int = 0
+    # `attempt` previously lived here as a job-level field but was never
+    # read by any producer or consumer (audit L2 medium 2026-05-25 +
+    # audit L3 drift). Retry authority is Redis PEL `times_delivered`
+    # read by the consumer at pickup time and stamped onto each
+    # `TtsResult` chunk (B3 fix) — that's where the gateway needs it
+    # for stream-dedupe. Removed from the payload to stop the field
+    # from being a documentation lie.
     enqueued_at_ms: int | None = None
 
     def encode(self) -> dict[str, str]:
@@ -90,7 +94,14 @@ class TtsJobPayload:
             return v.decode("utf-8") if isinstance(v, (bytes, bytearray)) else v
 
         raw = _s(fields[b"payload"] if b"payload" in fields else fields["payload"])
-        return cls(**json.loads(raw))
+        parsed = json.loads(raw)
+        # Drop unknown keys so the wire format can evolve forward
+        # without breaking consumers across rollouts (e.g. the recently-
+        # removed `attempt` field may still appear in in-flight jobs
+        # produced by an older gateway image). Known-field dict
+        # constructor keeps the field discipline.
+        known = {f.name for f in fields_of(cls)}
+        return cls(**{k: v for k, v in parsed.items() if k in known})
 
 
 # --------------------------------------------------------------------------- #

@@ -4,18 +4,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `neuro-voice` — NQAI'nin Türkçe + voice-cloning + streaming TTS yığını. **VoxCPM2 (Apache 2.0, OpenBMB, 2B param)** üzerine multi-tenant API gateway + Türkçe text frontend + Stripe-style async job queue + R2 object storage. Üst-katman `/home/alfonso/neeko-firmware/CLAUDE.md` 7 disiplin kuralı geçerlidir; aşağıdakiler bu repoya özel ek disiplinlerdir.
 
-## Şu anki durum (2026-05-24, commit `5cd83d0` — Faz B.1 tamam)
+## Şu anki durum (2026-05-25 — Faz C v1 + 5-layer audit hotfix turu)
 
-**Gateway/worker süreç ayrımı tamamlandı.** Gateway pure I/O (CPU-only, Hetzner CX22 sığar); worker GPU node'unda `python -m worker.main` ile koşar. Async TTS jobs uçtan uca, sync `/v1/tts` aynı queue üzerinden backward-compat proxy (RFC 8594 deprecation). Idempotency race-safe, XAUTOCLAIM at-least-once chaos test'iyle kanıtlı.
+**Faz B.1 (worker/gateway ayrımı) + B.1.5 (frame-by-frame streaming bridge) + C v0/v1 (Prometheus + heartbeat backpressure + waterfall persistence + Grafana + pgBouncer + load/chaos harness) tamam.** Üstüne 5 paralel agent ile end-to-end audit + 4-commit hotfix yapıldı (`ca0b47c..` audit-fix dizisi): migration 0002 in-place fix, `/v1/tts/stream` deprecation header temizliği, CORS credentials, retry-aware `seen_seq` (attempt epoch + dedupe reset), sync paths `reserve_or_get`, PoisonJob → DLQ archive, TTS_REQUESTS{status=auth_failed/backpressure} + dedicated `nqai_tts_deprecated_endpoint_total`, FK ondelete policies, iter_engine_chunks cancellation, gateway_first_byte_ms timer + WAV header semantics, XAUTOCLAIM env var disambiguation, observability.md aspirational banner, dead `src/live/*` + worker/live primitives temizliği.
 
-> **B.1.5'e (latency 80-100ms) geçmeden önce oku:** [docs/audit/checkpoint-2026-05-24-faz-b1-exit.md](docs/audit/checkpoint-2026-05-24-faz-b1-exit.md) — DoD, neyin neden yapılmadığı, B.1.5 hedef tanımı.
+> **Audit özeti:** [docs/audit/](docs/audit/) — `checkpoint-2026-05-24-faz-c-v1-exit.md` + agent task transcripts. Faz D'ye geçmeden önce real-GPU latency_bench + load_bench koşumları operator turu olarak bekleniyor (kod değil, ground-truth eksiği).
 
 Canlı doc'lar:
 - Kanonik mimari (v1.0 hedefi): [docs/architecture/scale-roadmap.md](docs/architecture/scale-roadmap.md)
 - Mimari index: [docs/architecture/README.md](docs/architecture/README.md)
 - Veri modeli: [docs/architecture/data-model.md](docs/architecture/data-model.md)
 - Multi-tenant auth: [docs/architecture/auth-multi-tenant.md](docs/architecture/auth-multi-tenant.md)
-- Streaming protokol (WS + chunked): [docs/architecture/streaming-protocol.md](docs/architecture/streaming-protocol.md)
+- Streaming protokol (HTTP chunked primary + async jobs + sync deprecated proxy; WS yok): [docs/architecture/streaming-protocol.md](docs/architecture/streaming-protocol.md)
 - Observability (Faz C spec'i): [docs/architecture/observability.md](docs/architecture/observability.md)
 - VoxCPM2 entegrasyon detayları + LoRA hattı: [docs/architecture/voxcpm2-integration.md](docs/architecture/voxcpm2-integration.md)
 - v0.2 single-process MVP (referans, kısmen superseded): [docs/architecture/platform-v0.2.md](docs/architecture/platform-v0.2.md)
@@ -23,7 +23,7 @@ Canlı doc'lar:
 | Komut | Ne yapar |
 | --- | --- |
 | `pip install -e ".[dev]"` | dev + test bağımlılıkları (boto3, fakeredis, moto, aiosqlite, argon2-cffi, pyjwt dahil) |
-| `python -m pytest` | **182 test** (~50 s) — frontend + auth + repos + R2 + async jobs + API smoke (VoxCPM stub'lu) |
+| `python -m pytest` | **384 test** (~55 s) — frontend + auth + repos + R2 + async jobs + API smoke + observability + bench (VoxCPM stub'lu) |
 | `ruff check src tests` | lint (clean baseline) |
 | `docker compose -f docker-compose.dev.yaml up -d` | gateway + Postgres 16 + Redis 7 lokal stack |
 | `alembic upgrade head` | DB schema forward-only migrate |
@@ -131,7 +131,7 @@ Damıtmadaki üç-katmanlı spec ([02-distilled-findings.md §4](docs/research/0
 | `configs/voices/` | Voice manifest YAML'ları (seed: `neeko-v01.yaml`) |
 | `configs/seed_voices.yaml` | Bootstrap toplu enroll için 5-slot katalog (1 NEEKO + 2 NIVA + 2 NeuroCourse) |
 | `scripts/` | `bootstrap_voices.py`, `smoke_test.py`, `seed_operator.py`, `migrate_filesystem_to_db.py` |
-| `tests/` | 15 dosya, **182 test** — frontend + API smoke + auth + repos + admin + R2 + async jobs + LoRA cache |
+| `tests/` | 30 dosya, **384 test** — frontend + API smoke + auth + repos + admin + R2 + async jobs + LoRA cache + observability/dashboard + heartbeat + benches |
 | `deploy/` | `gateway.Dockerfile`, `docker-compose.dev.yaml` (gateway + Postgres + Redis) |
 | `alembic.ini` | Alembic CLI config (env'den DB URL okur) |
 | `data/phonemes/` | Türkçe fonetik sözlük + kural seti + NEEKO lexicon overrides |

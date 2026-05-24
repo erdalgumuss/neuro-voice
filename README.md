@@ -2,7 +2,7 @@
 
 NQAI'nin Türkçe + voice-cloning + streaming TTS yığını. **VoxCPM2** (Apache 2.0, OpenBMB, 2B param) üzerine multi-tenant API gateway + Türkçe text frontend + Stripe-style async job queue. Endüstri-standardı tek-yönlü streaming TTS API'sı (ElevenLabs / OpenAI Audio / Cartesia uyumlu); duplex voice-agent (NIVA) ürünleri ayrı bir transport ile gelir.
 
-## Şu an (2026-05-24 — Faz B.1.5 başlangıcı)
+## Şu an (2026-05-25 — Faz C v1 audit hotfix turu)
 
 **Gateway/worker süreç ayrımı tamam, streaming bridge canlı.** Gateway CPU/I/O katmanı (Hetzner CX22 sığar); worker GPU node'unda `python -m worker.main` ile koşar. Worker pipeline frame-by-frame publish ediyor (drain-then-emit pattern öldü); ilk cümle üretilir üretilmez gateway result stream'den çekip `/v1/tts/stream` chunked HTTP üzerinden client'a iletiyor. Sync `/v1/tts` aynı Redis queue üzerinden geriye-uyumlu proxy (RFC 8594 `Deprecation`/`Sunset` header, 2026-09-01 sunset). At-least-once delivery XAUTOCLAIM + bounded retry/DLQ ile korunur.
 
@@ -142,7 +142,7 @@ curl -X POST $URL/v1/tts \
 ## Testler
 
 ```bash
-python -m pytest                    # 182 test (~50 s)
+python -m pytest                    # 384 test (~55 s)
 python -m pytest tests/test_async_jobs.py -v
 python -m pytest tests/test_repos.py::test_cross_tenant_isolation -v
 ruff check src tests                # lint

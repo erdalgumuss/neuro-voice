@@ -33,8 +33,10 @@ def pcm16_to_wav_bytes(pcm: bytes, sample_rate: int, channels: int = 1) -> bytes
 
     Used by the sync proxy path: gateway concatenates worker-emitted
     chunks into a single PCM buffer, then this helper turns it into a
-    playable .wav response body. Streaming endpoints use a different
-    "infinite size" RIFF header trick — see worker/streaming.py.
+    playable .wav response body. The chunked streaming endpoint
+    (`/v1/tts/stream`) uses a different "infinite-size" RIFF header
+    trick inlined in `server.main._yield_wav` — gateway never imports
+    a worker module.
     """
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
