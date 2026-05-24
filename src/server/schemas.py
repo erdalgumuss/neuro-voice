@@ -64,3 +64,55 @@ class HealthResponse(BaseModel):
 class ErrorResponse(BaseModel):
     error: str
     detail: str | None = None
+
+
+# --------------------------------------------------------------------------- #
+# Async TTS jobs — Stripe-style idempotent job model.
+# --------------------------------------------------------------------------- #
+class TTSJobParams(BaseModel):
+    """Per-request override of engine knobs. Whitelisted fields only —
+    arbitrary VoxCPM kwargs do not flow through here.
+    """
+    cfg_value: float | None = Field(default=None, ge=1.0, le=3.5)
+    inference_timesteps: int | None = Field(default=None, ge=4, le=40)
+
+
+class TTSJobCreate(BaseModel):
+    text: str = Field(..., min_length=1, max_length=20000)
+    voice_id: str = Field(..., min_length=3, max_length=64)
+    language: Literal["tr", "en"] = "tr"
+    audio_format: AudioFormat = "wav"
+    params: TTSJobParams | None = None
+
+
+JobStatus = Literal["queued", "running", "complete", "failed"]
+
+
+class TTSJobAccepted(BaseModel):
+    job_id: str
+    status: Literal["queued", "complete"]  # "complete" when an idempotent replay
+    created_at: str
+    deduplicated: bool = False
+
+
+class TTSJobMetrics(BaseModel):
+    queue_wait_ms: int | None = None
+    inference_ms: int | None = None
+    generated_audio_ms: int | None = None
+    rtf: float | None = None
+
+
+class TTSJobOutput(BaseModel):
+    audio_url: str
+    expires_at: str
+    content_type: str = "audio/wav"
+
+
+class TTSJobStatusResponse(BaseModel):
+    job_id: str
+    status: JobStatus
+    error_code: str | None = None
+    error_detail: str | None = None
+    created_at: str
+    metrics: TTSJobMetrics | None = None
+    output: TTSJobOutput | None = None

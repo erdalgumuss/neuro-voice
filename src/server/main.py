@@ -48,7 +48,7 @@ from registry.catalog import (
     InvalidVoiceId,
     validate_voice_id,
 )
-from repos import AuditRepo, UsageRepo, VoiceRepo
+from repos import AuditRepo, IdempotencyRepo, UsageRepo, VoiceRepo
 
 from . import streaming
 from .admin import admin_router
@@ -59,6 +59,7 @@ from .engine import (
     get_engine,
     pcm16_to_wav_bytes,
 )
+from .queue import TtsJobPayload, TtsJobQueue, get_queue, parse_idempotency_key
 from .reference_resolver import (
     ReferenceAudioMissing,
     UnsupportedReferenceURI,
@@ -69,6 +70,11 @@ from .schemas import (
     EnrollResponse,
     ErrorResponse,
     HealthResponse,
+    TTSJobAccepted,
+    TTSJobCreate,
+    TTSJobMetrics,
+    TTSJobOutput,
+    TTSJobStatusResponse,
     TTSRequest,
     TTSStreamRequest,
     VoiceListResponse,
@@ -582,6 +588,235 @@ async def synthesize_stream(
         media_type="audio/wav",
         headers=headers,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Async TTS jobs — Stripe-pattern idempotent job model.
+# --------------------------------------------------------------------------- #
+# Hard ceiling on queue depth — when XLEN exceeds this multiple of the
+# (unknown) worker count, gateway returns 503 instead of accepting new
+# work. We err on the conservative side (high), so Faz B benchmarks tune
+# this down once the actual GPU throughput is known.
+QUEUE_DEPTH_BACKPRESSURE = int(os.environ.get("NQAI_QUEUE_DEPTH_LIMIT", "200"))
+
+
+@app.post(
+    "/v1/tts/jobs",
+    response_model=TTSJobAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
+    tags=["synthesis"],
+)
+async def create_tts_job(
+    body: TTSJobCreate,
+    request: Request,
+    ctx: Annotated[AuthContext, Depends(require_auth("tts:write"))],
+    session: Annotated[AsyncSession, Depends(get_session)],
+    queue: Annotated[TtsJobQueue, Depends(get_queue)],
+) -> TTSJobAccepted:
+    """Enqueue a synthesis job. Idempotent — same Idempotency-Key returns
+    the existing job's id, never enqueues twice. Worker side completes
+    the job and writes the output to R2; clients poll the status endpoint.
+    """
+    if len(body.text) > settings.max_chars_per_request:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail=f"text exceeds max_chars={settings.max_chars_per_request}",
+        )
+
+    try:
+        idempotency_key = parse_idempotency_key(request.headers.get("Idempotency-Key"))
+    except ValueError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+
+    # Voice existence + tenant isolation — same path as sync /v1/tts.
+    db_voice, _view, _path = await _load_voice_or_404(
+        body.voice_id, ctx.tenant_id, session
+    )
+
+    # Stripe-style replay: same Idempotency-Key in the 24h window returns
+    # the cached row without re-enqueueing.
+    idem = IdempotencyRepo(session, ctx.tenant_id)
+    existing = await idem.get(idempotency_key)
+    if existing is not None:
+        existing_status = (
+            "complete" if existing.status == "complete" else "queued"
+        )
+        return TTSJobAccepted(
+            job_id=str(idempotency_key),
+            status=existing_status,
+            created_at=existing.created_at.isoformat(),
+            deduplicated=True,
+        )
+
+    # Backpressure check before reserving — we don't want to leave half-
+    # baked rows behind when the queue is saturated.
+    depth = await queue.depth()
+    if depth > QUEUE_DEPTH_BACKPRESSURE:
+        await AuditRepo(session).record(
+            actor_type="api_key",
+            actor_id=ctx.api_key_id,
+            actor_label=ctx.api_key.prefix,
+            action="tts.backpressure",
+            result="denied",
+            tenant_id=ctx.tenant_id,
+            payload={"queue_depth": depth, "limit": QUEUE_DEPTH_BACKPRESSURE},
+        )
+        await session.commit()
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="queue is saturated; retry shortly",
+            headers={"Retry-After": "5"},
+        )
+
+    request_hash = _hash_job_body(body)
+    await idem.reserve(
+        request_id=idempotency_key,
+        api_key_id=ctx.api_key_id,
+        request_hash=request_hash,
+    )
+    await session.commit()
+
+    payload = TtsJobPayload(
+        request_id=str(idempotency_key),
+        tenant_id=str(ctx.tenant_id),
+        api_key_id=str(ctx.api_key_id),
+        voice_id=db_voice.voice_id,
+        text=body.text,
+        language=body.language,
+        audio_format=body.audio_format,
+        params=body.params.model_dump(exclude_none=True) if body.params else None,
+    )
+    try:
+        await queue.submit(payload)
+    except Exception as e:
+        # XADD failed after we reserved the idempotency row — mark it
+        # failed so the client doesn't spin polling forever.
+        await idem.fail(idempotency_key)
+        await session.commit()
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            detail="failed to enqueue job; retry with a new Idempotency-Key",
+        ) from e
+
+    return TTSJobAccepted(
+        job_id=str(idempotency_key),
+        status="queued",
+        created_at=existing.created_at.isoformat() if existing else _now_iso(),
+        deduplicated=False,
+    )
+
+
+@app.get(
+    "/v1/tts/jobs/{job_id}",
+    response_model=TTSJobStatusResponse,
+    tags=["synthesis"],
+)
+async def get_tts_job(
+    job_id: str,
+    ctx: Annotated[AuthContext, Depends(require_auth("tts:read"))],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> TTSJobStatusResponse:
+    try:
+        rid = uuid.UUID(job_id)
+    except ValueError as e:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, detail="job_id must be a UUID"
+        ) from e
+
+    idem = IdempotencyRepo(session, ctx.tenant_id)
+    row = await idem.get(rid)
+    if row is None:
+        # Same 404 whether the job is for another tenant, never existed,
+        # or expired — no existence leak.
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, detail=f"job '{job_id}' not found"
+        )
+
+    response: dict[str, Any] = {
+        "job_id": job_id,
+        "status": _map_idempotency_status_to_job_status(row.status),
+        "created_at": row.created_at.isoformat(),
+    }
+
+    if row.status == "complete":
+        # Worker side stamped response_uri with the R2 location. Mint a
+        # signed URL (Faz B+ when R2 storage is bound; for now we just
+        # surface the URI itself).
+        if row.response_uri:
+            response["output"] = TTSJobOutput(
+                audio_url=row.response_uri,
+                expires_at=_signed_url_expiry_iso(),
+                content_type="audio/wav",
+            )
+        # Per-job metrics come from usage_records via request_id.
+        usage_row = await _find_usage_row(session, ctx.tenant_id, rid)
+        if usage_row is not None:
+            response["metrics"] = TTSJobMetrics(
+                queue_wait_ms=None,  # Faz B worker writes this
+                inference_ms=usage_row.elapsed_ms,
+                generated_audio_ms=usage_row.duration_ms,
+                rtf=usage_row.rtf,
+            )
+
+    return TTSJobStatusResponse(**response)
+
+
+# --------------------------------------------------------------------------- #
+# Job helpers — private
+# --------------------------------------------------------------------------- #
+def _hash_job_body(body: TTSJobCreate) -> str:
+    """Stable hash of the request shape so an Idempotency-Key replayed
+    with *different* content doesn't silently return the old job. (Stripe
+    surfaces a 409 in that case; we just record the hash for now and
+    Faz B can wire the conflict response.)
+    """
+    import hashlib
+
+    canonical = body.model_dump_json(by_alias=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _map_idempotency_status_to_job_status(s: str) -> str:
+    """`job_idempotency.status` is {processing, complete, failed}; the
+    client-facing job model is {queued, running, complete, failed}.
+
+    For now `processing` always maps to `queued`. Once workers heartbeat
+    a "running" state into the row (Faz B), this branches.
+    """
+    if s == "complete":
+        return "complete"
+    if s == "failed":
+        return "failed"
+    return "queued"
+
+
+async def _find_usage_row(
+    session: AsyncSession, tenant_id: uuid.UUID, request_id: uuid.UUID
+):
+    """Pull the usage_records row for a finished job. Tenant scoped."""
+    from sqlalchemy import select
+
+    from db.models import UsageRecord
+
+    result = await session.execute(
+        select(UsageRecord).where(
+            UsageRecord.tenant_id == tenant_id,
+            UsageRecord.request_id == request_id,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+def _now_iso() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _signed_url_expiry_iso() -> str:
+    from datetime import datetime, timedelta, timezone
+
+    return (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
 
 
 def run() -> None:
