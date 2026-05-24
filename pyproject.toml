@@ -82,7 +82,7 @@ nqai-voice-smoke = "scripts.smoke_test:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["server*", "registry*", "frontend*"]
+include = ["server*", "registry*", "frontend*", "db*", "repos*"]
 
 [tool.ruff]
 line-length = 100
