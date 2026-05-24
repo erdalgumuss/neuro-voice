@@ -336,6 +336,100 @@ async def test_sync_tts_proxy_504_when_no_worker(setup, monkeypatch):
         app.dependency_overrides.clear()
 
 
+async def test_first_chunk_in_result_stream_before_engine_finishes(setup):
+    """B.1.5 contract — measured at the worker→gateway result stream
+    boundary, not the HTTP wire (httpx ASGITransport buffers the
+    response body until the generator completes, which would mask the
+    bridge under test).
+
+    Engine yields sentence 1 at t=0, sleeps 300ms, yields sentence 2,
+    sleeps 300ms, yields sentence 3, sleeps 300ms — total ~900ms.
+    Bridge must XADD sentence 1 to the result stream BEFORE the worker
+    finishes (i.e. before XACK fires). Drain-then-emit would publish
+    all three after ~900ms in one burst, after XACK is imminent.
+    """
+    import time as _time
+
+    from server.auth import get_redis
+    from server.main import app
+    from server.queue import DEFAULT_STREAM, TtsJobQueue, get_queue, result_stream_name
+    from worker.consumer import WorkerConsumer
+
+    class _SlowEngine(_StubEngine):
+        def synthesize_stream(self, **kw):
+            for i, s in enumerate(("Bir.", "İki.", "Üç.")):
+                yield _FakeChunk(
+                    pcm_int16=b"\x00\x00" * 480,
+                    sample_rate=self.sample_rate,
+                    sentence_index=i,
+                    sentence_text=s,
+                )
+                _time.sleep(0.3)
+
+    fake_redis = fakeredis.aioredis.FakeRedis()
+    queue = TtsJobQueue(fake_redis, stream=DEFAULT_STREAM)
+    app.dependency_overrides[get_redis] = lambda: fake_redis
+    app.dependency_overrides[get_queue] = lambda: queue
+
+    stop = asyncio.Event()
+    consumer = WorkerConsumer(
+        redis=fake_redis, engine=_SlowEngine(),
+        archive_to_r2=setup["archive"],
+        stop_event=stop, block_ms=10,
+    )
+    worker_task = asyncio.create_task(consumer.run())
+
+    try:
+        from fastapi.testclient import TestClient
+
+        with TestClient(app) as client:
+            client.headers["Authorization"] = f"Bearer {setup['bearer']}"
+            _enroll_voice(client, voice_id="slow-voice")
+
+            rid = str(uuid.uuid4())
+            stream_name = result_stream_name(rid)
+            r = client.post(
+                "/v1/tts/jobs",
+                headers={"Idempotency-Key": rid},
+                json={"text": "Bir. İki. Üç.", "voice_id": "slow-voice"},
+            )
+            assert r.status_code == 202
+
+            # Poll the result stream WHILE the engine is still working.
+            # We want: stream_len > 0 BEFORE consumer.acked > 0.
+            saw_chunk_before_finish = False
+            saw_chunk_at_ms: float | None = None
+            t0 = _time.monotonic()
+            for _ in range(60):  # up to 1.2s — safely under the 1.5s+ ack
+                xlen = int(await fake_redis.xlen(stream_name))
+                if xlen > 0 and consumer.acked == 0:
+                    saw_chunk_before_finish = True
+                    saw_chunk_at_ms = (_time.monotonic() - t0) * 1000
+                    break
+                if consumer.acked > 0:
+                    break  # job already done — too slow to observe
+                await asyncio.sleep(0.02)
+
+            assert saw_chunk_before_finish, (
+                "no result-stream chunk visible before worker XACK — "
+                "pipeline regressed to drain-then-emit"
+            )
+            # And the chunk landed in the first sentence's window
+            # (~0-400ms after request started, well under 900ms total
+            # inference).
+            assert saw_chunk_at_ms is not None and saw_chunk_at_ms < 600, (
+                f"first chunk at {saw_chunk_at_ms:.1f}ms — bridge present "
+                "but too slow"
+            )
+    finally:
+        stop.set()
+        try:
+            await asyncio.wait_for(worker_task, timeout=2.0)
+        except asyncio.TimeoutError:
+            worker_task.cancel()
+        app.dependency_overrides.clear()
+
+
 async def test_sync_tts_stream_proxy_yields_riff_wav(setup):
     """The /v1/tts/stream variant — same proxy path but chunks
     forwarded as HTTP chunked transfer. Client sees a valid RIFF/WAVE
