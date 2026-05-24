@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>NQAI Voice — Admin</title>
+  <style>
+    :root { color-scheme: light dark; font-family: -apple-system, system-ui, sans-serif; }
+    body { display: grid; place-items: center; min-height: 100vh; margin: 0;
+           background: #0c0d10; color: #e8e9eb; }
+    .card { width: 360px; padding: 32px 28px; background: #16181d;
+            border: 1px solid #2a2d35; border-radius: 12px; }
+    h1 { margin: 0 0 4px; font-size: 18px; letter-spacing: -0.01em; }
+    p.sub { margin: 0 0 24px; color: #8a8f9a; font-size: 13px; }
+    label { display: block; margin: 14px 0 6px; font-size: 12px;
+            font-weight: 600; color: #b5bac4; text-transform: uppercase;
+            letter-spacing: 0.04em; }
+    input { width: 100%; padding: 10px 12px; background: #0c0d10;
+            border: 1px solid #2a2d35; border-radius: 8px;
+            color: #e8e9eb; font-size: 14px; box-sizing: border-box; }
+    input:focus { outline: 2px solid #4c6ef5; border-color: transparent; }
+    button { width: 100%; margin-top: 18px; padding: 10px;
+             background: #4c6ef5; color: #fff; border: 0;
+             border-radius: 8px; font-weight: 600; cursor: pointer; }
+    button:hover { background: #4263eb; }
+    .err { margin-top: 14px; font-size: 13px; color: #ff6b6b; }
+  </style>
+</head>
+<body>
+  <form class="card" action="/admin/auth/login" method="post">
+    <h1>NQAI Voice</h1>
+    <p class="sub">Operator giriş</p>
+    <label for="email">Email</label>
+    <input id="email" name="email" type="email" autofocus required>
+    <label for="password">Parola</label>
+    <input id="password" name="password" type="password" required>
+    <button type="submit">Giriş yap</button>
+  </form>
+</body>
+</html>

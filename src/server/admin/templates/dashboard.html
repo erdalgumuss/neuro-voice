@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>NQAI Voice — Admin</title>
+  <script src="https://unpkg.com/htmx.org@2.0.4"
+          integrity="sha384-HGfztofotfshcF7+8n44JQL2oJmowVChPTg48S+jvZoztPfvwD79OC/LTtG6dMp+"
+          crossorigin="anonymous"></script>
+  <style>
+    :root { color-scheme: light dark; font-family: -apple-system, system-ui, sans-serif; }
+    body { margin: 0; background: #0c0d10; color: #e8e9eb; }
+    header { padding: 18px 32px; border-bottom: 1px solid #2a2d35;
+             display: flex; justify-content: space-between; align-items: center; }
+    header h1 { margin: 0; font-size: 16px; letter-spacing: -0.01em; }
+    header .right { display: flex; gap: 12px; align-items: center;
+                    font-size: 13px; color: #8a8f9a; }
+    header button { background: transparent; color: #8a8f9a;
+                    border: 1px solid #2a2d35; padding: 6px 12px;
+                    border-radius: 6px; cursor: pointer; font-size: 12px; }
+    header button:hover { color: #e8e9eb; border-color: #4c6ef5; }
+    main { padding: 32px; max-width: 1100px; margin: 0 auto; }
+    h2 { font-size: 14px; text-transform: uppercase; letter-spacing: 0.05em;
+         color: #b5bac4; margin-top: 32px; }
+    .card { background: #16181d; border: 1px solid #2a2d35;
+            border-radius: 12px; padding: 18px; margin-top: 12px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 10px 14px; text-align: left;
+             border-bottom: 1px solid #2a2d35; }
+    th { color: #b5bac4; font-weight: 600; font-size: 11px;
+         text-transform: uppercase; letter-spacing: 0.04em; }
+    td.muted { color: #8a8f9a; font-family: ui-monospace, monospace; font-size: 12px; }
+    .actions { display: flex; gap: 8px; margin-top: 14px; }
+    .actions button, .actions input[type="submit"] {
+      padding: 8px 14px; background: #4c6ef5; color: #fff;
+      border: 0; border-radius: 6px; cursor: pointer; font-size: 13px;
+    }
+    .actions input { padding: 8px 10px; background: #0c0d10;
+                     border: 1px solid #2a2d35; border-radius: 6px;
+                     color: #e8e9eb; font-size: 13px; }
+    .danger { background: #fa5252 !important; }
+    .new-key { background: #1a3a1c; border-color: #2c5530;
+               padding: 14px 18px; margin-top: 14px; border-radius: 8px;
+               font-family: ui-monospace, monospace; font-size: 13px;
+               word-break: break-all; }
+    .new-key strong { display: block; margin-bottom: 8px;
+                      font-family: -apple-system, system-ui;
+                      color: #69db7c; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>NQAI Voice — Admin</h1>
+    <div class="right">
+      <span id="me">…</span>
+      <form action="/admin/auth/logout" method="post" style="margin:0">
+        <button type="submit">Çıkış</button>
+      </form>
+    </div>
+  </header>
+  <main>
+    <h2>Tenantlar</h2>
+    <div class="card" hx-get="/admin/tenants" hx-trigger="load" hx-swap="innerHTML">
+      Yükleniyor…
+    </div>
+
+    <h2>Yeni tenant</h2>
+    <div class="card">
+      <form class="actions" hx-post="/admin/tenants" hx-swap="none"
+            hx-on::after-request="if(event.detail.successful) htmx.trigger(htmx.find('[hx-get=&quot;/admin/tenants&quot;]'),'load')">
+        <input name="slug" placeholder="slug (örn. neeko-prod)" required>
+        <input name="display_name" placeholder="Görünür ad" required>
+        <input type="submit" value="Oluştur">
+      </form>
+    </div>
+
+    <h2>30 günlük kullanım özeti</h2>
+    <div class="card" hx-get="/admin/usage" hx-trigger="load delay:200ms"
+         hx-swap="innerHTML">
+      Yükleniyor…
+    </div>
+  </main>
+
+  <script>
+    // Render JSON tenants list into an actual table on the fly
+    document.body.addEventListener("htmx:afterSwap", (ev) => {
+      const target = ev.detail.target;
+      const txt = target.innerText.trim();
+      if (!txt.startsWith("{")) return;
+      let data;
+      try { data = JSON.parse(txt); } catch { return; }
+      if (data.tenants) {
+        renderTenants(target, data.tenants);
+      } else if (data.days && data.tenants !== undefined) {
+        renderUsage(target, data);
+      }
+    });
+    function renderTenants(el, tenants) {
+      el.innerHTML = tenants.length === 0
+        ? "<em>Henüz tenant yok.</em>"
+        : `<table>
+             <thead><tr><th>Slug</th><th>Ad</th><th>Durum</th><th>Oluştu</th><th></th></tr></thead>
+             <tbody>${tenants.map(t => `
+               <tr>
+                 <td class="muted">${t.slug}</td>
+                 <td>${t.display_name}</td>
+                 <td>${t.status}</td>
+                 <td class="muted">${t.created_at.slice(0,10)}</td>
+                 <td><a href="/admin/tenants/${t.id}" style="color:#4c6ef5">Detay</a></td>
+               </tr>`).join("")}
+             </tbody>
+           </table>`;
+    }
+    function renderUsage(el, data) {
+      const tenants = Object.entries(data.tenants);
+      el.innerHTML = tenants.length === 0
+        ? "<em>Henüz kullanım yok.</em>"
+        : `<table>
+             <thead><tr><th>Tenant</th><th>OK</th><th>Hata</th><th>Karakter</th><th>Ses ms</th></tr></thead>
+             <tbody>${tenants.map(([slug, stats]) => `
+               <tr>
+                 <td class="muted">${slug}</td>
+                 <td>${stats.ok?.count ?? 0}</td>
+                 <td>${(stats.error?.count ?? 0) + (stats.timeout?.count ?? 0)}</td>
+                 <td>${stats.ok?.chars ?? 0}</td>
+                 <td>${stats.ok?.audio_ms ?? 0}</td>
+               </tr>`).join("")}
+             </tbody>
+           </table>`;
+    }
+  </script>
+</body>
+</html>

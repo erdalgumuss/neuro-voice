@@ -1,0 +1,90 @@
+# NQAI Voice — local development stack.
+#
+# Brings up Postgres 16 + Redis 7 + (CPU) gateway. GPU workers run
+# separately (Faz B); for now the legacy single-process TTS endpoints
+# share this gateway and lazy-load VoxCPM2 on demand.
+#
+#   docker compose -f docker-compose.dev.yaml up --build
+#
+# First run, after the gateway image exists:
+#   docker compose -f docker-compose.dev.yaml exec gateway \
+#       alembic upgrade head
+#   docker compose -f docker-compose.dev.yaml exec gateway \
+#       python scripts/seed_operator.py --email you@nqai.com
+#
+# Then visit http://localhost:8000/admin/
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: nqai
+      POSTGRES_PASSWORD: nqai
+      POSTGRES_DB: nqai_voice
+    volumes:
+      - nqai_pgdata:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nqai -d nqai_voice"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --maxmemory
+      - "256mb"
+      - --maxmemory-policy
+      - "allkeys-lru"
+    volumes:
+      - nqai_redisdata:/data
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  gateway:
+    build:
+      context: .
+      dockerfile: deploy/gateway.Dockerfile
+    image: nqai-voice-gateway:dev
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NQAI_DATABASE_URL: "postgresql+asyncpg://nqai:nqai@postgres:5432/nqai_voice"
+      NQAI_REDIS_URL: "redis://redis:6379/0"
+      NQAI_DEVICE: cpu                     # GPU worker runs separately in Faz B
+      NQAI_REQUIRE_AUTH: "true"
+      NQAI_API_KEYS: "${NQAI_API_KEYS:-dev-key-12345}"
+      NQAI_JWT_SECRET: "${NQAI_JWT_SECRET:?must be set in .env, at least 32 chars}"
+      NQAI_COOKIE_SECURE: "false"          # local HTTP — production keeps default true
+      NQAI_VOICES_DIR: "/srv/nqai/configs/voices"
+      NQAI_REFERENCE_DIR: "/srv/nqai/data/reference-audio"
+      PYTHONPATH: "/srv/nqai/src"
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./configs:/srv/nqai/configs:rw
+      - ./data:/srv/nqai/data:rw
+      - ./migrations:/srv/nqai/migrations:ro
+      - ./alembic.ini:/srv/nqai/alembic.ini:ro
+    command: ["uvicorn", "server.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+volumes:
+  nqai_pgdata:
+  nqai_redisdata:

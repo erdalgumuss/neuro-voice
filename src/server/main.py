@@ -28,7 +28,8 @@ from registry import Voice, VoiceAlreadyExists, VoiceNotFound, VoiceRegistry
 from registry.catalog import InvalidVoiceId
 
 from . import streaming
-from .auth import require_api_key
+from .admin import admin_router
+from .auth_legacy import require_api_key  # noqa: F401 — BC shim, see module docstring
 from .config import settings
 from .engine import (
     BaseSynthEngine,
@@ -118,6 +119,10 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["X-NQAI-Sample-Rate", "X-NQAI-Voice-Id", "X-NQAI-Sentences"],
 )
+
+# Admin (JWT-protected, DB-backed) — separate auth surface from the
+# legacy TTS endpoints. Lives under /admin.
+app.include_router(admin_router)
 
 
 @app.get("/health", response_model=HealthResponse, tags=["meta"])
