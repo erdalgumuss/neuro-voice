@@ -41,6 +41,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from audio.wav import pcm16_to_wav_bytes
 from db.session import get_session
 from registry.audio_io import trim_and_resample_to_wav  # still used by enroll
 from registry.catalog import (
@@ -63,7 +64,6 @@ from .config import settings
 from .engine import (
     BaseSynthEngine,
     get_engine,
-    pcm16_to_wav_bytes,
 )
 from .queue import TtsJobPayload, TtsJobQueue, get_queue, parse_idempotency_key
 from .reference_resolver import (

@@ -17,13 +17,11 @@ Key VoxCPM2 traits we lean on:
 
 from __future__ import annotations
 
-import io
 import json
 import logging
 import os
 import threading
 import time
-import wave
 from collections import OrderedDict
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -94,20 +92,12 @@ def _resolve_device(requested: str) -> str:
     return "cpu"
 
 
-def _float_to_pcm16(wav: np.ndarray) -> bytes:
-    wav = np.clip(wav, -1.0, 1.0)
-    return (wav * 32767.0).astype(np.int16).tobytes()
-
-
-def pcm16_to_wav_bytes(pcm: bytes, sample_rate: int, channels: int = 1) -> bytes:
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as w:
-        w.setnchannels(channels)
-        w.setsampwidth(2)
-        w.setframerate(sample_rate)
-        w.writeframes(pcm)
-    return buf.getvalue()
-
+# PCM/WAV helpers live in `src/audio/wav.py` so the gateway proxy and
+# the worker can both import them without dragging in VoxCPM2. Re-export
+# preserves the historical `from .engine import pcm16_to_wav_bytes`
+# call sites until Step 3 of the worker split moves this module entirely.
+from audio.wav import float_to_pcm16_bytes as _float_to_pcm16  # noqa: F401,E402
+from audio.wav import pcm16_to_wav_bytes  # noqa: F401,E402
 
 # Engine-level default knobs. Tune per voice in the manifest later.
 DEFAULT_CFG_VALUE = 2.0
