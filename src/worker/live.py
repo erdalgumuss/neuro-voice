@@ -1,10 +1,24 @@
-"""Live TTS worker helpers.
+"""Streaming TTS worker helpers — frame-by-frame audio bridge.
 
-The durable B.1 pipeline can afford to generate a whole request then publish.
-The live path cannot. This module bridges the existing blocking
-`engine.synthesize_stream(...)` generator into an async frame stream so the
-first playable PCM frame can leave the worker before full generation
-completes.
+The durable B.1 pipeline could afford `list(engine.synthesize_stream())`
+and emit chunks after the full inference. Streaming cannot: the gateway
+needs to forward the first PCM frame to the HTTP client (or future
+WebSocket consumer) as soon as the engine yields a sentence's worth
+of audio, not after the whole request completes.
+
+`iter_live_audio_frames` runs the blocking sync generator on a thread,
+splits each model chunk into fixed-duration PCM frames, and pushes
+them onto an asyncio queue. The coroutine yields each frame to the
+caller, which can XADD it onto the per-request result stream
+immediately.
+
+The `LiveMediaSink` protocol + `InMemoryLiveMediaSink` reference
+implementation are kept for tests of `run_live_synthesis`, which is
+itself an interface the worker pipeline can lean on if we ever ship
+a sink that talks to a non-Redis transport (the deleted WebRTC scaffold
+used to live here). For B.1.5 the production sink is "XADD onto
+nqai.tts.results.{rid}" via `worker.pipeline.publish_chunk` — there is
+no media-sink in the streaming HTTP path.
 """
 
 from __future__ import annotations
@@ -31,13 +45,22 @@ logger = logging.getLogger("nqai_voice.worker.live")
 
 
 class LiveMediaSink(Protocol):
+    """Outbound media bridge — frames + control events to a client.
+
+    Implementations might be a test sink (in-memory), a WebSocket
+    writer, or (in a future product surface) a WebRTC publisher. The
+    streaming HTTP path does NOT use a sink — it writes chunks
+    directly to the per-request Redis result stream via
+    `worker.pipeline.publish_chunk`.
+    """
+
     async def send_audio_frame(self, frame: LiveAudioFrame) -> None: ...
     async def send_control(self, kind: str, payload: dict) -> None: ...
     async def close(self) -> None: ...
 
 
 class InMemoryLiveMediaSink:
-    """Test/dev sink that records audio/control events in memory."""
+    """Test/dev sink — records outbound events for assertions."""
 
     def __init__(self) -> None:
         self.audio_frames: list[LiveAudioFrame] = []
@@ -202,65 +225,8 @@ async def run_live_synthesis(
         await sink.close()
 
 
-class LiveKitMediaSink:
-    """LiveKit-backed media sink.
-
-    Optional runtime dependency: install `livekit` for real WebRTC publishing.
-    Unit tests use `InMemoryLiveMediaSink`, so gateway/worker imports stay light.
-    """
-
-    def __init__(
-        self,
-        *,
-        url: str,
-        token: str,
-        sample_rate: int = DEFAULT_SAMPLE_RATE,
-        num_channels: int = 1,
-    ) -> None:
-        self._url = url
-        self._token = token
-        self._sample_rate = sample_rate
-        self._num_channels = num_channels
-        self._room = None
-        self._source = None
-
-    async def connect(self) -> None:
-        try:
-            from livekit import rtc
-        except ImportError as exc:  # pragma: no cover - optional dependency
-            raise RuntimeError("install livekit to use LiveKitMediaSink") from exc
-
-        room = rtc.Room()
-        await room.connect(self._url, self._token)
-        source = rtc.AudioSource(self._sample_rate, self._num_channels)
-        track = rtc.LocalAudioTrack.create_audio_track("nqai-tts", source)
-        await room.local_participant.publish_track(track)
-        self._room = room
-        self._source = source
-
-    async def send_audio_frame(self, frame: LiveAudioFrame) -> None:
-        if self._source is None:
-            await self.connect()
-        from livekit import rtc
-
-        audio_frame = rtc.AudioFrame.create(
-            sample_rate=frame.sample_rate,
-            num_channels=1,
-            samples_per_channel=frame.samples_per_channel,
-        )
-        audio_frame.data.cast("B")[:len(frame.pcm_int16)] = frame.pcm_int16
-        await self._source.capture_frame(audio_frame)
-
-    async def send_control(self, kind: str, payload: dict) -> None:
-        if self._room is None:
-            await self.connect()
-        import json
-
-        data = json.dumps({"type": kind, **payload}, ensure_ascii=False).encode("utf-8")
-        await self._room.local_participant.publish_data(data, reliable=True)
-
-    async def close(self) -> None:
-        if self._room is not None:
-            await self._room.disconnect()
-            self._room = None
-            self._source = None
+# NOTE: LiveKit/WebRTC sink intentionally removed. NQAI Voice ships
+# as a one-way streaming TTS API (text in → audio out), à la
+# ElevenLabs / OpenAI / Cartesia. Duplex voice-agent transports live
+# in a separate product surface and would land as a different sink
+# implementation behind this same `LiveMediaSink` protocol.

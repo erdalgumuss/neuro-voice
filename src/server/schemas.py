@@ -117,23 +117,3 @@ class TTSJobStatusResponse(BaseModel):
     output: TTSJobOutput | None = None
 
 
-# --------------------------------------------------------------------------- #
-# Live TTS sessions — WebRTC-first control plane.
-# --------------------------------------------------------------------------- #
-class TTSLiveSessionCreate(BaseModel):
-    voice_id: str = Field(..., min_length=3, max_length=64)
-    language: Literal["tr", "en"] = "tr"
-    client_request_created_ms: int | None = Field(default=None, ge=0)
-
-
-class TTSLiveSessionResponse(BaseModel):
-    session_id: str
-    room_name: str
-    livekit_url: str
-    participant_token: str
-    expires_at: str
-    sample_rate: int = 48000
-    audio_codec: Literal["opus"] = "opus"
-    control_protocol: Literal["nqai.tts.live.v1"] = "nqai.tts.live.v1"
-    worker_id: str
-    metrics: dict[str, int | None] | None = None

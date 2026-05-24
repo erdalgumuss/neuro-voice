@@ -13,55 +13,15 @@ Spec: docs/architecture/worker-process.md.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 import os
 import signal
 import sys
 
-from live import LiveWorkerRegistry
-from server.config import settings
-
 from .consumer import WorkerConsumer
 from .runtime import boot_worker
 
 logger = logging.getLogger("nqai_voice.worker")
-
-
-async def _live_heartbeat_loop(
-    *,
-    redis,
-    consumer_name: str,
-    warm: bool,
-    stop: asyncio.Event,
-) -> None:
-    """Advertise live-session capacity for gateway admission.
-
-    B.1 durable jobs still flow through Redis Streams. B.1.5 live TTS
-    uses this short-TTL heartbeat so gateway can reject live sessions
-    immediately instead of letting them sit in a queue.
-    """
-    interval_s = float(os.environ.get("NQAI_LIVE_WORKER_HEARTBEAT_INTERVAL_S", "1"))
-    ttl_s = int(os.environ.get("NQAI_LIVE_WORKER_HEARTBEAT_TTL_S", "3"))
-    max_sessions = int(os.environ.get("NQAI_LIVE_WORKER_MAX_SESSIONS", "1"))
-    voice_ids = [
-        v.strip()
-        for v in os.environ.get("NQAI_LIVE_WORKER_VOICE_IDS", "").split(",")
-        if v.strip()
-    ]
-    registry = LiveWorkerRegistry(redis, ttl_s=ttl_s)
-    while not stop.is_set():
-        await registry.heartbeat(
-            worker_id=consumer_name,
-            model_id=settings.model_id,
-            device=settings.device,
-            warm=warm,
-            active_live_sessions=0,
-            max_live_sessions=max_sessions,
-            current_voice_ids=voice_ids,
-        )
-        with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(stop.wait(), timeout=interval_s)
 
 
 async def _run_async() -> int:
@@ -105,23 +65,9 @@ async def _run_async() -> int:
         consumer.consumer_name, consumer._stream, consumer._group,
         consumer._block_ms,
     )
-    heartbeat_task = asyncio.create_task(
-        _live_heartbeat_loop(
-            redis=redis,
-            consumer_name=consumer.consumer_name,
-            warm=warmup,
-            stop=stop,
-        )
-    )
     try:
         await consumer.run()
     finally:
-        stop.set()
-        heartbeat_task.cancel()
-        with contextlib.suppress(
-            asyncio.CancelledError, TimeoutError, asyncio.TimeoutError,
-        ):
-            await heartbeat_task
         try:
             await redis.aclose()
         except Exception:
