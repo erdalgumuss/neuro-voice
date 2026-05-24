@@ -21,7 +21,6 @@ import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
 from pathlib import Path
 from time import time
 from typing import Annotated, Any
@@ -56,24 +55,16 @@ from repos import (
     UsageRepo,
     VoiceRepo,
 )
-from storage.reference_resolver import (
-    ReferenceAudioMissing,
-    UnsupportedReferenceURI,
-    resolve_reference_uri,
-)
-
-# Engine + sentence streaming live in src/worker/ after Faz B.1 step 3.
-# Sync /v1/tts and /v1/tts/stream still call into them here for backward
-# compatibility (queue-proxy cutover lands in step 6); the import is
-# one-way (server → worker), no circular risk because worker imports
-# nothing from server.* other than server.queue (leaf wire schemas).
-from worker import streaming
-from worker.engine import BaseSynthEngine, get_engine
 
 from .admin import admin_router
 from .auth import AuthContext, require_auth
 from .config import settings
 from .queue import TtsJobPayload, TtsJobQueue, get_queue, parse_idempotency_key
+from .result_stream import (
+    ResultStreamTimeout,
+    collect_pcm_until_final,
+    consume_result_stream,
+)
 from .schemas import (
     DeleteResponse,
     EnrollResponse,
@@ -96,97 +87,48 @@ logging.basicConfig(
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
 )
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
-# Engine singleton — lazy load. The model itself stays per-process; multi-
-# replica horizontal scale waits on the Faz B worker split.
-_engine: BaseSynthEngine | None = None
+# Faz B.1 step 3 cutover: the gateway no longer holds a VoxCPM2 engine.
+# Sync /v1/tts and /v1/tts/stream proxy through the same Redis queue
+# the async /v1/tts/jobs path uses. Engine + sentence streaming live
+# exclusively in `src/worker/`; the gateway is pure I/O + auth + DB.
 
-
-def get_engine_dep() -> BaseSynthEngine:
-    global _engine
-    if _engine is None:
-        _engine = get_engine(
-            model_id=settings.model_id,
-            device=settings.device,
-            lora_path=settings.lora_path,
-            lora_config_path=settings.lora_config_path,
-            cfg_value=settings.cfg_value,
-            inference_timesteps=settings.inference_timesteps,
-            optimize=settings.optimize,
-        )
-    return _engine
+# Sunset date for the sync endpoints (RFC 8594). When this passes, the
+# Deprecation header becomes a hard 410 in a follow-up release.
+SYNC_TTS_SUNSET = "Mon, 01 Sep 2026 00:00:00 GMT"
+_SYNC_DEPRECATION_HEADERS = {
+    "Deprecation": "true",
+    "Sunset": SYNC_TTS_SUNSET,
+    "Link": '</v1/tts/jobs>; rel="successor-version"',
+}
 
 
-# --------------------------------------------------------------------------- #
-# VoiceView — duck-typed shape the engine consumes
-# --------------------------------------------------------------------------- #
-# The engine accesses three attributes on a "voice": `voice_id`,
-# `engine_params`, and `adapter` (an optional mapping understood by
-# engine._lora_from_mapping). Both the legacy registry.Voice and the
-# DB-backed db.models.Voice satisfy this loosely, but they're shaped
-# differently — DB carries adapter_uri/_sha256/_type as separate columns
-# while the engine wants a single dict. VoiceView is the canonical
-# adapter the request path uses.
-@dataclass(frozen=True)
-class VoiceView:
-    voice_id: str
-    engine_params: dict[str, Any] = field(default_factory=dict)
-    adapter: dict[str, Any] | None = None
-
-
-def _voice_view_from_db(v) -> VoiceView:
-    """Project a db.models.Voice → engine-shaped VoiceView."""
-    adapter: dict[str, Any] | None = None
-    if v.adapter_uri:
-        adapter = {
-            "type": v.adapter_type or "lora",
-            "path": v.adapter_uri,
-        }
-    return VoiceView(
-        voice_id=v.voice_id,
-        engine_params=v.engine_params or {},
-        adapter=adapter,
-    )
-
-
-async def _load_voice_or_404(
-    voice_id: str, tenant_id: uuid.UUID, session: AsyncSession
+async def _assert_voice_accessible_or_404(
+    voice_id: str, tenant_id: uuid.UUID, session: AsyncSession,
 ):
-    """Viewer-scoped accessibility lookup returning (db_voice, VoiceView,
-    resolved_path). Resolves owned ∪ public ∪ shared (refactor R, D-08).
+    """Viewer-scoped accessibility check (refactor R, D-08).
 
-    Raises HTTPException(404/400). Resolved reference path is a local
-    file — Faz B's R2 fetcher plugs in here for s3:// URIs.
+    Returns the db row so callers can read voice_id slug, owner, etc.
+    Crucially does NOT resolve the reference audio URI — that's a
+    worker-side concern. Gateway-side resolution would (a) trigger an
+    R2 download on every metadata/sync request (Codex audit fix) and
+    (b) re-introduce a server→storage dependency on a hot path.
+
+    Raises HTTPException(404/400). Existence-leak prevention: a voice
+    belonging to another tenant returns the same 404 as a missing one.
     """
     try:
         validate_voice_id(voice_id)
     except InvalidVoiceId as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
 
-    repo = VoiceRepo(session, tenant_id)
-    voice = await repo.get_accessible(voice_id)
+    voice = await VoiceRepo(session, tenant_id).get_accessible(voice_id)
     if voice is None:
-        # Existence-leak prevention — same 404 whether the voice belongs
-        # to another tenant (and isn't shared/public) or doesn't exist.
         raise HTTPException(
             status.HTTP_404_NOT_FOUND, detail=f"voice '{voice_id}' not found"
         )
-
-    try:
-        ref_path = resolve_reference_uri(voice.reference_uri)
-    except ReferenceAudioMissing as e:
-        # Reference uploaded but file gone — operator must re-upload.
-        raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"reference audio for '{voice_id}' is missing on this node",
-        ) from e
-    except UnsupportedReferenceURI as e:
-        raise HTTPException(
-            status.HTTP_501_NOT_IMPLEMENTED, detail=str(e)
-        ) from e
-
-    return voice, _voice_view_from_db(voice), ref_path
+    return voice
 
 
 # --------------------------------------------------------------------------- #
@@ -246,33 +188,26 @@ app.include_router(admin_router)
 
 
 # --------------------------------------------------------------------------- #
-# /health — unauthenticated liveness
+# /health — unauthenticated liveness (gateway only, no engine state)
 # --------------------------------------------------------------------------- #
 @app.get("/health", response_model=HealthResponse, tags=["meta"])
 async def health() -> HealthResponse:
-    eng = get_engine_dep()
-    loaded = getattr(eng, "_model", None) is not None
+    """Gateway liveness — DB / Redis health is not checked here so the
+    probe stays cheap. Worker engine state lives behind metrics in
+    Faz C; gateway never knows whether a GPU worker is warmed up.
+
+    `loaded` / `sample_rate` are advisory legacy fields kept for the
+    admin UI's existing rendering; they're filled with static settings
+    values, not a live engine probe."""
     return HealthResponse(
-        status="ok" if loaded else "warming",
+        status="ok",
         model_id=settings.model_id,
-        device=getattr(eng, "_device", settings.device),
-        sample_rate=getattr(eng, "sample_rate", 0),
-        loaded=loaded,
-        voice_count=0,  # Faz B'de DB-aggregate; gateway voice-count'a karar vermez
+        device="gateway",  # gateway never holds the model after Faz B.1
+        sample_rate=settings.target_sample_rate,
+        loaded=True,  # gateway is always "loaded" — engine lives in workers
+        voice_count=0,
         version=VERSION,
     )
-
-
-# --------------------------------------------------------------------------- #
-# /admin/warmup — admin-scoped (uses Bearer API key with admin:read scope)
-# --------------------------------------------------------------------------- #
-@app.post("/admin/warmup", tags=["meta"])
-async def warmup(
-    _ctx: Annotated[AuthContext, Depends(require_auth("admin:read"))],
-    eng: Annotated[BaseSynthEngine, Depends(get_engine_dep)],
-) -> dict:
-    eng.warmup()
-    return {"loaded": True, "sample_rate": eng.sample_rate}
 
 
 # --------------------------------------------------------------------------- #
@@ -311,7 +246,9 @@ async def get_voice(
     ctx: Annotated[AuthContext, Depends(require_auth("voice:read"))],
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> VoicePublic:
-    db_voice, _view, _path = await _load_voice_or_404(voice_id, ctx.tenant_id, session)
+    db_voice = await _assert_voice_accessible_or_404(
+        voice_id, ctx.tenant_id, session,
+    )
     return _voice_to_public(db_voice)
 
 
@@ -513,59 +450,111 @@ async def synthesize(
     request: Request,
     ctx: Annotated[AuthContext, Depends(require_auth("tts:write"))],
     session: Annotated[AsyncSession, Depends(get_session)],
-    eng: Annotated[BaseSynthEngine, Depends(get_engine_dep)],
+    queue: Annotated[TtsJobQueue, Depends(get_queue)],
 ) -> Response:
+    """**Deprecated** — backward-compat queue proxy.
+
+    Faz B.1 step 3 cutover: gateway no longer holds the engine. This
+    endpoint XADD's the job to the same Redis Streams queue the async
+    `/v1/tts/jobs` path uses, awaits chunks on the per-request result
+    stream, concatenates them into a single WAV body, and returns it
+    synchronously. The client API contract is preserved (POST → WAV
+    body), but the actual synthesis runs in the worker.
+
+    New code should use `POST /v1/tts/jobs` directly — see Sunset and
+    Link headers (RFC 8594). Latency: this proxy adds 1-2 ms of queue
+    + result-stream overhead vs. the in-process engine; everything
+    above that is the worker's inference time.
+    """
     if len(body.text) > settings.max_chars_per_request:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             detail=f"text exceeds max_chars={settings.max_chars_per_request}",
         )
-    db_voice, view, ref_path = await _load_voice_or_404(
-        body.voice_id, ctx.tenant_id, session
+    db_voice = await _assert_voice_accessible_or_404(
+        body.voice_id, ctx.tenant_id, session,
     )
-    rid = _request_id_for(request)
-    t0 = time()
-    result = eng.synthesize(
-        text=body.text,
-        voice=view,
-        reference_path=ref_path,
-        language_id=body.language,
-    )
-    elapsed_ms = int((time() - t0) * 1000)
-    duration_ms = int(result.duration_seconds * 1000)
-    rtf = (result.elapsed_seconds / result.duration_seconds) if result.duration_seconds else None
 
-    await _record_usage(
-        session,
-        ctx=ctx,
-        voice_id=view.voice_id,
-        request_id=rid,
-        text_char_count=len(body.text),
-        sentence_count=result.sentence_count,
-        duration_ms=duration_ms,
-        elapsed_ms=elapsed_ms,
-        ttfb_ms=None,
-        rtf=rtf,
-        status_str="ok",
+    rid = _request_id_for(request)
+    redis = queue._redis  # use the same client the queue is bound to
+
+    # Reserve idempotency upfront so a duplicate sync POST with the
+    # same X-Request-Id replays cleanly (same path as async jobs).
+    idem = IdempotencyRepo(session, ctx.tenant_id)
+    await idem.reserve(
+        request_id=rid, api_key_id=ctx.api_key_id,
+        request_hash=_hash_sync_body(body),
+    )
+    await session.commit()
+
+    payload = TtsJobPayload(
+        request_id=str(rid),
+        tenant_id=str(ctx.tenant_id),
+        api_key_id=str(ctx.api_key_id),
+        voice_id=db_voice.voice_id,
+        text=body.text,
+        language=body.language,
+        audio_format=body.audio_format,
         app_label=_app_label_from(request),
     )
+    try:
+        await queue.submit(payload)
+    except Exception as e:
+        await idem.delete(rid)
+        await session.commit()
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY, detail="failed to enqueue sync job",
+        ) from e
+
+    t0 = time()
+    try:
+        pcm, sentences, error = await collect_pcm_until_final(
+            redis, str(rid),
+            block_ms=200,
+            overall_timeout_s=float(
+                os.environ.get("NQAI_SYNC_TIMEOUT_S", "30")
+            ),
+        )
+    except ResultStreamTimeout as e:
+        raise HTTPException(
+            status.HTTP_504_GATEWAY_TIMEOUT,
+            detail="worker did not finish in time; retry via /v1/tts/jobs",
+        ) from e
+    elapsed_ms = int((time() - t0) * 1000)
+
+    if error:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY, detail=f"worker error: {error}",
+        )
+
+    # Worker emits 48 kHz PCM int16; sample_rate fixed by the engine.
+    # If clients ever need to override, they pass `sample_rate` on the
+    # request and the worker resamples (Faz B.2).
+    sample_rate = settings.target_sample_rate
+    duration_ms = int(len(pcm) // 2 / max(sample_rate, 1) * 1000)
+    rtf = (elapsed_ms / duration_ms) if duration_ms > 0 else None
+
+    # Usage was already recorded by the worker; gateway doesn't double-
+    # write here. The session has nothing pending — keep the
+    # transaction sane.
 
     headers = {
+        **_SYNC_DEPRECATION_HEADERS,
         "X-NQAI-Request-Id": str(rid),
-        "X-NQAI-Sample-Rate": str(result.sample_rate),
-        "X-NQAI-Voice-Id": view.voice_id,
-        "X-NQAI-Sentences": str(result.sentence_count),
-        "X-NQAI-Duration-Seconds": f"{result.duration_seconds:.3f}",
-        "X-NQAI-Elapsed-Seconds": f"{result.elapsed_seconds:.3f}",
+        "X-NQAI-Sample-Rate": str(sample_rate),
+        "X-NQAI-Voice-Id": db_voice.voice_id,
+        "X-NQAI-Sentences": str(sentences),
+        "X-NQAI-Duration-Seconds": f"{duration_ms / 1000.0:.3f}",
+        "X-NQAI-Elapsed-Seconds": f"{elapsed_ms / 1000.0:.3f}",
         "X-NQAI-RTF": f"{rtf:.3f}" if rtf is not None else "inf",
     }
     if body.audio_format == "pcm16":
         return Response(
-            content=result.pcm_int16,
+            content=pcm,
             media_type="application/octet-stream",
             headers=headers,
         )
-    wav_bytes = pcm16_to_wav_bytes(result.pcm_int16, result.sample_rate)
+    wav_bytes = pcm16_to_wav_bytes(pcm, sample_rate)
     return Response(content=wav_bytes, media_type="audio/wav", headers=headers)
 
 
@@ -575,45 +564,120 @@ async def synthesize_stream(
     request: Request,
     ctx: Annotated[AuthContext, Depends(require_auth("tts:write"))],
     session: Annotated[AsyncSession, Depends(get_session)],
-    eng: Annotated[BaseSynthEngine, Depends(get_engine_dep)],
+    queue: Annotated[TtsJobQueue, Depends(get_queue)],
 ) -> StreamingResponse:
+    """**Deprecated** — sentence-streamed queue proxy.
+
+    Same queue path as `/v1/tts`, but chunks are forwarded to the
+    client as they arrive on the result stream rather than concatenated.
+    HTTP chunked transfer; the first byte hits the wire after the
+    worker's first sentence is generated (Faz B.1 latency: 1-2s on
+    L4 with stub engine; real engine drives most of the wall clock).
+
+    Latency-focused live streaming (frame-level, WS / WebRTC) is
+    Faz B.1.5 — that path will not use this endpoint.
+    """
     if len(body.text) > settings.max_chars_per_request:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             detail=f"text exceeds max_chars={settings.max_chars_per_request}",
         )
-    _db_voice, view, ref_path = await _load_voice_or_404(
-        body.voice_id, ctx.tenant_id, session
+    db_voice = await _assert_voice_accessible_or_404(
+        body.voice_id, ctx.tenant_id, session,
     )
     rid = _request_id_for(request)
+    redis = queue._redis
+
+    idem = IdempotencyRepo(session, ctx.tenant_id)
+    await idem.reserve(
+        request_id=rid, api_key_id=ctx.api_key_id,
+        request_hash=_hash_sync_body(body),
+    )
+    await session.commit()
+
+    payload = TtsJobPayload(
+        request_id=str(rid),
+        tenant_id=str(ctx.tenant_id),
+        api_key_id=str(ctx.api_key_id),
+        voice_id=db_voice.voice_id,
+        text=body.text,
+        language=body.language,
+        audio_format=body.audio_format,
+        app_label=_app_label_from(request),
+    )
+    try:
+        await queue.submit(payload)
+    except Exception as e:
+        await idem.delete(rid)
+        await session.commit()
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY, detail="failed to enqueue sync job",
+        ) from e
+
+    sample_rate = settings.target_sample_rate
     headers = {
+        **_SYNC_DEPRECATION_HEADERS,
         "X-NQAI-Request-Id": str(rid),
-        "X-NQAI-Sample-Rate": str(eng.sample_rate),
-        "X-NQAI-Voice-Id": view.voice_id,
+        "X-NQAI-Sample-Rate": str(sample_rate),
+        "X-NQAI-Voice-Id": db_voice.voice_id,
     }
+
+    async def _yield_pcm():
+        try:
+            async for chunk in consume_result_stream(
+                redis, str(rid),
+                block_ms=100,
+                overall_timeout_s=float(
+                    os.environ.get("NQAI_SYNC_TIMEOUT_S", "30")
+                ),
+            ):
+                if chunk.error:
+                    # Inline error sentinel — chunked-WAV can't carry
+                    # status codes mid-stream; client must check trailers
+                    # or out-of-band. For now we log + break.
+                    logger.warning("worker error mid-stream: %s", chunk.error)
+                    break
+                if chunk.final:
+                    break
+                yield chunk.pcm_bytes
+        except ResultStreamTimeout:
+            logger.warning("sync-stream proxy timed out for rid=%s", rid)
+            return
+
+    async def _yield_wav():
+        # RIFF "infinite size" header trick — same as worker.streaming
+        # did before the cutover; we reproduce it here so gateway
+        # doesn't import any worker module.
+        import struct
+        header = b"RIFF" + struct.pack("<I", 0xFFFFFFFF) + b"WAVE"
+        header += b"fmt " + struct.pack(
+            "<IHHIIHH", 16, 1, 1, sample_rate, sample_rate * 2, 2, 16,
+        )
+        header += b"data" + struct.pack("<I", 0xFFFFFFFF)
+        yield header
+        async for pcm in _yield_pcm():
+            yield pcm
+
     if body.audio_format == "pcm16":
         return StreamingResponse(
-            streaming.stream_pcm16(
-                eng,
-                text=body.text,
-                voice=view,
-                reference_path=ref_path,
-                language_id=body.language,
-            ),
+            _yield_pcm(),
             media_type="application/octet-stream",
             headers=headers,
         )
     return StreamingResponse(
-        streaming.stream_wav(
-            eng,
-            text=body.text,
-            voice=view,
-            reference_path=ref_path,
-            language_id=body.language,
-        ),
+        _yield_wav(),
         media_type="audio/wav",
         headers=headers,
     )
+
+
+def _hash_sync_body(body) -> str:
+    """Stable hash of the sync request shape — same role as
+    `_hash_job_body` for async, kept separate so a future shape change
+    in TTSRequest vs TTSJobCreate doesn't accidentally collide."""
+    import hashlib
+    canonical = body.model_dump_json(by_alias=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 # --------------------------------------------------------------------------- #
@@ -655,8 +719,8 @@ async def create_tts_job(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
 
     # Voice existence + tenant isolation — same path as sync /v1/tts.
-    db_voice, _view, _path = await _load_voice_or_404(
-        body.voice_id, ctx.tenant_id, session
+    db_voice = await _assert_voice_accessible_or_404(
+        body.voice_id, ctx.tenant_id, session,
     )
 
     # Stripe-style guarded reserve: same key + same body → replay; same

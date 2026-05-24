@@ -224,6 +224,179 @@ async def test_async_job_completes_when_worker_is_running(setup):
         app.dependency_overrides.clear()
 
 
+async def test_sync_tts_proxy_returns_wav_via_worker(setup):
+    """Faz B.1 step 3: sync /v1/tts is a queue proxy. Gateway XADD's
+    the job, worker consumes it, gateway concatenates result-stream
+    chunks into a WAV body. Same client-facing contract as the old
+    in-process path.
+
+    Uses httpx.AsyncClient (ASGI transport) so the worker task running
+    in the same event loop actually gets scheduling time during the
+    sync POST — TestClient's sync API blocks the loop and starves the
+    worker, which would manifest as a 504."""
+    import io
+    import wave
+
+    import httpx
+
+    from server.auth import get_redis
+    from server.main import app
+    from server.queue import DEFAULT_STREAM, TtsJobQueue, get_queue
+    from worker.consumer import WorkerConsumer
+
+    fake_redis = fakeredis.aioredis.FakeRedis()
+    queue = TtsJobQueue(fake_redis, stream=DEFAULT_STREAM)
+    app.dependency_overrides[get_redis] = lambda: fake_redis
+    app.dependency_overrides[get_queue] = lambda: queue
+
+    stop = asyncio.Event()
+    consumer = WorkerConsumer(
+        redis=fake_redis, engine=_StubEngine(),
+        archive_to_r2=setup["archive"],
+        stop_event=stop, block_ms=10,
+    )
+    worker_task = asyncio.create_task(consumer.run())
+
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test",
+            headers={"Authorization": f"Bearer {setup['bearer']}"},
+            timeout=10.0,
+        ) as client:
+            # Enroll a voice (multipart upload).
+            wav = _make_wav_bytes()
+            r_enroll = await client.post(
+                "/v1/voices",
+                data={"voice_id": "sync-proxy-voice", "display_name": "P"},
+                files={"reference_audio": ("d.wav", wav, "audio/wav")},
+            )
+            assert r_enroll.status_code == 200, r_enroll.text
+
+            r = await client.post(
+                "/v1/tts",
+                headers={"X-NQAI-App": "sync-proxy-test"},
+                json={
+                    "text": "Merhaba dünya.",
+                    "voice_id": "sync-proxy-voice",
+                },
+            )
+            assert r.status_code == 200, r.text
+            assert r.headers["content-type"].startswith("audio/wav")
+            # Deprecation contract (RFC 8594) — clients see the sunset
+            # signal so they know to migrate to /v1/tts/jobs.
+            assert r.headers["deprecation"] == "true"
+            assert "sunset" in r.headers
+            assert "/v1/tts/jobs" in r.headers["link"]
+            # WAV body is a valid RIFF.
+            with wave.open(io.BytesIO(r.content), "rb") as w:
+                assert w.getnchannels() == 1
+                assert w.getsampwidth() == 2
+                assert w.getframerate() == 48000
+                assert w.getnframes() > 0
+            assert int(r.headers["x-nqai-sentences"]) >= 1
+            assert int(r.headers["x-nqai-sample-rate"]) == 48000
+    finally:
+        stop.set()
+        try:
+            await asyncio.wait_for(worker_task, timeout=2.0)
+        except asyncio.TimeoutError:
+            worker_task.cancel()
+        app.dependency_overrides.clear()
+
+
+async def test_sync_tts_proxy_504_when_no_worker(setup, monkeypatch):
+    """If no worker consumes the job, the gateway proxy times out and
+    returns 504 — never hangs the client forever."""
+    from fastapi.testclient import TestClient
+
+    from server.auth import get_redis
+    from server.main import app
+    from server.queue import DEFAULT_STREAM, TtsJobQueue, get_queue
+
+    monkeypatch.setenv("NQAI_SYNC_TIMEOUT_S", "0.3")
+
+    fake_redis = fakeredis.aioredis.FakeRedis()
+    queue = TtsJobQueue(fake_redis, stream=DEFAULT_STREAM)
+    app.dependency_overrides[get_redis] = lambda: fake_redis
+    app.dependency_overrides[get_queue] = lambda: queue
+
+    try:
+        with TestClient(app) as client:
+            client.headers["Authorization"] = f"Bearer {setup['bearer']}"
+            _enroll_voice(client, voice_id="lonely-voice")
+
+            r = client.post(
+                "/v1/tts",
+                json={"text": "Hiç worker yok.", "voice_id": "lonely-voice"},
+            )
+            assert r.status_code == 504
+            assert "/v1/tts/jobs" in r.json()["detail"]
+    finally:
+        app.dependency_overrides.clear()
+
+
+async def test_sync_tts_stream_proxy_yields_riff_wav(setup):
+    """The /v1/tts/stream variant — same proxy path but chunks
+    forwarded as HTTP chunked transfer. Client sees a valid RIFF/WAVE
+    header up front, then PCM bytes. AsyncClient for the same
+    event-loop-sharing reason as the sync proxy test above."""
+    import httpx
+
+    from server.auth import get_redis
+    from server.main import app
+    from server.queue import DEFAULT_STREAM, TtsJobQueue, get_queue
+    from worker.consumer import WorkerConsumer
+
+    fake_redis = fakeredis.aioredis.FakeRedis()
+    queue = TtsJobQueue(fake_redis, stream=DEFAULT_STREAM)
+    app.dependency_overrides[get_redis] = lambda: fake_redis
+    app.dependency_overrides[get_queue] = lambda: queue
+
+    stop = asyncio.Event()
+    consumer = WorkerConsumer(
+        redis=fake_redis, engine=_StubEngine(),
+        archive_to_r2=setup["archive"],
+        stop_event=stop, block_ms=10,
+    )
+    worker_task = asyncio.create_task(consumer.run())
+
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test",
+            headers={"Authorization": f"Bearer {setup['bearer']}"},
+            timeout=10.0,
+        ) as client:
+            wav = _make_wav_bytes()
+            await client.post(
+                "/v1/voices",
+                data={"voice_id": "stream-voice", "display_name": "S"},
+                files={"reference_audio": ("s.wav", wav, "audio/wav")},
+            )
+            async with client.stream(
+                "POST",
+                "/v1/tts/stream",
+                json={
+                    "text": "Birinci cümle. İkinci cümle.",
+                    "voice_id": "stream-voice",
+                },
+            ) as r:
+                chunks = b""
+                async for piece in r.aiter_bytes():
+                    chunks += piece
+            assert chunks.startswith(b"RIFF")
+            assert b"WAVE" in chunks[:20]
+            assert len(chunks) > 44  # header + at least one PCM chunk
+    finally:
+        stop.set()
+        try:
+            await asyncio.wait_for(worker_task, timeout=2.0)
+        except asyncio.TimeoutError:
+            worker_task.cancel()
+        app.dependency_overrides.clear()
+
+
 async def test_gateway_idempotency_complete_status_after_worker(setup):
     """Same key replay AFTER worker completed must return deduplicated +
     status=complete (no double-processing)."""

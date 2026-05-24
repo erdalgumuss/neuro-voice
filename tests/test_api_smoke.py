@@ -13,7 +13,6 @@ from __future__ import annotations
 import io
 import sys
 import types as _types
-import wave
 
 import fakeredis.aioredis
 import numpy as np
@@ -158,8 +157,13 @@ def test_health_does_not_require_auth(client):
     r = client.get("/health")
     assert r.status_code == 200
     body = r.json()
-    assert body["status"] in {"ok", "warming"}
-    assert body["version"] == "0.3.0"
+    assert body["status"] == "ok"
+    # Gateway is always "loaded" after Faz B.1 (engine lives in workers).
+    assert body["loaded"] is True
+    assert body["device"] == "gateway"
+    # Version stays declared in src/server/main.py — exact match is too
+    # brittle, just check semver shape.
+    assert body["version"].count(".") == 2
 
 
 # --------------------------------------------------------------------------- #
@@ -244,75 +248,16 @@ def test_enroll_rejects_tiny_audio(client):
 
 
 # --------------------------------------------------------------------------- #
-# TTS happy + edge
+# TTS — voice resolution (sync-engine smoke tests moved to test_async_e2e
+# now that /v1/tts proxies through the queue; only static-failure
+# assertions stay here because they don't need a worker)
 # --------------------------------------------------------------------------- #
-def test_tts_with_stub_engine(client):
-    wav = _make_wav_bytes()
-    client.post(
-        "/v1/voices",
-        data={"voice_id": "bob-01", "display_name": "Bob"},
-        files={"reference_audio": ("b.wav", wav, "audio/wav")},
-    )
-    r = client.post(
-        "/v1/tts",
-        json={"text": "Merhaba dünya. Bu bir test cümlesidir.", "voice_id": "bob-01"},
-    )
-    assert r.status_code == 200, r.text
-    assert r.headers["content-type"].startswith("audio/wav")
-    assert int(r.headers["X-NQAI-Sentences"]) >= 1
-    assert int(r.headers["X-NQAI-Sample-Rate"]) == 48000
-    assert "X-NQAI-Request-Id" in r.headers
-    with wave.open(io.BytesIO(r.content), "rb") as w:
-        assert w.getnchannels() == 1
-        assert w.getsampwidth() == 2
-        assert w.getframerate() == 48000
-        assert w.getnframes() > 0
-
-
 def test_tts_voice_404(client):
     r = client.post(
         "/v1/tts",
         json={"text": "merhaba", "voice_id": "nobody-here"},
     )
     assert r.status_code == 404
-
-
-def test_tts_stream_returns_wav(client):
-    wav = _make_wav_bytes()
-    client.post(
-        "/v1/voices",
-        data={"voice_id": "carol-01", "display_name": "Carol"},
-        files={"reference_audio": ("c.wav", wav, "audio/wav")},
-    )
-    with client.stream(
-        "POST",
-        "/v1/tts/stream",
-        json={"text": "Birinci cümle. İkinci cümle burada.", "voice_id": "carol-01"},
-    ) as r:
-        chunks = b"".join(r.iter_bytes())
-    assert chunks.startswith(b"RIFF")
-    assert b"WAVE" in chunks[:20]
-    assert len(chunks) > 44
-
-
-def test_request_id_round_trip(client):
-    """X-Request-Id supplied by the caller must come back in the response."""
-    wav = _make_wav_bytes()
-    client.post(
-        "/v1/voices",
-        data={"voice_id": "dave-01", "display_name": "Dave"},
-        files={"reference_audio": ("d.wav", wav, "audio/wav")},
-    )
-    # uuid.UUID accepts both hyphenated and bare-hex; we send a canonical
-    # UUIDv4 so the gateway echoes it back unchanged.
-    rid_uuid = "550e8400-e29b-41d4-a716-446655440000"
-    r = client.post(
-        "/v1/tts",
-        headers={"X-Request-Id": rid_uuid},
-        json={"text": "Test.", "voice_id": "dave-01"},
-    )
-    assert r.status_code == 200, r.text
-    assert r.headers["X-NQAI-Request-Id"] == rid_uuid
 
 
 # --------------------------------------------------------------------------- #
