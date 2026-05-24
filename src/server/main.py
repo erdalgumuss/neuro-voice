@@ -56,6 +56,11 @@ from repos import (
     UsageRepo,
     VoiceRepo,
 )
+from storage.reference_resolver import (
+    ReferenceAudioMissing,
+    UnsupportedReferenceURI,
+    resolve_reference_uri,
+)
 
 # Engine + sentence streaming live in src/worker/ after Faz B.1 step 3.
 # Sync /v1/tts and /v1/tts/stream still call into them here for backward
@@ -69,11 +74,6 @@ from .admin import admin_router
 from .auth import AuthContext, require_auth
 from .config import settings
 from .queue import TtsJobPayload, TtsJobQueue, get_queue, parse_idempotency_key
-from .reference_resolver import (
-    ReferenceAudioMissing,
-    UnsupportedReferenceURI,
-    resolve_reference_uri,
-)
 from .schemas import (
     DeleteResponse,
     EnrollResponse,

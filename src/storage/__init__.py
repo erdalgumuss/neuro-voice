@@ -15,5 +15,18 @@ Faz B step 3 wires this into:
 """
 
 from .r2 import R2Storage, get_r2_storage
+from .reference_resolver import (
+    ReferenceAudioMissing,
+    UnsupportedReferenceURI,
+    resolve_reference_uri,
+    set_remote_fetcher,
+)
 
-__all__ = ["R2Storage", "get_r2_storage"]
+__all__ = [
+    "R2Storage",
+    "get_r2_storage",
+    "ReferenceAudioMissing",
+    "UnsupportedReferenceURI",
+    "resolve_reference_uri",
+    "set_remote_fetcher",
+]

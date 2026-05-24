@@ -15,7 +15,7 @@ import pytest
 
 def _resolver():
     """Import fresh on every call — beats module-level pollution."""
-    from server.reference_resolver import (
+    from storage.reference_resolver import (
         ReferenceAudioMissing,
         UnsupportedReferenceURI,
         resolve_reference_uri,

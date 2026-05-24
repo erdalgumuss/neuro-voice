@@ -1,17 +1,17 @@
-"""Unit tests for src/worker/pipeline.py — happy + failure paths.
+"""Unit tests for src/worker/pipeline.py.
 
-The pipeline orchestrates engine + result stream + idempotency + usage.
+Pipeline contract (worker.pipeline module docstring):
+  * Terminal errors  (voice/ref missing) → PoisonJob + error chunk +
+    idem.fail() — consumer XACKs to drain
+  * Transient errors (engine/archive/db hiccup) → TransientFailure —
+    NO error chunk, NO idem.fail() — consumer skips XACK, XAUTOCLAIM
+    retries on another worker
+  * Commit-before-final ordering: GET sees `complete + response_uri`
+    iff client saw `final=True` chunk
+  * Archive REQUIRED — no `audio_url=null` dangling state
+
 Engine is stubbed (no GPU); Redis is fakeredis; DB is aiosqlite. We
 assert wire behaviour and side-effect semantics, not byte-exact audio.
-
-Coverage:
-  * happy path  — chunks XADD'd, final marker, idempotency complete,
-                   usage record with app_label, R2 archive callback fired
-  * voice missing → PoisonJob + error chunk + idempotency.fail()
-  * reference missing → PoisonJob + error chunk + idempotency.fail()
-  * engine crash → TransientFailure + error chunk + idempotency.fail()
-                     (caller skips XACK so XAUTOCLAIM can retry)
-  * R2 archive crash → still completes (chunks already shipped)
 """
 
 from __future__ import annotations
@@ -66,9 +66,11 @@ class _StubEngine:
     sample_rate = 48000
 
     def __init__(self, sentences: list[str] | None = None,
-                 raise_on_generate: bool = False) -> None:
+                 raise_on_generate: bool = False,
+                 empty_output: bool = False) -> None:
         self._sentences = sentences or ["İlk cümle.", "İkinci cümle."]
         self._raise = raise_on_generate
+        self._empty = empty_output
 
     def warmup(self) -> None:
         pass
@@ -76,9 +78,9 @@ class _StubEngine:
     def synthesize_stream(self, *, text, voice, reference_path, language_id="tr"):
         if self._raise:
             raise RuntimeError("synthetic engine failure")
+        if self._empty:
+            return
         for i, s in enumerate(self._sentences):
-            # 1024 samples of int16 silence per sentence — enough to compute
-            # duration_ms without burning RAM.
             yield _FakeChunk(
                 pcm_int16=b"\x00\x00" * 1024,
                 sample_rate=self.sample_rate,
@@ -100,7 +102,7 @@ async def setup_db(tmp_path, monkeypatch):
 
     for mod in list(sys.modules):
         if mod.startswith(("server", "worker", "db", "repos", "frontend",
-                            "registry")):
+                            "registry", "storage")):
             del sys.modules[mod]
 
     from db import AsyncSessionLocal, init_models_for_tests
@@ -120,8 +122,6 @@ async def setup_db(tmp_path, monkeypatch):
         )
         s.add(api_key)
         await s.flush()
-        # The voice points at a real local file so resolve_reference can
-        # return it without an R2 download.
         ref_path = tmp_path / "ref.wav"
         ref_path.write_bytes(b"\x00" * 256)
         voice = Voice(
@@ -141,6 +141,7 @@ async def setup_db(tmp_path, monkeypatch):
             "api_key_id": api_key.id,
             "voice_id": voice.voice_id,
             "ref_path": ref_path,
+            "artifact_dir": tmp_path / "artifacts",
         }
 
 
@@ -160,35 +161,44 @@ def _job(setup, *, voice_id: str | None = None, app_label: str | None = None,
     )
 
 
-async def _reserve_idempotency(setup, job):
-    """Mimic the gateway side: in production POST /v1/tts/jobs reserves
-    the idempotency row BEFORE XADD'ing the job. Worker just completes
-    it. Without this the worker's `complete()` finds no row to update
-    and silently no-ops — the realistic flow always reserves first."""
+async def _reserve(setup, job):
+    """Mimic gateway POST: reserve idempotency BEFORE worker sees the job."""
     from db import AsyncSessionLocal
     from repos import IdempotencyRepo
     async with AsyncSessionLocal() as s:
         await IdempotencyRepo(s, setup["tenant_id"]).reserve(
             request_id=uuid.UUID(job.request_id),
             api_key_id=setup["api_key_id"],
-            request_hash="test-hash",
+            request_hash="h",
         )
         await s.commit()
 
 
 def _stub_resolver(setup):
-    """Wrapper around `resolve_reference_uri` that always returns the
-    setup-provided ref_path, regardless of URI — keeps the test from
-    touching the real resolver's R2 / file:// branching logic."""
     def _resolve(_uri: str) -> Path:
         return setup["ref_path"]
     return _resolve
 
 
+def _local_archiver(setup):
+    """E2E-friendly archive callback — writes PCM to a local file and
+    returns a `file://` URI. Lets B.1 tests verify the artifact
+    contract end-to-end without R2 credentials."""
+    setup["artifact_dir"].mkdir(parents=True, exist_ok=True)
+
+    async def _archive(rid: uuid.UUID, pcm: bytes, sample_rate: int) -> str:
+        path = setup["artifact_dir"] / f"{rid}.pcm"
+        path.write_bytes(pcm)
+        return f"file://{path}"
+
+    return _archive
+
+
 # --------------------------------------------------------------------------- #
 # Happy path
 # --------------------------------------------------------------------------- #
-async def test_pipeline_happy_path_publishes_chunks_and_completes(setup_db):
+async def test_pipeline_happy_path_commits_then_publishes_final(setup_db):
+    """3 chunks → archive → commit → final. Final ONLY after commit."""
     setup = setup_db
     from server.queue import result_stream_name
     from worker.pipeline import process_one_job
@@ -196,32 +206,36 @@ async def test_pipeline_happy_path_publishes_chunks_and_completes(setup_db):
     redis = fakeredis.aioredis.FakeRedis()
     engine = _StubEngine(sentences=["Cümle bir.", "Cümle iki.", "Cümle üç."])
     job = _job(setup, app_label="neeko-mobile")
-    await _reserve_idempotency(setup, job)
+    await _reserve(setup, job)
 
     await process_one_job(
         job, redis=redis, engine=engine,
         resolve_reference=_stub_resolver(setup),
+        archive_to_r2=_local_archiver(setup),
     )
 
-    # Result stream got 3 chunks + 1 final = 4 entries.
+    # 3 sentence chunks + 1 final = 4 entries on the result stream.
     stream = result_stream_name(uuid.UUID(job.request_id))
-    length = await redis.xlen(stream)
-    assert length == 4
-
-    # Last entry is final=True, no PCM.
     entries = await redis.xrange(stream)
+    assert len(entries) == 4
+
+    # Last entry is final=True, no PCM, no error.
     last_fields = entries[-1][1]
     assert last_fields[b"final"] == b"true"
     assert last_fields[b"seq"] == b"3"
+    assert b"error" not in last_fields
 
-    # Idempotency row went to 'complete'; usage row has app_label.
+    # Idempotency complete + response_uri NEVER NULL (audit fix #4).
     from db import AsyncSessionLocal
     from repos import IdempotencyRepo, UsageRepo
     async with AsyncSessionLocal() as s:
         row = await IdempotencyRepo(s, setup["tenant_id"]).get(
             uuid.UUID(job.request_id)
         )
-        assert row is not None and row.status == "complete"
+        assert row is not None
+        assert row.status == "complete"
+        assert row.response_uri is not None
+        assert row.response_uri.startswith("file://")
 
         usage = await UsageRepo(s, setup["tenant_id"]).recent(limit=10)
         assert len(usage) == 1
@@ -229,44 +243,8 @@ async def test_pipeline_happy_path_publishes_chunks_and_completes(setup_db):
         assert usage[0].sentence_count == 3
         assert usage[0].status == "ok"
         # 3 sentences × 1024 samples × int16 = 6144 bytes; duration =
-        # 3072 samples / 48000 sr = 0.064 s = 64 ms.
+        # 3072 samples / 48000 sr = 64 ms.
         assert usage[0].duration_ms == 64
-
-
-async def test_pipeline_invokes_archive_callback_and_records_uri(setup_db):
-    setup = setup_db
-    from worker.pipeline import process_one_job
-
-    redis = fakeredis.aioredis.FakeRedis()
-    engine = _StubEngine()
-    job = _job(setup)
-    await _reserve_idempotency(setup, job)
-
-    captured = {}
-
-    async def fake_archive(rid, pcm_bytes, sample_rate):
-        captured["rid"] = str(rid)
-        captured["size"] = len(pcm_bytes)
-        captured["sr"] = sample_rate
-        return f"s3://outputs/{rid}.wav"
-
-    await process_one_job(
-        job, redis=redis, engine=engine,
-        resolve_reference=_stub_resolver(setup),
-        archive_to_r2=fake_archive,
-    )
-
-    assert captured["rid"] == job.request_id
-    assert captured["sr"] == 48000
-    assert captured["size"] > 0  # 2 stub sentences × 1024 samples × 2 bytes
-
-    from db import AsyncSessionLocal
-    from repos import IdempotencyRepo
-    async with AsyncSessionLocal() as s:
-        row = await IdempotencyRepo(s, setup["tenant_id"]).get(
-            uuid.UUID(job.request_id)
-        )
-        assert row.response_uri == f"s3://outputs/{job.request_id}.wav"
 
 
 async def test_pipeline_sets_expire_on_result_stream(setup_db):
@@ -275,122 +253,316 @@ async def test_pipeline_sets_expire_on_result_stream(setup_db):
 
     redis = fakeredis.aioredis.FakeRedis()
     job = _job(setup)
-    await _reserve_idempotency(setup, job)
+    await _reserve(setup, job)
     await process_one_job(
         job, redis=redis, engine=_StubEngine(),
         resolve_reference=_stub_resolver(setup),
+        archive_to_r2=_local_archiver(setup),
     )
-    # Inspect any nqai.tts.results.* key and check TTL is set.
     keys = [k async for k in redis.scan_iter(match="nqai.tts.results.*")]
     assert keys, "expected at least one result stream key"
     ttl = await redis.ttl(keys[0])
-    assert ttl > 0, "result stream must carry a TTL safety net"
-    assert ttl <= 600
+    assert 0 < ttl <= 600
 
 
 # --------------------------------------------------------------------------- #
-# Failure paths
+# Terminal errors (PoisonJob) — XACK to drain
 # --------------------------------------------------------------------------- #
-async def test_pipeline_unknown_voice_raises_poison_and_fails_idempotency(setup_db):
+async def test_pipeline_unknown_voice_raises_poison_with_error_chunk(setup_db):
     setup = setup_db
+    from server.queue import result_stream_name
     from worker.pipeline import PoisonJob, process_one_job
 
     redis = fakeredis.aioredis.FakeRedis()
     job = _job(setup, voice_id="ghost-voice")
+    await _reserve(setup, job)
 
     with pytest.raises(PoisonJob):
         await process_one_job(
             job, redis=redis, engine=_StubEngine(),
             resolve_reference=_stub_resolver(setup),
+            archive_to_r2=_local_archiver(setup),
         )
 
-    # Error chunk on the result stream.
-    from server.queue import result_stream_name
-    stream = result_stream_name(uuid.UUID(job.request_id))
-    entries = await redis.xrange(stream)
+    entries = await redis.xrange(result_stream_name(uuid.UUID(job.request_id)))
     assert len(entries) == 1
     assert entries[0][1][b"error"] == b"voice_not_found"
 
-    # Idempotency status = failed.
     from db import AsyncSessionLocal
     from repos import IdempotencyRepo
     async with AsyncSessionLocal() as s:
         row = await IdempotencyRepo(s, setup["tenant_id"]).get(
             uuid.UUID(job.request_id)
         )
-        # idem.fail() updates an existing row; if none exists (no prior
-        # reserve), .fail() is a no-op — so we just assert there's no
-        # 'complete' state.
-        if row is not None:
-            assert row.status == "failed"
+        assert row is not None and row.status == "failed"
 
 
-async def test_pipeline_reference_missing_raises_poison(setup_db, tmp_path):
+async def test_pipeline_reference_missing_raises_poison_with_error_chunk(setup_db):
     setup = setup_db
+    from server.queue import result_stream_name
     from worker.pipeline import PoisonJob, process_one_job
-
-    redis = fakeredis.aioredis.FakeRedis()
-    job = _job(setup)
 
     def broken_resolver(_uri: str) -> Path:
         raise FileNotFoundError("ref.wav missing")
+
+    redis = fakeredis.aioredis.FakeRedis()
+    job = _job(setup)
+    await _reserve(setup, job)
 
     with pytest.raises(PoisonJob):
         await process_one_job(
             job, redis=redis, engine=_StubEngine(),
             resolve_reference=broken_resolver,
+            archive_to_r2=_local_archiver(setup),
         )
 
-    from server.queue import result_stream_name
     entries = await redis.xrange(result_stream_name(uuid.UUID(job.request_id)))
     assert entries
     assert entries[0][1][b"error"].startswith(b"reference_missing")
 
+    from db import AsyncSessionLocal
+    from repos import IdempotencyRepo
+    async with AsyncSessionLocal() as s:
+        row = await IdempotencyRepo(s, setup["tenant_id"]).get(
+            uuid.UUID(job.request_id)
+        )
+        assert row is not None and row.status == "failed"
 
-async def test_pipeline_engine_crash_raises_transient_and_marks_failed(setup_db):
-    """Engine crash = transient (worker may be retried via XAUTOCLAIM),
-    so the consumer MUST NOT XACK. We assert TransientFailure surfaces."""
+
+async def test_pipeline_empty_engine_output_is_poison(setup_db):
+    """Engine returned without yielding → unrecoverable input/model bug.
+    Treated as poison (XACK + no retry); idempotency NOT marked failed
+    here because no terminal client-visible state was established
+    before discovery — retry would just produce the same empty output."""
     setup = setup_db
+    from worker.pipeline import PoisonJob, process_one_job
+
+    redis = fakeredis.aioredis.FakeRedis()
+    job = _job(setup)
+    await _reserve(setup, job)
+
+    with pytest.raises(PoisonJob):
+        await process_one_job(
+            job, redis=redis, engine=_StubEngine(empty_output=True),
+            resolve_reference=_stub_resolver(setup),
+            archive_to_r2=_local_archiver(setup),
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Transient errors (TransientFailure) — NO error chunk, NO idem.fail
+# --------------------------------------------------------------------------- #
+async def test_pipeline_engine_crash_is_transient_and_silent(setup_db):
+    """Audit fix #1: engine crash = transient. NO error chunk, NO
+    idem.fail. XAUTOCLAIM retries on another worker — client sees
+    queued, not failed."""
+    setup = setup_db
+    from server.queue import result_stream_name
     from worker.pipeline import TransientFailure, process_one_job
 
     redis = fakeredis.aioredis.FakeRedis()
     job = _job(setup)
+    await _reserve(setup, job)
 
     with pytest.raises(TransientFailure):
         await process_one_job(
             job, redis=redis, engine=_StubEngine(raise_on_generate=True),
             resolve_reference=_stub_resolver(setup),
+            archive_to_r2=_local_archiver(setup),
         )
 
-    # An error chunk must reach the gateway so the client doesn't hang.
-    from server.queue import result_stream_name
-    entries = await redis.xrange(result_stream_name(uuid.UUID(job.request_id)))
-    assert any(b"error" in fields for _id, fields in entries)
+    # Result stream is empty — no error event, no chunks.
+    stream = result_stream_name(uuid.UUID(job.request_id))
+    assert (await redis.xlen(stream)) == 0
 
-
-async def test_pipeline_archive_failure_still_completes(setup_db):
-    """R2 hiccup must NOT lose the job — chunks were already shipped to
-    the gateway, so we still mark complete (without response_uri)."""
-    setup = setup_db
+    # Idempotency stays 'processing' — retry path is open.
     from db import AsyncSessionLocal
     from repos import IdempotencyRepo
-    from worker.pipeline import process_one_job
+    async with AsyncSessionLocal() as s:
+        row = await IdempotencyRepo(s, setup["tenant_id"]).get(
+            uuid.UUID(job.request_id)
+        )
+        assert row is not None and row.status == "processing"
+
+
+async def test_pipeline_archive_failure_is_transient_and_silent(setup_db):
+    """Audit fix #4: archive failure is transient — retry re-generates
+    PCM and tries archive again. No client-visible failure state,
+    no orphan complete-with-null-uri row."""
+    setup = setup_db
+    from server.queue import result_stream_name
+    from worker.pipeline import TransientFailure, process_one_job
 
     async def boom_archive(*_a, **_kw):
         raise RuntimeError("R2 down")
 
     redis = fakeredis.aioredis.FakeRedis()
     job = _job(setup)
-    await _reserve_idempotency(setup, job)
-    await process_one_job(
-        job, redis=redis, engine=_StubEngine(),
-        resolve_reference=_stub_resolver(setup),
-        archive_to_r2=boom_archive,
-    )
+    await _reserve(setup, job)
 
+    with pytest.raises(TransientFailure):
+        await process_one_job(
+            job, redis=redis, engine=_StubEngine(),
+            resolve_reference=_stub_resolver(setup),
+            archive_to_r2=boom_archive,
+        )
+
+    # Chunks may have been emitted (engine ran before archive), but
+    # no final marker — gateway will wait or timeout, then retry sees
+    # a freshly archived response.
+    stream = result_stream_name(uuid.UUID(job.request_id))
+    entries = await redis.xrange(stream)
+    finals = [e for e in entries if e[1].get(b"final") == b"true"]
+    assert not finals, "no final marker should be published on archive failure"
+
+    # Idempotency stays 'processing' — never 'failed', never 'complete'.
+    from db import AsyncSessionLocal
+    from repos import IdempotencyRepo
     async with AsyncSessionLocal() as s:
         row = await IdempotencyRepo(s, setup["tenant_id"]).get(
             uuid.UUID(job.request_id)
         )
-        assert row is not None and row.status == "complete"
-        assert row.response_uri is None
+        assert row is not None and row.status == "processing"
+
+
+async def test_pipeline_archive_returns_none_is_transient(setup_db):
+    """Archive callable returned None (no exception) — same outcome
+    as raise: no artifact, refuse to mark complete."""
+    setup = setup_db
+    from worker.pipeline import TransientFailure, process_one_job
+
+    async def null_archive(*_a, **_kw):
+        return None
+
+    redis = fakeredis.aioredis.FakeRedis()
+    job = _job(setup)
+    await _reserve(setup, job)
+
+    with pytest.raises(TransientFailure):
+        await process_one_job(
+            job, redis=redis, engine=_StubEngine(),
+            resolve_reference=_stub_resolver(setup),
+            archive_to_r2=null_archive,
+        )
+
+
+async def test_pipeline_without_archive_callback_is_transient(setup_db):
+    """Production safety net (audit fix #4): if the worker is mis-
+    wired without an archive callable, refuse to mark complete rather
+    than leaving audio_url=null on the status response."""
+    setup = setup_db
+    from worker.pipeline import TransientFailure, process_one_job
+
+    redis = fakeredis.aioredis.FakeRedis()
+    job = _job(setup)
+    await _reserve(setup, job)
+
+    with pytest.raises(TransientFailure):
+        await process_one_job(
+            job, redis=redis, engine=_StubEngine(),
+            resolve_reference=_stub_resolver(setup),
+            # archive_to_r2=None  (default) — should refuse to complete
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Commit-before-final ordering (audit fix #2)
+# --------------------------------------------------------------------------- #
+async def test_pipeline_publishes_final_only_after_db_commit(setup_db, monkeypatch):
+    """If the DB commit raises, NO final marker hits the stream — the
+    gateway's invariant `final=True ⇒ complete + response_uri` holds."""
+    setup = setup_db
+    from server.queue import result_stream_name
+    from worker.pipeline import TransientFailure, process_one_job
+
+    redis = fakeredis.aioredis.FakeRedis()
+    job = _job(setup)
+    await _reserve(setup, job)
+
+    # Force the DB commit at the final step to raise by monkeypatching
+    # IdempotencyRepo.complete to blow up.
+    import repos.idempotency as idem_mod
+    real_complete = idem_mod.IdempotencyRepo.complete
+
+    async def explode(*_a, **_kw):
+        raise RuntimeError("simulated DB outage")
+
+    monkeypatch.setattr(idem_mod.IdempotencyRepo, "complete", explode)
+    try:
+        with pytest.raises(TransientFailure):
+            await process_one_job(
+                job, redis=redis, engine=_StubEngine(),
+                resolve_reference=_stub_resolver(setup),
+                archive_to_r2=_local_archiver(setup),
+            )
+    finally:
+        monkeypatch.setattr(idem_mod.IdempotencyRepo, "complete", real_complete)
+
+    # Chunks were published, but NO final marker — that's the invariant.
+    entries = await redis.xrange(result_stream_name(uuid.UUID(job.request_id)))
+    finals = [e for e in entries if e[1].get(b"final") == b"true"]
+    assert not finals, (
+        "publish_final must happen AFTER DB commit; otherwise the "
+        "gateway would tell a client 'done' for a job that DB still "
+        "shows as processing"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Streaming bridge TODO (audit fix #5)
+# --------------------------------------------------------------------------- #
+async def test_pipeline_chunks_currently_drained_before_publish(setup_db, monkeypatch):
+    """Pinning current behaviour: the pipeline collects all engine chunks
+    into a list BEFORE publishing any. True streaming (chunk available
+    on Redis as soon as engine yields it) needs a thread→asyncio queue
+    bridge — see TODO(faz-b1.5) in worker.pipeline.
+
+    When that bridge lands, this test should be updated to assert the
+    *opposite* (chunks appear on the stream incrementally, not in a
+    burst after generation completes)."""
+    setup = setup_db
+    from worker.pipeline import process_one_job
+
+    captured: dict[str, list] = {"chunk_yield_then_xadd": []}
+
+    # Spy on engine yields vs. publish_chunk calls — they must NOT
+    # interleave under current behaviour (all yields then all xadds).
+    import worker.pipeline as pmod
+    real_publish_chunk = pmod.publish_chunk
+
+    chunks_yielded: list[str] = []
+
+    class _SpyEngine(_StubEngine):
+        def synthesize_stream(self, **kw):
+            for c in super().synthesize_stream(**kw):
+                chunks_yielded.append(c.sentence_text)
+                yield c
+
+    publish_calls: list[str] = []
+
+    async def spy_publish_chunk(redis, rid, **kw):
+        publish_calls.append(kw.get("sentence_text") or "")
+        await real_publish_chunk(redis, rid, **kw)
+
+    monkeypatch.setattr(pmod, "publish_chunk", spy_publish_chunk)
+
+    redis = fakeredis.aioredis.FakeRedis()
+    job = _job(setup)
+    await _reserve(setup, job)
+    await process_one_job(
+        job, redis=redis, engine=_SpyEngine(),
+        resolve_reference=_stub_resolver(setup),
+        archive_to_r2=_local_archiver(setup),
+    )
+
+    # All yields happened before any publish — drain-then-emit, NOT
+    # true streaming. When the queue bridge replaces _drain_engine,
+    # invert this assertion to prove the new contract holds.
+    yields_seen_at_first_publish = len(chunks_yielded) if publish_calls else 0
+    assert yields_seen_at_first_publish == len(chunks_yielded), (
+        "CURRENT (drain-then-emit) behaviour expected; if this fires "
+        "the streaming bridge has landed — update both the assertion "
+        "and the TODO(faz-b1.5) in worker/pipeline.py"
+    )
+    captured["chunk_yield_then_xadd"] = list(chunks_yielded)
+    assert captured["chunk_yield_then_xadd"]

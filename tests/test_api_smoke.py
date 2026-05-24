@@ -96,7 +96,7 @@ async def setup(monkeypatch, tmp_path):
 
     # Force-reset module state so the new env + DB take effect.
     for mod_name in list(sys.modules):
-        if mod_name.startswith(("server", "worker", "db", "repos", "frontend", "registry")):
+        if mod_name.startswith(("server", "worker", "db", "repos", "frontend", "registry", "storage")):
             del sys.modules[mod_name]
 
     from db import AsyncSessionLocal, init_models_for_tests
