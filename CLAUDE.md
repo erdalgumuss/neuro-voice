@@ -4,11 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `neuro-voice` — NQAI'nin Türkçe + voice-cloning + streaming TTS yığını. **VoxCPM2 (Apache 2.0, OpenBMB, 2B param)** üzerine multi-tenant API gateway + Türkçe text frontend + Stripe-style async job queue + R2 object storage. Üst-katman `/home/alfonso/neeko-firmware/CLAUDE.md` 7 disiplin kuralı geçerlidir; aşağıdakiler bu repoya özel ek disiplinlerdir.
 
-## Şu anki durum (2026-05-24, commit `ba6be69`)
+## Şu anki durum (2026-05-24, commit `5cd83d0` — Faz B.1 tamam)
 
-**Faz A bitti, Faz B'nin gateway tarafı %40 hazır, worker süreci açık.** Repo bir multi-tenant TTS platform iskeleti: Postgres data plane + DB-backed Bearer auth (argon2id) + R2 storage + Stripe `Idempotency-Key` + Redis Streams backpressure. **GPU work hâlâ gateway içinde** (`src/worker/` paketi yazılmadı — Faz B.1).
+**Gateway/worker süreç ayrımı tamamlandı.** Gateway pure I/O (CPU-only, Hetzner CX22 sığar); worker GPU node'unda `python -m worker.main` ile koşar. Async TTS jobs uçtan uca, sync `/v1/tts` aynı queue üzerinden backward-compat proxy (RFC 8594 deprecation). Idempotency race-safe, XAUTOCLAIM at-least-once chaos test'iyle kanıtlı.
 
-> **Faz B'ye geçmeden önce mutlaka oku:** [docs/audit/checkpoint-2026-05-24-faz-a-exit.md](docs/audit/checkpoint-2026-05-24-faz-a-exit.md) — uçtan uca durum, 5 ön-iş, 3 karar satırı.
+> **B.1.5'e (latency 80-100ms) geçmeden önce oku:** [docs/audit/checkpoint-2026-05-24-faz-b1-exit.md](docs/audit/checkpoint-2026-05-24-faz-b1-exit.md) — DoD, neyin neden yapılmadığı, B.1.5 hedef tanımı.
 
 Canlı doc'lar:
 - Kanonik mimari (v1.0 hedefi): [docs/architecture/scale-roadmap.md](docs/architecture/scale-roadmap.md)

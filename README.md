@@ -2,9 +2,9 @@
 
 NQAI'nin Türkçe + voice-cloning + streaming TTS yığını. **VoxCPM2** (Apache 2.0, OpenBMB, 2B param) üzerine multi-tenant API gateway + Türkçe text frontend + sentence-chunked synthesis + Stripe-style async job queue.
 
-## Şu an (2026-05-24, commit `ba6be69`)
+## Şu an (2026-05-24, commit `5cd83d0` — Faz B.1 tamam)
 
-**Faz A bitti, Faz B'nin gateway tarafı %40 hazır.** Repo bir multi-tenant TTS platform iskeleti — auth + storage + idempotency + backpressure yerinde, GPU work hâlâ gateway içinde (worker süreci Faz B.1'de ayrılır).
+**Gateway/worker süreç ayrımı bitti.** Gateway CPU/I/O katmanı (Hetzner CX22 sığar); worker GPU node'unda `python -m worker.main` ile koşar. Async TTS jobs uçtan uca çalışır; sync `/v1/tts` aynı Redis queue üzerinden geriye-uyumlu proxy (RFC 8594 `Deprecation`/`Sunset` header, 2026-09-01 sunset). At-least-once delivery XAUTOCLAIM chaos test'iyle kanıtlı.
 
 - Checkpoint + Faz B yol haritası: [docs/audit/checkpoint-2026-05-24-faz-a-exit.md](docs/audit/checkpoint-2026-05-24-faz-a-exit.md)
 - Kanonik mimari (v1.0 hedefi): [docs/architecture/scale-roadmap.md](docs/architecture/scale-roadmap.md)
@@ -12,9 +12,9 @@ NQAI'nin Türkçe + voice-cloning + streaming TTS yığını. **VoxCPM2** (Apach
 - VoxCPM2 entegrasyon detayları: [docs/architecture/voxcpm2-integration.md](docs/architecture/voxcpm2-integration.md)
 - Mimari index: [docs/architecture/README.md](docs/architecture/README.md)
 
-**Şu an çalışan:** 4 tenant × N API key, DB-backed Bearer auth (argon2id), filesystem + R2 dual-mode voice catalog, sync `POST /v1/tts` (tek-process), async `POST /v1/tts/jobs` (Redis Streams XADD + Stripe idempotency, worker yok), admin UI (FastAPI + Jinja2 + HTMX).
+**Şu an çalışan:** 4 tenant × N API key, DB-backed Bearer auth (argon2id), R2 voice catalog + artifact storage, sync `POST /v1/tts` (queue proxy, `Deprecation: true`), async `POST /v1/tts/jobs` (Stripe Idempotency-Key + worker uçtan uca tamamlar + presigned R2 URL), admin UI (FastAPI + Jinja2 + HTMX), worker süreci (`python -m worker.main`) — gerçek consumer, R2 archive, periyodik XAUTOCLAIM, SIGTERM graceful drain.
 
-**Bilinen yarı-durumlar:** async job XADD ediyor ama tüketici yok → `queued` durumunda kalır; WebSocket yok; sync path canlı tutuldu (deprecation kararı bekliyor). Detaylar checkpoint doc'unda §5.
+**Faz B.1.5'e bilinçli ertelenenler** (latency-focused, ayrı scope): true frame-level streaming (drain-then-emit → thread→asyncio bridge), WebSocket endpoint, WebRTC, warm-worker sticky routing, ttfb/first-pcm metrikleri, capacity-based backpressure, DLQ. Detaylar: [docs/audit/checkpoint-2026-05-24-faz-b1-exit.md](docs/audit/checkpoint-2026-05-24-faz-b1-exit.md) §6.
 
 ## Hedef
 
@@ -39,7 +39,7 @@ docker compose -f docker-compose.dev.yaml exec gateway \
 open http://localhost:8000/admin/         # operator login + tenant/key CRUD
 ```
 
-Stack: gateway (FastAPI + admin UI) + Postgres 16 + Redis 7. Worker servisi henüz yok — TTS endpoint'leri tek-process'te koşar (Faz B.1'de ayrılır).
+Stack: gateway (FastAPI + admin UI) + Postgres 16 + Redis 7. GPU worker `docker compose -f docker-compose.dev.yaml --profile gpu up worker` ile başlar (NVIDIA Container Toolkit gerekli); CPU dev için worker'ı yerel `python -m worker.main` ile boot edebilirsiniz.
 
 ## Quickstart — Colab (GPU'lu uçtan uca)
 
