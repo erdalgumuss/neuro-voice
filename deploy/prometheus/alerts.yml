@@ -1,0 +1,133 @@
+# NQAI Voice — Prometheus alert rules.
+#
+# Pairs with deploy/grafana/dashboards/nqai-voice.json. The thresholds
+# here are starter values: tune them after the first real-traffic week
+# and after `scripts/latency_bench.py` produces per-hardware baseline
+# numbers (Faz C v1 item 2).
+#
+# Severity convention:
+#   critical  — pager-worthy, customer-affecting
+#   warning   — investigate this shift / next business day
+#   info      — record in dashboards, no page
+
+groups:
+  - name: nqai-voice-availability
+    interval: 30s
+    rules:
+      - alert: NqaiVoiceNoHealthyWorkers
+        expr: max(nqai_worker_count) == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: nqai-voice
+        annotations:
+          summary: "No NQAI Voice workers are healthy"
+          description: |
+            Worker heartbeats report 0 healthy workers for >1 minute.
+            Gateway has fallen back to XLEN-only backpressure.
+            Check worker pod health + Redis connectivity.
+
+      - alert: NqaiVoiceHighErrorRate
+        expr: |
+          (
+            sum(rate(nqai_tts_requests_total{status="error"}[5m]))
+            /
+            sum(rate(nqai_tts_requests_total[5m]))
+          ) > 0.05
+        for: 10m
+        labels:
+          severity: critical
+          service: nqai-voice
+        annotations:
+          summary: "TTS error rate >5% for 10 minutes"
+          description: |
+            More than 5% of TTS requests are terminating in error.
+            Check nqai_tts_errors_total by type for the dominant failure
+            mode (poison / transient / unknown / dlq).
+
+      - alert: NqaiVoiceDlqGrowing
+        expr: increase(nqai_worker_dlq_total[15m]) > 0
+        for: 15m
+        labels:
+          severity: warning
+          service: nqai-voice
+        annotations:
+          summary: "Jobs landing in DLQ"
+          description: |
+            One or more jobs have moved to the dead-letter queue in the
+            last 15 minutes. Inspect `nqai.tts.jobs.dlq` Redis stream
+            and reprocess after fixing the underlying failure.
+
+  - name: nqai-voice-saturation
+    interval: 30s
+    rules:
+      - alert: NqaiVoiceQueueBacklogHigh
+        expr: max(nqai_queue_depth{stream="jobs"}) > 150
+        for: 5m
+        labels:
+          severity: warning
+          service: nqai-voice
+        annotations:
+          summary: "Job queue depth >150 for 5 minutes"
+          description: |
+            Sustained queue backlog. Either traffic exceeds cluster
+            throughput or workers are degraded.
+            Check worker count, capacity, in-flight ratio, and
+            inference latency p95.
+
+      - alert: NqaiVoiceBackpressureRate
+        expr: sum(rate(nqai_tts_requests_total{status="backpressure"}[5m])) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+          service: nqai-voice
+        annotations:
+          summary: "Backpressure 503s being issued at >0.1 req/s"
+          description: |
+            The gateway is denying requests via capacity-aware
+            backpressure (or XLEN-only fallback). If sustained, scale
+            workers OR raise NQAI_QUEUE_DEPTH_LIMIT (only if the cluster
+            can actually drain it).
+
+  - name: nqai-voice-latency
+    interval: 30s
+    rules:
+      # Tune these on first real-traffic week. Starter values target
+      # L4-class GPU with VoxCPM2; T4 will breach until tuned.
+      - alert: NqaiVoiceFirstAudioP95High
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(nqai_tts_first_audio_seconds_bucket[5m]))
+          ) > 2.0
+        for: 10m
+        labels:
+          severity: warning
+          service: nqai-voice
+        annotations:
+          summary: "First-audio p95 >2s for 10 minutes"
+          description: |
+            Worker-side first-audio latency p95 is above 2 seconds.
+            Compare nqai_tts_inference_seconds (model) vs
+            nqai_tts_reference_resolve_seconds (R2 cache) vs
+            nqai_tts_worker_pickup_seconds (queue health) to isolate.
+
+      - alert: NqaiVoiceGatewayTransportOverhead
+        expr: |
+          (
+            histogram_quantile(0.95, sum by (le) (rate(nqai_tts_gateway_first_byte_seconds_bucket[5m])))
+            -
+            histogram_quantile(0.95, sum by (le) (rate(nqai_tts_first_audio_seconds_bucket[5m])))
+          ) > 0.2
+        for: 10m
+        labels:
+          severity: warning
+          service: nqai-voice
+        annotations:
+          summary: "Gateway/transport adding >200ms on top of worker first-audio (p95)"
+          description: |
+            gateway_first_byte_ms − first_audio_ms gap should be small
+            (< 100 ms typical). Sustained > 200 ms means HTTP framing /
+            ASGI buffering / network overhead is dominating, not the
+            worker. Check uvicorn worker count, body-size limits, and
+            client-side network path.

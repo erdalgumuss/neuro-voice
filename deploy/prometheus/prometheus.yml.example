@@ -1,0 +1,35 @@
+# NQAI Voice — Prometheus scrape config example.
+#
+# Drop this into your Prometheus deployment alongside the rule files
+# from deploy/prometheus/alerts.yml. Real production should use service
+# discovery (Kubernetes, Consul) instead of static configs.
+#
+# The gateway exposes /metrics on the same port as the FastAPI app.
+# Each worker exposes /metrics on NQAI_WORKER_METRICS_PORT (default 9100).
+
+global:
+  scrape_interval: 30s
+  evaluation_interval: 30s
+
+rule_files:
+  - "alerts.yml"
+
+scrape_configs:
+  - job_name: nqai-voice-gateway
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["gateway:8000"]
+        labels:
+          service: nqai-voice
+          component: gateway
+
+  - job_name: nqai-voice-worker
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["worker:9100"]
+        labels:
+          service: nqai-voice
+          component: worker
+    # prometheus_client.start_http_server serves the registry on any
+    # path (including /metrics) so the scrape works either way; we use
+    # /metrics for consistency with the gateway.
