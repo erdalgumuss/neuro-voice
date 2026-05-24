@@ -24,6 +24,7 @@ import os
 import threading
 import time
 import wave
+from collections import OrderedDict
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -113,6 +114,13 @@ DEFAULT_CFG_VALUE = 2.0
 DEFAULT_INFERENCE_TIMESTEPS = 10
 DEFAULT_SAMPLE_RATE = 48000
 
+# LoRA adapter cache budget — bounded LRU. Each loaded VoxCPM2 instance
+# (base + adapter) consumes ~4 GB VRAM on bfloat16; 3 active adapters fit
+# on an L4 (24 GB) with headroom for batched inference. Adapters beyond
+# this threshold get evicted in least-recently-used order. Override via
+# NQAI_LORA_CACHE_SIZE if you serve more voices on a single worker.
+DEFAULT_LORA_CACHE_SIZE = int(os.environ.get("NQAI_LORA_CACHE_SIZE", "3"))
+
 
 @dataclass(frozen=True)
 class LoRAAdapterSpec:
@@ -172,6 +180,9 @@ class VoxCPM2Engine:
 
     sample_rate: int
 
+    # Cache key shape: (model_id, (adapter_path, adapter_config_path) | None)
+    _CacheKey = tuple[str, tuple[str, str | None] | None]
+
     def __init__(
         self,
         model_id: str,
@@ -183,19 +194,25 @@ class VoxCPM2Engine:
         lora_path: Path | None = None,
         lora_config_path: Path | None = None,
         optimize: bool = False,
+        cache_size: int = DEFAULT_LORA_CACHE_SIZE,
     ) -> None:
+        if cache_size < 1:
+            raise ValueError("cache_size must be >= 1 (base model always cached)")
         self._model_id = model_id
         self._device = _resolve_device(device)
         self._cfg_value = cfg_value
         self._inference_timesteps = inference_timesteps
         self._load_denoiser = load_denoiser
         self._optimize = optimize
+        self._cache_size = cache_size
         self._default_adapter = (
             LoRAAdapterSpec(path=lora_path, config_path=lora_config_path)
             if lora_path
             else None
         )
-        self._models: dict[tuple[str, tuple[str, str | None] | None], object] = {}
+        # LRU: most recent at the end. dict-of-models, bounded by cache_size.
+        self._models: OrderedDict[VoxCPM2Engine._CacheKey, object] = OrderedDict()
+        self._evictions_total = 0  # exposed for tests + metrics (Faz C)
         self._model = None  # compatibility hook used by /health and old tests
         self._load_lock = threading.Lock()
         self._inference_lock = threading.Lock()
@@ -214,15 +231,49 @@ class VoxCPM2Engine:
     def _adapter_for_voice(self, voice: Voice) -> LoRAAdapterSpec | None:
         return _lora_from_mapping(voice.adapter) or self._default_adapter
 
+    def _evict_oldest_locked(self) -> None:
+        """Drop the LRU entry. Caller holds `_load_lock`."""
+        if not self._models:
+            return
+        evicted_key, evicted_model = self._models.popitem(last=False)
+        self._evictions_total += 1
+        logger.info(
+            "LoRA cache eviction (LRU): adapter=%s (cache_size=%d, evictions_total=%d)",
+            evicted_key[1] or "base",
+            self._cache_size,
+            self._evictions_total,
+        )
+        # Best-effort VRAM release. The model object goes out of scope but
+        # CUDA caching allocator holds the freed blocks until empty_cache().
+        del evicted_model
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            # torch import or empty_cache failure is not fatal — Python GC
+            # will reclaim eventually; we just lose a tick of VRAM headroom.
+            pass
+
     def _model_for_adapter(self, adapter: LoRAAdapterSpec | None):
         key = (self._model_id, adapter.cache_key if adapter else None)
         cached = self._models.get(key)
         if cached is not None:
+            # Mark as most-recently-used.
+            self._models.move_to_end(key)
+            self._model = cached  # keep /health pointer fresh
             return cached
         with self._load_lock:
             cached = self._models.get(key)
             if cached is not None:
+                self._models.move_to_end(key)
+                self._model = cached
                 return cached
+
+            # Make room before loading the new model so peak VRAM stays bounded.
+            while len(self._models) >= self._cache_size:
+                self._evict_oldest_locked()
 
             from voxcpm import VoxCPM
 
@@ -240,10 +291,12 @@ class VoxCPM2Engine:
                 adapter_label = str(adapter.path)
 
             logger.info(
-                "loading %s on %s (adapter=%s)",
+                "loading %s on %s (adapter=%s, cache=%d/%d)",
                 self._model_id,
                 self._device,
                 adapter_label,
+                len(self._models),
+                self._cache_size,
             )
             t0 = time.time()
             model = VoxCPM.from_pretrained(self._model_id, **kwargs)
@@ -383,6 +436,7 @@ def get_engine(
     cfg_value: float = DEFAULT_CFG_VALUE,
     inference_timesteps: int = DEFAULT_INFERENCE_TIMESTEPS,
     optimize: bool = False,
+    cache_size: int = DEFAULT_LORA_CACHE_SIZE,
 ) -> BaseSynthEngine:
     global _engine_singleton
     if _engine_singleton is not None:
@@ -397,5 +451,6 @@ def get_engine(
                 cfg_value=cfg_value,
                 inference_timesteps=inference_timesteps,
                 optimize=optimize,
+                cache_size=cache_size,
             )
         return _engine_singleton
