@@ -119,7 +119,8 @@ class Tenant(Base, TimestampMixin):
         back_populates="tenant", cascade="all, delete-orphan", passive_deletes=True
     )
     voices: Mapped[list[Voice]] = relationship(
-        back_populates="tenant", cascade="all, delete-orphan", passive_deletes=True
+        back_populates="owner", cascade="all, delete-orphan", passive_deletes=True,
+        foreign_keys="Voice.owner_tenant_id",
     )
 
     __table_args__ = (
@@ -222,13 +223,21 @@ class ApiKey(Base):
 
 
 # --------------------------------------------------------------------------- #
-# Voices (tenant-scoped catalog)
+# Voices — owned by a tenant, visible to others via visibility + voice_access
 # --------------------------------------------------------------------------- #
+# Refactor R (2026-05-24): tenant = account/workspace, not product. A voice
+# has a single owner_tenant_id; cross-tenant visibility is mediated by the
+# `visibility` enum + the `voice_access` table:
+#   visibility='private' → only owner sees/uses the voice
+#   visibility='shared'  → owner + tenants listed in voice_access see it
+#   visibility='public'  → every active tenant sees it
+# voice_id slug uniqueness stays scoped to owner — two workspaces can each
+# have a voice called "ayse" without collision.
 class Voice(Base, TimestampMixin):
     __tablename__ = "voices"
 
     id: Mapped[uuid.UUID] = mapped_column(_UUIDPortable, primary_key=True, default=new_uuid)
-    tenant_id: Mapped[uuid.UUID] = mapped_column(
+    owner_tenant_id: Mapped[uuid.UUID] = mapped_column(
         _UUIDPortable, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False
     )
     voice_id: Mapped[str] = mapped_column(Text, nullable=False)
@@ -244,6 +253,7 @@ class Voice(Base, TimestampMixin):
     reference_sample_rate: Mapped[int] = mapped_column(Integer, nullable=False, default=16000)
     source: Mapped[str] = mapped_column(Text, nullable=False)
     license: Mapped[str] = mapped_column(Text, nullable=False)
+    visibility: Mapped[str] = mapped_column(Text, nullable=False, default="private")
     engine_params: Mapped[dict[str, Any]] = mapped_column(
         _JSONBPortable, nullable=False, default=dict
     )
@@ -261,10 +271,16 @@ class Voice(Base, TimestampMixin):
     )
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
-    tenant: Mapped[Tenant] = relationship(back_populates="voices")
+    owner: Mapped[Tenant] = relationship(back_populates="voices")
+    access_grants: Mapped[list[VoiceAccess]] = relationship(
+        back_populates="voice", cascade="all, delete-orphan", passive_deletes=True,
+    )
 
     __table_args__ = (
-        UniqueConstraint("tenant_id", "voice_id", name="tenant_voice_unique"),
+        UniqueConstraint(
+            "owner_tenant_id", "voice_id",
+            name="uq_voices_owner_tenant_id_voice_id",
+        ),
         CheckConstraint(
             r"voice_id ~ '^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$'",
             name="voice_id_format",
@@ -281,6 +297,10 @@ class Voice(Base, TimestampMixin):
             name="source_enum",
         ),
         CheckConstraint(
+            "visibility IN ('private','shared','public')",
+            name="visibility_enum",
+        ),
+        CheckConstraint(
             "release_status IN ('draft','staging','production','deprecated')",
             name="release_status_enum",
         ),
@@ -289,17 +309,68 @@ class Voice(Base, TimestampMixin):
             name="adapter_type_enum",
         ),
         Index(
-            "ix_voices_tenant_active", "tenant_id",
+            "ix_voices_owner_tenant_id_active", "owner_tenant_id",
             postgresql_where="deleted_at IS NULL",
         ),
         Index(
-            "ix_voices_release", "tenant_id", "release_status",
+            "ix_voices_public", "visibility",
+            postgresql_where="visibility = 'public' AND deleted_at IS NULL",
+        ),
+        Index(
+            "ix_voices_release", "owner_tenant_id", "release_status",
             postgresql_where="deleted_at IS NULL",
         ),
     )
 
     def __repr__(self) -> str:
-        return f"<Voice {self.voice_id!r} tenant={self.tenant_id}>"
+        return f"<Voice {self.voice_id!r} owner={self.owner_tenant_id}>"
+
+
+# --------------------------------------------------------------------------- #
+# VoiceAccess — explicit cross-tenant grants for visibility='shared' voices
+# --------------------------------------------------------------------------- #
+# Public voices bypass this table (every active tenant sees them). Private
+# voices ignore this table entirely. Only when visibility='shared' do these
+# rows mediate access. Insertion is admin-operator territory (Faz B+
+# `POST /v1/voices/{id}/share` endpoint — out of scope for refactor R).
+class VoiceAccess(Base):
+    __tablename__ = "voice_access"
+
+    id: Mapped[int] = mapped_column(BigIntPk, primary_key=True, autoincrement=True)
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        _UUIDPortable, ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False,
+    )
+    voice_id: Mapped[uuid.UUID] = mapped_column(
+        _UUIDPortable, ForeignKey("voices.id", ondelete="CASCADE"), nullable=False,
+    )
+    permission: Mapped[str] = mapped_column(Text, nullable=False, default="use")
+    granted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow,
+    )
+    granted_by: Mapped[uuid.UUID | None] = mapped_column(
+        _UUIDPortable, ForeignKey("operators.id", ondelete="SET NULL"),
+    )
+
+    voice: Mapped[Voice] = relationship(back_populates="access_grants")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id", "voice_id",
+            name="uq_voice_access_tenant_id_voice_id",
+        ),
+        CheckConstraint(
+            "permission IN ('use','read')",
+            name="ck_voice_access_permission_enum",
+        ),
+        Index("ix_voice_access_tenant_id", "tenant_id"),
+        Index("ix_voice_access_voice_id", "voice_id"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<VoiceAccess voice={self.voice_id} tenant={self.tenant_id} "
+            f"perm={self.permission}>"
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -333,6 +404,11 @@ class UsageRecord(Base):
     error_code: Mapped[str | None] = mapped_column(Text)
     worker_id: Mapped[str | None] = mapped_column(Text)
     model_version: Mapped[str | None] = mapped_column(Text)
+    # Product attribution from X-NQAI-App request header (refactor R,
+    # 2026-05-24). NULL when the header was absent — the field is
+    # advisory metadata, not a billing primary key (tenant_id stays the
+    # source of truth for who pays).
+    app_label: Mapped[str | None] = mapped_column(Text)
 
     __table_args__ = (
         CheckConstraint("text_char_count >= 0", name="text_char_count_nonneg"),
@@ -346,6 +422,10 @@ class UsageRecord(Base):
         ),
         Index("ix_usage_tenant_time", "tenant_id", "occurred_at"),
         Index("ix_usage_key_time", "api_key_id", "occurred_at"),
+        Index(
+            "ix_usage_records_tenant_id_app_label_created_at",
+            "tenant_id", "app_label", "occurred_at",
+        ),
     )
 
 

@@ -68,6 +68,7 @@ class TtsJobPayload:
     language: str = "tr"
     audio_format: str = "wav"
     params: dict[str, Any] | None = None  # cfg_value, inference_timesteps overrides
+    app_label: str | None = None  # product attribution from X-NQAI-App header
     callback_url: str | None = None  # Faz B+: server-to-server completion hook
 
     def encode(self) -> dict[str, str]:

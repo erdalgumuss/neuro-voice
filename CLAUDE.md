@@ -91,6 +91,7 @@ Damıtmadaki üç-katmanlı spec ([02-distilled-findings.md §4](docs/research/0
 
 ## Repo-özel disiplinler
 
+0. **Tenant = account/workspace, ürün değil** (Refactor R, 2026-05-24). Bir tenant kendi voice catalog'unu, kendi API key'lerini, kendi usage'ını yönetir. Ürün attribution `X-NQAI-App` header → `usage_records.app_label`. Voice'lar `owner_tenant_id` + `visibility` (`private/shared/public`) + `voice_access` ile paylaşılır. Single voice slug owner içinde unique (`erdal-dev/ayse` ve `niva-prod/ayse` ayrı voice). ElevenLabs/OpenAI mental model.
 1. **Kaynaklı iddia.** Her sayı / her benchmark / her "X iyi" cümlesi link + tarih ister. "Bence iyi" yetmez: `MOS X / Elo Y / kaynak Z (link, tarih)` formatı. Memory: `feedback_evidence_over_convention`.
 2. **Reproducibility.** Her deney = config + seed + commit hash + çıktı klasörü. Yeni notebook çıktısı yeni `experiments/` klasörüne iner — eskilerin üstüne yazılmaz.
 3. **Eval kataloğu sabit.** Aynı test cümleleri ([data/test-sets/v0.1-mini.md](data/test-sets/v0.1-mini.md) bugün; Faz 1'de v1.0-full = 120 cümle), aynı metrikler. Modeller değişir, ölçü değişmez.

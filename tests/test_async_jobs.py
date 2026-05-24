@@ -165,6 +165,65 @@ def test_create_job_returns_queued_with_job_id(client):
     assert "created_at" in body
 
 
+def test_create_job_propagates_x_nqai_app_to_payload(client):
+    """Refactor R: X-NQAI-App header lands on TtsJobPayload.app_label
+    so the worker can record it on usage_records for product rollup."""
+    import json
+
+    _enroll_voice(client)
+    rid = str(uuid.uuid4())
+    r = client.post(
+        "/v1/tts/jobs",
+        headers={"Idempotency-Key": rid, "X-NQAI-App": "neeko-mobile"},
+        json={"text": "Selam.", "voice_id": "demo-01"},
+    )
+    assert r.status_code == 202, r.text
+
+    # Read the enqueued payload off the stream and check app_label survived.
+    import asyncio
+
+    async def _read_payload():
+        entries = await client.fake_redis.xread(
+            {"nqai.tts.jobs.test": "0"}, count=1
+        )
+        # entries = [(stream_name, [(entry_id, fields_dict), ...])]
+        return entries[0][1][0][1]
+
+    fields = asyncio.run(_read_payload())
+    payload_json = (fields[b"payload"] if b"payload" in fields else fields["payload"])
+    if isinstance(payload_json, bytes):
+        payload_json = payload_json.decode("utf-8")
+    payload = json.loads(payload_json)
+    assert payload["app_label"] == "neeko-mobile"
+
+
+def test_create_job_without_x_nqai_app_records_null_label(client):
+    _enroll_voice(client)
+    rid = str(uuid.uuid4())
+    r = client.post(
+        "/v1/tts/jobs",
+        headers={"Idempotency-Key": rid},  # no X-NQAI-App
+        json={"text": "Selam.", "voice_id": "demo-01"},
+    )
+    assert r.status_code == 202
+
+    import asyncio
+    import json
+
+    async def _read_payload():
+        entries = await client.fake_redis.xread(
+            {"nqai.tts.jobs.test": "0"}, count=1
+        )
+        return entries[0][1][0][1]
+
+    fields = asyncio.run(_read_payload())
+    payload_json = (fields[b"payload"] if b"payload" in fields else fields["payload"])
+    if isinstance(payload_json, bytes):
+        payload_json = payload_json.decode("utf-8")
+    payload = json.loads(payload_json)
+    assert payload["app_label"] is None
+
+
 def test_create_job_writes_to_redis_stream(client):
     _enroll_voice(client)
     rid = str(uuid.uuid4())

@@ -44,7 +44,7 @@ async def _make_key(session, tenant: models.Tenant, prefix=None) -> models.ApiKe
 
 async def _make_voice(session, tenant: models.Tenant, voice_id="vox-01") -> models.Voice:
     v = models.Voice(
-        tenant_id=tenant.id,
+        owner_tenant_id=tenant.id,
         voice_id=voice_id,
         display_name=f"voice {voice_id}",
         reference_uri=f"s3://r2/voices/{tenant.slug}/{voice_id}.wav",
@@ -116,9 +116,9 @@ async def test_voice_unique_per_tenant_pair():
         await _make_voice(s, t_a, voice_id="shared")
         await _make_voice(s, t_b, voice_id="shared")  # OK — different tenants
         await s.commit()
-        # Within tenant: violation
+        # Within owner: violation (slug unique per owner_tenant_id)
         s.add(models.Voice(
-            tenant_id=t_a.id, voice_id="shared",
+            owner_tenant_id=t_a.id, voice_id="shared",
             display_name="dup", reference_uri="x", reference_sha256="a"*64,
             reference_seconds=10.0, source="placeholder",
             license="internal-placeholder",

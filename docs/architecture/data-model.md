@@ -100,10 +100,12 @@ CREATE TABLE operators (
 
 ### 1.4 `voices`
 
+> **Refactor R (2026-05-24):** tenant = account/workspace, not product. A voice has a single `owner_tenant_id`; cross-tenant visibility is mediated by `visibility` enum + `voice_access` table (§1.4b). The `(owner_tenant_id, voice_id)` UNIQUE constraint stays — slug uniqueness is per-owner.
+
 ```sql
 CREATE TABLE voices (
     id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    tenant_id           UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    owner_tenant_id     UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
     voice_id            TEXT NOT NULL
                         CHECK (voice_id ~ '^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$'),
     display_name        TEXT NOT NULL,
@@ -111,13 +113,15 @@ CREATE TABLE voices (
     gender              TEXT NOT NULL DEFAULT 'neutral'
                         CHECK (gender IN ('neutral','female','male')),
     style_tags          TEXT[] NOT NULL DEFAULT '{}'::TEXT[],
-    reference_uri       TEXT NOT NULL,  -- s3://r2/voices/<tenant_slug>/<voice_id>.wav
+    reference_uri       TEXT NOT NULL,  -- s3://r2/voices/<owner_slug>/<voice_id>.wav
     reference_sha256    TEXT NOT NULL CHECK (length(reference_sha256) = 64),
     reference_seconds   REAL NOT NULL CHECK (reference_seconds > 0 AND reference_seconds <= 60),
     reference_sample_rate INT NOT NULL DEFAULT 16000,
     source              TEXT NOT NULL
                         CHECK (source IN ('elevenlabs','voice-talent','user-enroll','placeholder','bootstrap')),
     license             TEXT NOT NULL,
+    visibility          TEXT NOT NULL DEFAULT 'private'
+                        CHECK (visibility IN ('private','shared','public')),
     engine_params       JSONB NOT NULL DEFAULT '{}'::jsonb,
     -- Faz 3 alanları (önceden tanımlı, başlangıçta NULL)
     adapter_uri         TEXT,
@@ -132,19 +136,47 @@ CREATE TABLE voices (
     created_by_key_id   UUID REFERENCES api_keys(id),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     deleted_at          TIMESTAMPTZ,
-    UNIQUE (tenant_id, voice_id)
+    UNIQUE (owner_tenant_id, voice_id)
 );
 
-CREATE INDEX voices_tenant_idx ON voices (tenant_id) WHERE deleted_at IS NULL;
-CREATE INDEX voices_release_idx ON voices (tenant_id, release_status)
+CREATE INDEX voices_owner_idx ON voices (owner_tenant_id) WHERE deleted_at IS NULL;
+CREATE INDEX voices_public_idx ON voices (visibility)
+    WHERE visibility = 'public' AND deleted_at IS NULL;
+CREATE INDEX voices_release_idx ON voices (owner_tenant_id, release_status)
     WHERE deleted_at IS NULL;
 ```
 
 **Notlar:**
-- `voice_id` tenant içinde unique (composite); aynı `voice_id` farklı tenant'larda olabilir
+- `voice_id` slug owner içinde unique; aynı slug farklı owner'larda olabilir (`erdal-dev/ayse` vs `niva-prod/ayse` — iki ayrı voice)
+- **Accessibility** = `owner_tenant_id = viewer` OR `visibility='public'` OR `voice_access` grant for viewer
 - `engine_params` JSONB → per-voice override (cfg_value, inference_timesteps, mode tag overrides)
-- Faz 3 alanları (adapter*, watermark*, eval*) bugünden tanımlı, NULL ile başlar — schema migration sonra gerek yok
+- Faz 3 alanları (adapter*, watermark*, eval*) bugünden tanımlı, NULL ile başlar
 - `release_status` voice lifecycle: draft → staging → production → (deprecated)
+
+### 1.4b `voice_access` (cross-tenant grants for shared voices)
+
+```sql
+CREATE TABLE voice_access (
+    id            BIGSERIAL PRIMARY KEY,
+    tenant_id     UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    voice_id      UUID NOT NULL REFERENCES voices(id)  ON DELETE CASCADE,
+    permission    TEXT NOT NULL DEFAULT 'use'
+                  CHECK (permission IN ('use','read')),
+    granted_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    granted_by    UUID REFERENCES operators(id) ON DELETE SET NULL,
+    UNIQUE (tenant_id, voice_id)
+);
+CREATE INDEX voice_access_tenant_idx ON voice_access (tenant_id);
+CREATE INDEX voice_access_voice_idx  ON voice_access (voice_id);
+```
+
+**Notlar:**
+- `voice_id` burada `voices.id` (UUID PK), slug değil — sharing identity-stable
+- `visibility='private'` → bu tablo görmezden gelinir
+- `visibility='shared'` → bu tablodaki tenant'lar voice'u görür/kullanır
+- `visibility='public'` → bu tabloyu bypass eder, herkese açık
+- Owner kendi voice'u için grant yazmaz (kendisi zaten görür)
+- Faz B+ `POST /v1/voices/{id}/share` endpoint'i bu tabloyu yazar; gateway request path sadece okur
 
 ### 1.5 `usage_records` (time-series)
 
@@ -165,12 +197,20 @@ CREATE TABLE usage_records (
     status          TEXT NOT NULL CHECK (status IN ('ok','error','timeout','partial')),
     error_code      TEXT,
     worker_id       TEXT,
-    model_version   TEXT
+    model_version   TEXT,
+    app_label       TEXT  -- X-NQAI-App header value (refactor R)
 );
 
 CREATE INDEX usage_records_tenant_time_idx ON usage_records (tenant_id, occurred_at DESC);
-CREATE INDEX usage_records_key_time_idx ON usage_records (api_key_id, occurred_at DESC);
+CREATE INDEX usage_records_key_time_idx    ON usage_records (api_key_id, occurred_at DESC);
+CREATE INDEX usage_records_app_time_idx    ON usage_records (tenant_id, app_label, occurred_at DESC);
 ```
+
+**`app_label` (refactor R, 2026-05-24):** product attribution from the
+optional `X-NQAI-App` request header (e.g. `neeko-mobile`, `niva-agent`,
+`neurocourse-web`). NULL when absent. Tenant stays the billing primary
+key — `app_label` is advisory metadata for per-product rollup queries.
+Capped at 64 chars at the gateway to keep label cardinality bounded (D-15).
 
 **Migration plan to TimescaleDB:** Faz D'de bu tablo `usage_records` hypertable'a dönüştürülür (Timescale extension), `occurred_at` partition key. Retention policy 90 gün hot + aggregate continuous aggregate (gün/ay özet) sonsuza dek.
 

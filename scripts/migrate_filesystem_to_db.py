@@ -114,7 +114,7 @@ async def _migrate(args) -> int:
             if not voice_id:
                 print(f"  skip {yaml_path.name}: no voice_id", file=sys.stderr)
                 continue
-            existing = await vr.get(voice_id)
+            existing = await vr.get_accessible(voice_id)
             if existing is not None:
                 print(f"  skip {voice_id} (already in DB)")
                 continue

@@ -32,6 +32,7 @@ class VoicePublic(BaseModel):
     reference_seconds: float
     source: str
     license: str
+    visibility: Literal["private", "shared", "public"] = "private"
     created_at: str
     created_by: str
 

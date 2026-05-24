@@ -16,11 +16,13 @@ from .operator import OperatorRepo
 from .tenant import TenantRepo
 from .usage import UsageRepo
 from .voice import VoiceRepo
+from .voice_access import VoiceAccessRepo
 
 __all__ = [
     "TenantRepo",
     "ApiKeyRepo",
     "VoiceRepo",
+    "VoiceAccessRepo",
     "UsageRepo",
     "AuditRepo",
     "OperatorRepo",

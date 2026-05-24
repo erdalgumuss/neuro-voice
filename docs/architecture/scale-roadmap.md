@@ -12,9 +12,11 @@ Bu doküman çekirdek mimari, bileşen seçimleri, faz çıktıları ve karar ge
 
 Tek-process VoxCPM2 prototipinden, **4 tenant × 5 concurrent = 20 user başlangıç** ve **3-4× yatay ölçek ile 200 user** taşıyabilen bir mimariye geçiyoruz. Hedef pattern: **stateless API gateway + Redis Streams iş kuyruğu + GPU worker pool + Postgres data plane + S3-compat object storage**.
 
+> **Terminoloji notu (Refactor R, 2026-05-24):** "tenant" **account/workspace** demektir, "ürün" değil. Bir tenant kendi voice catalog'unu yönetir, kendi API key'lerini üretir, kendi usage'ını ödenir. Ürün (NEEKO toy, NIVA call-center, NeuroCourse, NARO) tenant ile **1:1 değil** — bir tenant ("erdal-dev") birden çok ürüne hizmet edebilir, bir ürünün ("neeko-app") production tenant'ı staging tenant'ından ayrı olabilir. Ürün attribution `X-NQAI-App` request header'ı ile `usage_records.app_label` üzerinden yapılır. Voice'lar tenant'a aittir ama `visibility` (`private/shared/public`) + `voice_access` tablosu ile cross-tenant paylaşılabilir. ElevenLabs/OpenAI ile uyumlu mental model.
+
 Çekirdek varsayımlar:
 - 4 client uygulama (NEEKO toy, NIVA call-center, NeuroCourse instructor, NARO) ortak omurgayı tüketir.
-- Her client kendi tenant'ı + scoped API key'leriyle bağlanır.
+- Her account (tenant) kendi API key'lerini üretir; ürünler `X-NQAI-App` header ile rollup edilir.
 - Streaming TTS uç noktası **WebSocket primary** (true low-latency); HTTP/2 chunked WAV fallback.
 - Birincil base model: VoxCPM2 (Apache-2.0). Inference runtime: önce direct `voxcpm`, Faz C'de `nano-vllm-voxcpm` (resmi paket, RTX 4090'da RTF 0.13, batched concurrent + FastAPI server).
 - "Premium" tanımı [voxcpm2-integration.md](voxcpm2-integration.md) bölümünde, sayısal hedefler [observability.md](observability.md) SLO'larında.
@@ -631,10 +633,13 @@ Tek satır cevaplar, detay → bileşen matrisi (§4) veya zorunlu kararlar (§6
 
 ## 18. Sözlük
 
-- **Tenant:** dış müşteri uygulaması (NEEKO, NIVA, NeuroCourse, NARO)
-- **API key:** tenant'a ait Bearer credential
+- **Tenant:** account/workspace — billing + auth + voice ownership birimi. Genellikle bir organizasyon veya isolated bir geliştirme ortamı (`erdal-dev`, `neeko-prod`, `partner-x-staging`). Ürünle 1:1 değil
+- **App / Product:** tenant'ın hizmet ettiği logical client (NEEKO toy, NIVA, NeuroCourse, NARO). `X-NQAI-App` header ile `usage_records.app_label` üzerinden tracked. Auth/billing birimi değil
+- **API key:** tenant'a ait Bearer credential — bir tenant N anahtar üretebilir
 - **Operator:** admin UI'a giren NQAI çalışanı (JWT'li ayrı auth)
-- **Voice:** referans audio + manifest = bir karakter sesi
+- **Voice:** referans audio + manifest = bir karakter sesi. `owner_tenant_id` sahibi tenant'ı belirler
+- **Voice visibility:** `private` (sadece owner), `shared` (owner + voice_access grants), `public` (her tenant)
+- **Voice access:** `voice_access` tablosundaki explicit cross-tenant grant (sharing için)
 - **Request:** istemcinin tek bir `POST /v1/tts` çağrısı
 - **Job:** queue'da bir request'in temsili (TtsJob struct)
 - **Chunk:** worker'ın gateway'e gönderdiği bir cümle PCM'i

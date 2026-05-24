@@ -73,18 +73,28 @@ PYTHONPATH=src python -m uvicorn server.main:app --host 0.0.0.0 --port 8000
 
 ### Tenant API (Bearer `Authorization: Bearer nqai_<prefix>_<secret>`)
 
+> **Mental model:** "tenant" = workspace/account (`erdal-dev`, `neeko-prod`, `partner-x`). API key tenant'a ait. Voice'lar tenant'a ait ama `visibility=public` veya `voice_access` grant ile cross-tenant paylaşılabilir. Ürün attribution `X-NQAI-App` header ile yapılır (`neeko-mobile`, `niva-agent` vb.) — `usage_records.app_label`'a düşer, billing tenant'a kalır.
+
 | Method | Yol | Scope | Ne yapar |
 |---|---|---|---|
 | GET | `/health` | — | model yüklendi mi, voice sayısı, sürüm |
 | POST | `/admin/warmup` | — | VoxCPM2 ağırlıklarını eager yükle (auth zorunlu) |
-| GET | `/v1/voices` | `voice:read` | tenant'a görünen voice catalog |
-| GET | `/v1/voices/{id}` | `voice:read` | tek voice manifest |
-| POST | `/v1/voices` | `voice:write` | yeni voice enroll (multipart: `reference_audio` + form) |
-| DELETE | `/v1/voices/{id}` | `voice:write` | voice + reference dosyasını sil |
+| GET | `/v1/voices` | `voice:read` | bu workspace'in erişebildiği catalog (owned + public + shared) |
+| GET | `/v1/voices/{id}` | `voice:read` | tek voice manifest (accessible olmalı) |
+| POST | `/v1/voices` | `voice:write` | yeni voice enroll (multipart: `reference_audio` + form) — owner = bu tenant, default `visibility=private` |
+| DELETE | `/v1/voices/{id}` | `voice:write` | voice sil (sadece owner; non-owner için 404) |
 | POST | `/v1/tts` | `tts:write` | sync 48 kHz WAV / PCM16 (tek-process) |
 | POST | `/v1/tts/stream` | `tts:write` | sentence-chunked streaming WAV / PCM16 |
 | POST | `/v1/tts/jobs` | `tts:write` | **async** — `Idempotency-Key` header (UUID) zorunlu, 202 + `job_id` |
 | GET | `/v1/tts/jobs/{job_id}` | `tts:read` | job durumu (queued / running / complete / failed) + presigned audio URL |
+
+**Opsiyonel request header'ları (tüm `/v1/*` endpoint'lerinde):**
+
+| Header | Etki |
+|---|---|
+| `X-NQAI-App: <slug>` | Ürün/app attribution — `usage_records.app_label`'a yazılır (max 64 char). Örn: `neeko-mobile`, `niva-agent-prod` |
+| `X-Request-Id: <uuid>` | Trace correlation; yoksa gateway UUID atar |
+| `Idempotency-Key: <uuid>` | `/v1/tts/jobs` için zorunlu (Stripe pattern) — aynı key + farklı body → 409 |
 
 ### Operator API (JWT cookie, ayrı login)
 
@@ -106,10 +116,11 @@ KEY="nqai-prod-..."
 URL="http://localhost:8000"
 RID=$(python -c 'import uuid; print(uuid.uuid4())')
 
-# 1. Submit
+# 1. Submit (X-NQAI-App opsiyonel ama tavsiye edilir)
 curl -X POST $URL/v1/tts/jobs \
   -H "Authorization: Bearer $KEY" \
   -H "Idempotency-Key: $RID" \
+  -H "X-NQAI-App: neeko-mobile" \
   -H "Content-Type: application/json" \
   -d '{"text":"Merhaba, ben Neeko.","voice_id":"neeko-v01"}'
 # → 202 {"job_id":"<RID>","status":"queued",...}

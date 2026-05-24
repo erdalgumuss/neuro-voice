@@ -150,7 +150,8 @@ def _voice_view_from_db(v) -> VoiceView:
 async def _load_voice_or_404(
     voice_id: str, tenant_id: uuid.UUID, session: AsyncSession
 ):
-    """Tenant-scoped lookup returning (db_voice, VoiceView, resolved_path).
+    """Viewer-scoped accessibility lookup returning (db_voice, VoiceView,
+    resolved_path). Resolves owned ∪ public ∪ shared (refactor R, D-08).
 
     Raises HTTPException(404/400). Resolved reference path is a local
     file — Faz B's R2 fetcher plugs in here for s3:// URIs.
@@ -161,10 +162,10 @@ async def _load_voice_or_404(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
 
     repo = VoiceRepo(session, tenant_id)
-    voice = await repo.get(voice_id)
+    voice = await repo.get_accessible(voice_id)
     if voice is None:
-        # Existence leak prevention — same 404 whether the voice belongs to
-        # another tenant or doesn't exist at all.
+        # Existence-leak prevention — same 404 whether the voice belongs
+        # to another tenant (and isn't shared/public) or doesn't exist.
         raise HTTPException(
             status.HTTP_404_NOT_FOUND, detail=f"voice '{voice_id}' not found"
         )
@@ -284,6 +285,7 @@ def _voice_to_public(v) -> VoicePublic:
         reference_seconds=v.reference_seconds,
         source=v.source,
         license=v.license,
+        visibility=v.visibility,
         created_at=v.created_at.isoformat(),
         created_by=str(v.created_by_key_id) if v.created_by_key_id else "system",
     )
@@ -294,8 +296,9 @@ async def list_voices(
     ctx: Annotated[AuthContext, Depends(require_auth("voice:read"))],
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> VoiceListResponse:
+    """Catalog visible to this tenant: owned + shared-with-me + public."""
     repo = VoiceRepo(session, ctx.tenant_id)
-    voices = [_voice_to_public(v) for v in await repo.list()]
+    voices = [_voice_to_public(v) for v in await repo.list_accessible()]
     return VoiceListResponse(voices=voices, count=len(voices))
 
 
@@ -366,11 +369,11 @@ async def enroll_voice(
     sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
 
     repo = VoiceRepo(session, ctx.tenant_id)
-    if await repo.get(voice_id) is not None:
+    if await repo.get_owned(voice_id) is not None:
         target.unlink(missing_ok=True)
         raise HTTPException(
             status.HTTP_409_CONFLICT,
-            detail=f"voice '{voice_id}' already exists for tenant",
+            detail=f"voice '{voice_id}' already exists in this workspace",
         )
 
     tags = [t.strip() for t in style_tags.split(",") if t.strip()]
@@ -450,6 +453,18 @@ def _request_id_for(request: Request) -> uuid.UUID:
     return uuid.uuid4()
 
 
+def _app_label_from(request: Request) -> str | None:
+    """Product attribution from `X-NQAI-App` request header (refactor R,
+    2026-05-24). Caps length at 64 chars to stay within the metric
+    cardinality budget (D-15). Returns None if header absent or empty
+    after trimming."""
+    raw = request.headers.get("X-NQAI-App")
+    if not raw:
+        return None
+    val = raw.strip()[:64]
+    return val or None
+
+
 async def _record_usage(
     session: AsyncSession,
     *,
@@ -464,6 +479,7 @@ async def _record_usage(
     rtf: float | None,
     status_str: str,
     error_code: str | None = None,
+    app_label: str | None = None,
 ) -> None:
     try:
         await UsageRepo(session, ctx.tenant_id).record(
@@ -479,6 +495,7 @@ async def _record_usage(
             status=status_str,
             error_code=error_code,
             model_version=settings.model_id,
+            app_label=app_label,
         )
         await session.commit()
     except Exception:
@@ -527,6 +544,7 @@ async def synthesize(
         ttfb_ms=None,
         rtf=rtf,
         status_str="ok",
+        app_label=_app_label_from(request),
     )
 
     headers = {
@@ -720,6 +738,7 @@ async def create_tts_job(
         language=body.language,
         audio_format=body.audio_format,
         params=body.params.model_dump(exclude_none=True) if body.params else None,
+        app_label=_app_label_from(request),
     )
     try:
         await queue.submit(payload)

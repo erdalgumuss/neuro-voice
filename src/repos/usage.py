@@ -34,6 +34,7 @@ class UsageRepo:
         error_code: str | None = None,
         worker_id: str | None = None,
         model_version: str | None = None,
+        app_label: str | None = None,
     ) -> UsageRecord:
         rec = UsageRecord(
             tenant_id=self.tenant_id,
@@ -50,6 +51,7 @@ class UsageRepo:
             error_code=error_code,
             worker_id=worker_id,
             model_version=model_version,
+            app_label=app_label,
         )
         self.session.add(rec)
         await self.session.flush()

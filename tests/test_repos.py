@@ -147,8 +147,8 @@ async def test_voice_repo_isolates_tenants():
             source="placeholder", license="internal-placeholder",
         )
         await s.commit()
-        a_listing = await vra.list()
-        b_listing = await vrb.list()
+        a_listing = await vra.list_accessible()
+        b_listing = await vrb.list_accessible()
         assert len(a_listing) == 1 and a_listing[0].display_name == "A's shared"
         assert len(b_listing) == 1 and b_listing[0].display_name == "B's shared"
 
@@ -165,13 +165,146 @@ async def test_voice_repo_get_returns_none_for_other_tenants_voice():
         )
         await s.commit()
         vra = VoiceRepo(s, tid_a)
-        assert await vra.get("b-only") is None  # existence leak yok
+        # Private voice (default visibility) is invisible to another tenant.
+        assert await vra.get_accessible("b-only") is None  # existence leak yok
 
 
 async def test_voice_repo_rejects_non_uuid_tenant_id():
     async with AsyncSessionLocal() as s:
         with pytest.raises(TypeError):
             VoiceRepo(s, "not-a-uuid")
+
+
+async def test_voice_public_visible_to_other_tenants():
+    """Refactor R: voice with visibility='public' is in every tenant's
+    accessible catalog. Owner still sees it as their own."""
+    tid_owner, tid_other = await _bootstrap_two_tenants()
+    async with AsyncSessionLocal() as s:
+        vro = VoiceRepo(s, tid_owner)
+        await vro.create(
+            voice_id="open-mic", display_name="Public voice",
+            reference_uri="s3://r2/o/open.wav", reference_sha256="p" * 64,
+            reference_seconds=10.0, source="placeholder",
+            license="internal-placeholder", visibility="public",
+        )
+        await s.commit()
+        # Owner sees it (via owner branch).
+        assert await vro.get_accessible("open-mic") is not None
+        # Other tenant sees it (via public branch).
+        vrx = VoiceRepo(s, tid_other)
+        assert await vrx.get_accessible("open-mic") is not None
+        # Listing on the other tenant includes the public voice.
+        names = [v.voice_id for v in await vrx.list_accessible()]
+        assert "open-mic" in names
+
+
+async def test_voice_shared_visible_only_via_explicit_grant():
+    """Refactor R: visibility='shared' is invisible without a
+    voice_access grant. After granting tenant B sees it. After revoking
+    they don't."""
+    from repos import VoiceAccessRepo
+
+    tid_owner, tid_grantee = await _bootstrap_two_tenants()
+    async with AsyncSessionLocal() as s:
+        await VoiceRepo(s, tid_owner).create(
+            voice_id="secret-club", display_name="Members only",
+            reference_uri="s3://r2/s.wav", reference_sha256="s" * 64,
+            reference_seconds=10.0, source="placeholder",
+            license="internal-placeholder", visibility="shared",
+        )
+        await s.commit()
+
+        vrg = VoiceRepo(s, tid_grantee)
+        # No grant yet → invisible (visibility=shared without grant = hidden).
+        assert await vrg.get_accessible("secret-club") is None
+
+        # Grant via owner repo.
+        ar = VoiceAccessRepo(s, tid_owner)
+        grant = await ar.grant(
+            voice_slug="secret-club",
+            grantee_tenant_id=tid_grantee,
+            permission="use",
+        )
+        assert grant is not None
+        await s.commit()
+        # Now grantee sees it.
+        seen = await vrg.get_accessible("secret-club")
+        assert seen is not None and seen.display_name == "Members only"
+
+        # Revoke → invisible again.
+        removed = await ar.revoke(
+            voice_slug="secret-club", grantee_tenant_id=tid_grantee,
+        )
+        await s.commit()
+        assert removed == 1
+        assert await vrg.get_accessible("secret-club") is None
+
+
+async def test_voice_private_never_visible_cross_tenant():
+    """Default visibility is 'private' — guarantees backward-compat with
+    pre-refactor isolation tests."""
+    tid_a, tid_b = await _bootstrap_two_tenants()
+    async with AsyncSessionLocal() as s:
+        await VoiceRepo(s, tid_a).create(
+            voice_id="mine", display_name="A's",
+            reference_uri="s3://r2/m.wav", reference_sha256="m" * 64,
+            reference_seconds=10.0, source="placeholder",
+            license="internal-placeholder",
+            # visibility omitted → defaults to 'private'
+        )
+        await s.commit()
+        assert await VoiceRepo(s, tid_a).get_accessible("mine") is not None
+        assert await VoiceRepo(s, tid_b).get_accessible("mine") is None
+
+
+async def test_voice_owner_only_soft_delete():
+    """Refactor R: non-owner trying to delete a voice they can SEE via
+    public/shared still returns None (404 to API caller). Only owner can
+    actually delete."""
+    from repos import VoiceAccessRepo
+
+    tid_owner, tid_grantee = await _bootstrap_two_tenants()
+    async with AsyncSessionLocal() as s:
+        await VoiceRepo(s, tid_owner).create(
+            voice_id="not-yours", display_name="Owner-only",
+            reference_uri="s3://r2/n.wav", reference_sha256="n" * 64,
+            reference_seconds=10.0, source="placeholder",
+            license="internal-placeholder", visibility="shared",
+        )
+        await VoiceAccessRepo(s, tid_owner).grant(
+            voice_slug="not-yours", grantee_tenant_id=tid_grantee,
+        )
+        await s.commit()
+
+        # Grantee can SEE the voice (via the access grant)…
+        assert await VoiceRepo(s, tid_grantee).get_accessible("not-yours") is not None
+        # …but cannot delete it.
+        assert await VoiceRepo(s, tid_grantee).soft_delete("not-yours") is None
+        # Owner can.
+        deleted = await VoiceRepo(s, tid_owner).soft_delete("not-yours")
+        await s.commit()
+        assert deleted is not None
+
+
+async def test_voice_set_visibility_owner_only():
+    tid_owner, tid_other = await _bootstrap_two_tenants()
+    async with AsyncSessionLocal() as s:
+        await VoiceRepo(s, tid_owner).create(
+            voice_id="toggle", display_name="X",
+            reference_uri="s3://r2/t.wav", reference_sha256="t" * 64,
+            reference_seconds=10.0, source="placeholder",
+            license="internal-placeholder",
+        )
+        await s.commit()
+
+        # Non-owner can't flip visibility.
+        assert await VoiceRepo(s, tid_other).set_visibility("toggle", "public") is None
+
+        # Owner flips → other tenant now sees it.
+        updated = await VoiceRepo(s, tid_owner).set_visibility("toggle", "public")
+        await s.commit()
+        assert updated is not None and updated.visibility == "public"
+        assert await VoiceRepo(s, tid_other).get_accessible("toggle") is not None
 
 
 async def test_voice_repo_soft_delete():
@@ -188,8 +321,8 @@ async def test_voice_repo_soft_delete():
         deleted = await vr.soft_delete("to-delete")
         await s.commit()
         assert deleted is not None and deleted.deleted_at is not None
-        assert await vr.get("to-delete") is None
-        full = await vr.list(include_deleted=True)
+        assert await vr.get_accessible("to-delete") is None
+        full = await vr.list_accessible(include_deleted=True)
         assert len(full) == 1
 
 
@@ -216,6 +349,37 @@ async def test_usage_record_and_summary():
         assert summary["ok"]["count"] == 1
         assert summary["error"]["count"] == 1
         assert summary["ok"]["chars"] == 20
+
+
+async def test_usage_record_persists_app_label():
+    """Refactor R: X-NQAI-App header value lands on usage_records.app_label
+    for per-product rollup."""
+    tid, _ = await _bootstrap_two_tenants()
+    async with AsyncSessionLocal() as s:
+        k = await ApiKeyRepo(s).create(
+            tenant_id=tid, prefix="nqai_dev_appppppppppppp", secret_hash="x",
+        )
+        await s.commit()
+        ur = UsageRepo(s, tid)
+        rid_with = uuid.uuid4()
+        rid_without = uuid.uuid4()
+        await ur.record(
+            api_key_id=k.id, voice_id="v", request_id=rid_with,
+            text_char_count=5, sentence_count=1,
+            duration_ms=500, elapsed_ms=200, rtf=0.4,
+            app_label="neeko-mobile",
+        )
+        await ur.record(
+            api_key_id=k.id, voice_id="v", request_id=rid_without,
+            text_char_count=5, sentence_count=1,
+            duration_ms=500, elapsed_ms=200, rtf=0.4,
+            # app_label omitted → None
+        )
+        await s.commit()
+        rows = await ur.recent(limit=10)
+        labels = {r.request_id: r.app_label for r in rows}
+        assert labels[rid_with] == "neeko-mobile"
+        assert labels[rid_without] is None
 
 
 # --------------------------------------------------------------------------- #
