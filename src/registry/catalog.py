@@ -162,7 +162,7 @@ class VoiceRegistry:
         license: str = "user-owned",
         created_by: str = "system",
         reference_trim_seconds: float = 15.0,
-        target_sample_rate: int = 24000,
+        target_sample_rate: int = 16000,
     ) -> Voice:
         validate_voice_id(voice_id)
         suffix = reference_audio_suffix.lower()

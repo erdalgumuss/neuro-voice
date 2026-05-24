@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nqai-voice"
-version = "0.1.0"
-description = "NQAI Türkçe TTS platformu — Chatterbox Multilingual üstüne voice catalog + streaming API"
+version = "0.2.0"
+description = "NQAI Türkçe TTS platformu — VoxCPM2 üstüne voice catalog + streaming API"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.13"
 license = { text = "Proprietary" }
 authors = [{ name = "NeuroQubit / NQAI" }]
 
@@ -17,13 +17,13 @@ dependencies = [
     "pydantic>=2.9",
     "pyyaml>=6.0",
     "python-multipart>=0.0.12",
-    "numpy>=2.0,<2.1",
+    "numpy>=1.26",
     "soundfile>=0.12",
     "librosa>=0.11",
-    "torch>=2.6",
-    "torchaudio>=2.6",
-    "transformers==4.46.3",
-    "chatterbox-tts>=0.1.7",
+    "torch>=2.5",
+    "torchaudio>=2.5",
+    "transformers>=4.46",
+    "voxcpm>=0.5",
     "httpx>=0.27",
 ]
 

@@ -40,7 +40,7 @@ class Settings:
         "NQAI_REFERENCE_DIR", _repo_root() / "data" / "reference-audio"
     ))
     model_id: str = field(default_factory=lambda: os.environ.get(
-        "NQAI_MODEL_ID", "ResembleAI/chatterbox-multilingual"
+        "NQAI_MODEL_ID", "openbmb/VoxCPM2"
     ))
     device: str = field(default_factory=lambda: os.environ.get("NQAI_DEVICE", "auto"))
     max_chars_per_request: int = field(default_factory=lambda: int(
@@ -49,8 +49,12 @@ class Settings:
     reference_trim_seconds: float = field(default_factory=lambda: float(
         os.environ.get("NQAI_REF_TRIM_SECONDS", "15.0")
     ))
+    # VoxCPM2 accepts 16 kHz reference audio; output is 48 kHz via AudioVAE V2.
+    reference_sample_rate: int = field(default_factory=lambda: int(
+        os.environ.get("NQAI_REF_SR", "16000")
+    ))
     target_sample_rate: int = field(default_factory=lambda: int(
-        os.environ.get("NQAI_TARGET_SR", "24000")
+        os.environ.get("NQAI_TARGET_SR", "48000")
     ))
     api_keys: list[str] = field(default_factory=lambda: _env_list("NQAI_API_KEYS", []))
     require_auth: bool = field(default_factory=lambda: _env_bool("NQAI_REQUIRE_AUTH", True))

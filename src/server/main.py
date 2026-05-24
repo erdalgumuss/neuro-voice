@@ -203,7 +203,8 @@ async def enroll_voice(
             license=license,
             created_by=api_key,
             reference_trim_seconds=settings.reference_trim_seconds,
-            target_sample_rate=settings.target_sample_rate,
+            # VoxCPM2 wants 16 kHz mono reference; output is 48 kHz.
+            target_sample_rate=settings.reference_sample_rate,
         )
     except InvalidVoiceId as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(e)) from e

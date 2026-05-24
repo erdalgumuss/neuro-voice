@@ -1,14 +1,14 @@
 """End-to-end API smoke — registry CRUD + auth, model stubbed.
 
-This test runs without GPU / Chatterbox by injecting a fake engine that
-returns a fixed PCM blob, so the FastAPI dependency graph and the
-streaming/wav code paths get exercised on CI-class machines.
+This test runs without a GPU and without the real VoxCPM2 install by
+injecting a fake model into `sys.modules['voxcpm']`. The FastAPI
+dependency graph and the streaming/WAV code paths still get exercised
+on CI-class machines.
 """
 
 from __future__ import annotations
 
 import io
-import os
 import sys
 import wave
 from pathlib import Path
@@ -17,33 +17,42 @@ import numpy as np
 import pytest
 import soundfile as sf
 
-# Stub chatterbox before importing the server, so loading does not pull torch.
-fake_module = type(sys)("chatterbox")
-fake_mtl = type(sys)("chatterbox.mtl_tts")
+# Stub voxcpm before importing the server, so loading does not pull torch.
+_fake_voxcpm = type(sys)("voxcpm")
+
+
+class _StubInner:
+    sample_rate = 48000
 
 
 class _StubModel:
-    sr = 24000
+    tts_model = _StubInner()
 
-    def generate(self, text, *, language_id, audio_prompt_path):
-        import torch
-
+    def generate(
+        self,
+        text,
+        *,
+        reference_wav_path,
+        cfg_value=2.0,
+        inference_timesteps=10,
+        normalize=False,
+        denoise=False,
+        retry_badcase=True,
+        **_kwargs,
+    ):
+        sr = self.tts_model.sample_rate
         duration = 0.5 + 0.05 * len(text)
-        samples = int(duration * self.sr)
-        wav = torch.zeros(1, samples)
-        return wav
+        return np.zeros(int(duration * sr), dtype=np.float32)
 
 
 class _StubFactory:
     @staticmethod
-    def from_pretrained(device):
+    def from_pretrained(model_id, load_denoiser=False):
         return _StubModel()
 
 
-fake_mtl.ChatterboxMultilingualTTS = _StubFactory
-fake_module.mtl_tts = fake_mtl
-sys.modules["chatterbox"] = fake_module
-sys.modules["chatterbox.mtl_tts"] = fake_mtl
+_fake_voxcpm.VoxCPM = _StubFactory
+sys.modules["voxcpm"] = _fake_voxcpm
 
 
 @pytest.fixture()
@@ -53,7 +62,7 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     voices_dir.mkdir()
     ref_dir.mkdir()
 
-    sr = 24000
+    sr = 16000  # VoxCPM2 reference audio rate
     seed = np.zeros(sr, dtype=np.float32)
     sf.write(ref_dir / "seed.wav", seed, sr)
 
@@ -77,7 +86,7 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 HEADERS = {"Authorization": "Bearer test-key-1"}
 
 
-def _make_wav_bytes(duration_s: float = 2.0, sr: int = 24000) -> bytes:
+def _make_wav_bytes(duration_s: float = 2.0, sr: int = 16000) -> bytes:
     audio = (np.random.randn(int(duration_s * sr)) * 0.1).astype(np.float32)
     buf = io.BytesIO()
     sf.write(buf, audio, sr, format="WAV", subtype="PCM_16")
@@ -174,12 +183,12 @@ def test_tts_with_stub_engine(client):
     assert r.status_code == 200, r.text
     assert r.headers["content-type"].startswith("audio/wav")
     assert int(r.headers["X-NQAI-Sentences"]) >= 1
-    assert int(r.headers["X-NQAI-Sample-Rate"]) == 24000
+    assert int(r.headers["X-NQAI-Sample-Rate"]) == 48000
     # Parse it as WAV to confirm the bytes are valid
     with wave.open(io.BytesIO(r.content), "rb") as w:
         assert w.getnchannels() == 1
         assert w.getsampwidth() == 2
-        assert w.getframerate() == 24000
+        assert w.getframerate() == 48000
         assert w.getnframes() > 0
 
 
