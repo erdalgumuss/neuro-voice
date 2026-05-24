@@ -92,9 +92,18 @@ async def _write_once(
     state: WorkerHeartbeatState,
     ttl_ms: int,
 ) -> None:
+    # `updated_at_ms` is the LIVENESS signal: it advances every refresh
+    # tick regardless of whether the worker picked a job. The gateway's
+    # stale check uses this — otherwise a healthy worker that has been
+    # idle for >stale_ms gets marked dead just because no jobs arrived
+    # (Codex audit 2026-05-24). `last_pickup_ms` stays as a separate
+    # "is the worker actually picking jobs?" diagnostic — operators can
+    # detect a stuck worker whose `updated_at_ms` is fresh but
+    # `last_pickup_ms` is old.
     mapping = {
         "capacity": str(state.capacity),
         "in_flight": str(state.in_flight),
+        "updated_at_ms": str(_now_ms()),
         "last_pickup_ms": str(state.last_pickup_ms),
         "started_at_ms": str(state.started_at_ms),
     }

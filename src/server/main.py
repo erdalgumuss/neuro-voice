@@ -618,16 +618,22 @@ async def synthesize_stream(
     session: Annotated[AsyncSession, Depends(get_session)],
     queue: Annotated[TtsJobQueue, Depends(get_queue)],
 ) -> StreamingResponse:
-    """**Deprecated** — sentence-streamed queue proxy.
+    """Primary streaming TTS endpoint — HTTP chunked WAV.
 
-    Same queue path as `/v1/tts`, but chunks are forwarded to the
-    client as they arrive on the result stream rather than concatenated.
-    HTTP chunked transfer; the first byte hits the wire after the
-    worker's first sentence is generated (Faz B.1 latency: 1-2s on
-    L4 with stub engine; real engine drives most of the wall clock).
+    Sentence-streamed via the same Redis queue path that drives async
+    jobs and the deprecated sync ``/v1/tts``. The worker pipeline uses
+    ``iter_engine_chunks`` (Faz B.1.5) to bridge the engine generator
+    onto the result stream frame-by-frame, so the first byte hits the
+    client wire as soon as the engine emits its first sentence — full
+    generation does NOT drain before publishing.
 
-    Latency-focused live streaming (frame-level, WS / WebRTC) is
-    Faz B.1.5 — that path will not use this endpoint.
+    This is the canonical industry-standard one-way streaming TTS
+    surface (ElevenLabs / OpenAI Audio / Cartesia / MiniMax mental
+    model). Duplex voice-agent (NIVA call-center, real bidirectional
+    conversation) is a separate product surface — if that product
+    ships it will use a different transport (WebRTC / gRPC) on a
+    different endpoint, not this one. See
+    ``docs/architecture/streaming-protocol.md``.
     """
     if len(body.text) > settings.max_chars_per_request:
         raise HTTPException(
@@ -753,20 +759,30 @@ async def _check_queue_depth_or_503(
 ) -> None:
     """Faz C capacity-aware backpressure.
 
-    Strategy:
+    Strategy
+    --------
     1. Read cluster capacity from worker heartbeats. If any healthy workers
-       exist, admit when the cluster has enough total throughput to absorb
-       the already-queued jobs plus this one within a bounded window.
-       Concretely: ``depth <= total_capacity + headroom`` where ``headroom
-       = total_capacity - total_inflight``. Interpretation: "next wave of
-       jobs (one tick of full-cluster work, plus the slots that are free
-       right now) is enough to consume what's queued." A hard XLEN ceiling
-       still applies as a fail-safe so a slow cluster can't accept
+       exist, admit while:
+
+           depth <= total_capacity + headroom
+
+       where ``headroom = total_capacity - total_inflight``. The intent
+       is: "if I admit this job, the next wave of cluster work (the slots
+       currently free, plus one full pass through every slot) will
+       absorb what's queued." This **accepts backlog up to one full
+       cluster-pass even when the cluster is 100 % utilised** — a
+       deliberate choice for TTS workloads where individual jobs are
+       multi-second and a few seconds of queue latency is acceptable.
+       Pinned by ``tests/test_metrics_endpoint.py::test_backpressure_
+       admits_at_capacity_with_one_cluster_pass_backlog`` so a future
+       refactor can't quietly tighten it. A hard XLEN ceiling still
+       applies as a final fail-safe so a slow cluster can't accept
        unbounded jobs even if its self-reported capacity says otherwise.
     2. If NO healthy workers (cold start, all workers crashed, or the
-       heartbeat read itself failed): fall back to the original XLEN-only
-       path — the queue ceiling is the only signal we trust. This keeps
-       backpressure safe even when the heartbeat plane is degraded.
+       heartbeat read itself failed): fall back to the original
+       XLEN-only path — the queue ceiling is the only signal we trust.
+       This keeps backpressure safe even when the heartbeat plane is
+       degraded.
     """
     depth = await queue.depth()
     capacity_known = False

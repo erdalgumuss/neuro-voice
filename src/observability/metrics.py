@@ -140,7 +140,10 @@ TTS_FIRST_PCM_SECONDS: Histogram = Histogram(
 
 TTS_FIRST_AUDIO_SECONDS: Histogram = Histogram(
     "nqai_tts_first_audio_seconds",
-    "End-to-end latency from gateway-received to first audio byte delivered to client.",
+    "Worker-side latency: inference start to first publish_chunk XADD "
+    "(when the gateway can first read a byte off the result stream). "
+    "Proxy for client TTFB; true gateway → wire timing requires a "
+    "separate gateway_first_byte_ms column (Faz C v1).",
     labelnames=_WATERFALL_LABELS,
     buckets=WATERFALL_BUCKETS,
     registry=REGISTRY,
@@ -148,7 +151,7 @@ TTS_FIRST_AUDIO_SECONDS: Histogram = Histogram(
 
 TTS_INFERENCE_SECONDS: Histogram = Histogram(
     "nqai_tts_inference_seconds",
-    "Pure model inference duration (first PCM to last PCM).",
+    "Pure model inference duration (worker-side, first PCM to last PCM).",
     labelnames=_WATERFALL_LABELS,
     buckets=WATERFALL_BUCKETS,
     registry=REGISTRY,
@@ -156,7 +159,9 @@ TTS_INFERENCE_SECONDS: Histogram = Histogram(
 
 TTS_TOTAL_SECONDS: Histogram = Histogram(
     "nqai_tts_total_seconds",
-    "End-to-end wall time per TTS job (gateway-received to final audio done).",
+    "Worker-side wall time per TTS job (pipeline start to archive + "
+    "DB commit done). Does NOT include gateway HTTP framing or "
+    "client transport time.",
     labelnames=_WATERFALL_LABELS,
     buckets=WATERFALL_BUCKETS,
     registry=REGISTRY,

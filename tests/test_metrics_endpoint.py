@@ -121,6 +121,7 @@ def _seed_heartbeat(
             mapping={
                 "capacity": str(capacity),
                 "in_flight": str(in_flight),
+                "updated_at_ms": str(now),
                 "last_pickup_ms": str(now),
                 "started_at_ms": str(now - 10_000),
             },
@@ -240,6 +241,58 @@ def test_backpressure_falls_back_to_xlen_when_no_heartbeats(client):
         json={"text": "Merhaba.", "voice_id": "demo-01"},
     )
     assert r.status_code == 202, r.text
+
+
+def test_backpressure_admits_at_capacity_with_one_cluster_pass_backlog(client):
+    """Pin the admission policy: even at 100 % cluster utilisation
+    (in_flight == capacity, headroom == 0), the gateway admits while
+    queue depth ≤ total_capacity — i.e. up to one full cluster-pass
+    of backlog. This is a deliberate trade-off for multi-second TTS
+    jobs (Codex audit 2026-05-24). A future refactor that tightens
+    this to `depth ≤ headroom` would surface here.
+    """
+    _enroll_voice(client)
+    # One worker, capacity=4, fully utilised (in_flight=4, headroom=0).
+    _seed_heartbeat(client.fake_redis, worker_id="w1", capacity=4, in_flight=4)
+
+    # 3 jobs queued (< total_capacity=4). depth (3) <= 0 + 4 = 4 → admit.
+    async def _fill():
+        for i in range(3):
+            await client.fake_redis.xadd(
+                "nqai.tts.jobs.test", {"payload": f"filler-{i}"}
+            )
+
+    asyncio.run(_fill())
+
+    r = client.post(
+        "/v1/tts/jobs",
+        headers={"Idempotency-Key": str(uuid.uuid4())},
+        json={"text": "Merhaba.", "voice_id": "demo-01"},
+    )
+    assert r.status_code == 202, r.text
+
+
+def test_backpressure_denies_at_capacity_when_backlog_exceeds_one_cluster_pass(client):
+    """Boundary: same fully-utilised cluster, but depth > total_capacity.
+    Pinning the other side of the policy."""
+    _enroll_voice(client)
+    _seed_heartbeat(client.fake_redis, worker_id="w1", capacity=4, in_flight=4)
+
+    # 5 jobs queued (> total_capacity=4). depth (5) > 0 + 4 = 4 → deny.
+    async def _fill():
+        for i in range(5):
+            await client.fake_redis.xadd(
+                "nqai.tts.jobs.test", {"payload": f"filler-{i}"}
+            )
+
+    asyncio.run(_fill())
+
+    r = client.post(
+        "/v1/tts/jobs",
+        headers={"Idempotency-Key": str(uuid.uuid4())},
+        json={"text": "Merhaba.", "voice_id": "demo-01"},
+    )
+    assert r.status_code == 503, r.text
 
 
 def test_backpressure_xlen_fallback_still_denies_when_queue_full(client):

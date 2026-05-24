@@ -79,8 +79,57 @@ async def test_worker_heartbeat_writes_expected_fields(redis):
     decoded = {k.decode(): v.decode() for k, v in raw.items()}
     assert decoded["capacity"] == "8"
     assert decoded["in_flight"] == "2"
+    assert int(decoded["updated_at_ms"]) > 0
     assert int(decoded["last_pickup_ms"]) > 0
     assert int(decoded["started_at_ms"]) > 0
+
+
+async def test_worker_heartbeat_updated_at_ms_advances_each_tick(redis):
+    """`updated_at_ms` MUST advance every refresh tick, regardless of
+    whether the worker actually picked a job. This is the liveness
+    signal the gateway uses to filter stale workers — pinning it.
+
+    Regression guard: Codex audit 2026-05-24 caught the bug where the
+    gateway stale-checked `last_pickup_ms`, which only advances on
+    activity, so idle-but-alive workers got marked dead.
+    """
+    stop = asyncio.Event()
+    # Frozen pickup timestamp — caller never advances it.
+    frozen_pickup_ms = int(time.time() * 1000) - 30_000  # 30 s old
+    state = WorkerHeartbeatState(
+        capacity=4,
+        in_flight=0,
+        last_pickup_ms=frozen_pickup_ms,
+        started_at_ms=frozen_pickup_ms,
+    )
+
+    task = asyncio.create_task(
+        start_heartbeat_loop(
+            redis,
+            worker_id="w-idle",
+            get_state=lambda: state,
+            stop_event=stop,
+            interval_s=0.05,
+            ttl_s=1.0,
+        )
+    )
+    await asyncio.sleep(0.06)
+    first = await redis.hgetall(f"{DEFAULT_PREFIX}.w-idle")
+    updated_first = int(first[b"updated_at_ms"])
+    pickup_first = int(first[b"last_pickup_ms"])
+
+    await asyncio.sleep(0.12)  # two more ticks
+    second = await redis.hgetall(f"{DEFAULT_PREFIX}.w-idle")
+    updated_second = int(second[b"updated_at_ms"])
+    pickup_second = int(second[b"last_pickup_ms"])
+
+    stop.set()
+    await asyncio.wait_for(task, timeout=1.0)
+
+    # Liveness advanced.
+    assert updated_second > updated_first
+    # Activity did NOT advance (frozen by caller).
+    assert pickup_second == pickup_first == frozen_pickup_ms
 
 
 async def test_worker_heartbeat_sets_ttl(redis):
@@ -183,6 +232,7 @@ async def test_cluster_capacity_aggregates_multiple_workers(redis):
             mapping={
                 "capacity": str(cap),
                 "in_flight": str(inf),
+                "updated_at_ms": str(now),
                 "last_pickup_ms": str(now),
                 "started_at_ms": str(now - 1000),
             },
@@ -200,16 +250,21 @@ async def test_cluster_capacity_aggregates_multiple_workers(redis):
 
 async def test_cluster_capacity_excludes_stale_workers(redis):
     now = _now_ms()
-    fresh_pickup = now
-    stale_pickup = now - 60_000  # 60 s ago, way beyond 5 s cutoff
+    fresh = now
+    stale_updated = now - 60_000  # 60 s ago, way beyond 5 s cutoff
 
-    for wid, pickup in (("fresh1", fresh_pickup), ("fresh2", fresh_pickup), ("stale", stale_pickup)):
+    for wid, updated in (
+        ("fresh1", fresh),
+        ("fresh2", fresh),
+        ("stale", stale_updated),
+    ):
         await redis.hset(
             f"{DEFAULT_PREFIX}.{wid}",
             mapping={
                 "capacity": "4",
                 "in_flight": "1",
-                "last_pickup_ms": str(pickup),
+                "updated_at_ms": str(updated),
+                "last_pickup_ms": str(updated),
                 "started_at_ms": str(now - 1000),
             },
         )
@@ -220,6 +275,67 @@ async def test_cluster_capacity_excludes_stale_workers(redis):
     assert "stale" not in cap.healthy_worker_ids
     assert cap.total_capacity == 8
     assert cap.total_inflight == 2
+
+
+async def test_cluster_capacity_idle_worker_stays_healthy(redis):
+    """Idle-but-alive worker (fresh `updated_at_ms`, old `last_pickup_ms`)
+    must NOT be evicted. This is the Codex audit 2026-05-24 regression:
+    pre-fix the gateway stale-checked `last_pickup_ms`, evicting healthy
+    idle workers and falling back to XLEN-only as soon as traffic
+    quieted down.
+    """
+    now = _now_ms()
+    # Worker hasn't picked a job in 60 s, but is still refreshing its
+    # heartbeat every second (so updated_at_ms is fresh).
+    await redis.hset(
+        f"{DEFAULT_PREFIX}.idle-but-alive",
+        mapping={
+            "capacity": "4",
+            "in_flight": "0",
+            "updated_at_ms": str(now),
+            "last_pickup_ms": str(now - 60_000),
+            "started_at_ms": str(now - 300_000),
+        },
+    )
+
+    cap = await read_cluster_capacity(redis, stale_ms=5_000)
+    assert cap.worker_count == 1
+    assert cap.healthy_worker_ids == ("idle-but-alive",)
+    assert cap.total_capacity == 4
+    assert cap.total_inflight == 0
+
+
+async def test_cluster_capacity_falls_back_to_last_pickup_for_old_workers(redis):
+    """Backward compat: a worker hash without `updated_at_ms` (pre-fix
+    image) should still be evaluated against `last_pickup_ms`. That
+    means OLD idle workers still get marked stale — but new workers
+    write `updated_at_ms` and are protected. Both can coexist during
+    a rollout."""
+    now = _now_ms()
+    # Old-style worker, fresh pickup → healthy.
+    await redis.hset(
+        f"{DEFAULT_PREFIX}.old-active",
+        mapping={
+            "capacity": "4",
+            "in_flight": "1",
+            "last_pickup_ms": str(now),
+            "started_at_ms": str(now - 1000),
+        },
+    )
+    # Old-style worker, stale pickup → evicted (no `updated_at_ms` to
+    # save it; rolling images forward gets us out of this).
+    await redis.hset(
+        f"{DEFAULT_PREFIX}.old-idle",
+        mapping={
+            "capacity": "4",
+            "in_flight": "0",
+            "last_pickup_ms": str(now - 60_000),
+            "started_at_ms": str(now - 300_000),
+        },
+    )
+
+    cap = await read_cluster_capacity(redis, stale_ms=5_000)
+    assert cap.healthy_worker_ids == ("old-active",)
 
 
 async def test_cluster_capacity_empty(redis):
@@ -241,6 +357,7 @@ async def test_cluster_capacity_skips_malformed_hash(redis):
         mapping={
             "capacity": "4",
             "in_flight": "1",
+            "updated_at_ms": str(now),
             "last_pickup_ms": str(now),
             "started_at_ms": str(now - 1000),
         },
@@ -251,6 +368,7 @@ async def test_cluster_capacity_skips_malformed_hash(redis):
         mapping={
             "capacity": "4",
             "in_flight": "1",
+            "updated_at_ms": str(now),
             "last_pickup_ms": str(now),
         },
     )
@@ -260,6 +378,7 @@ async def test_cluster_capacity_skips_malformed_hash(redis):
         mapping={
             "capacity": "nope",
             "in_flight": "0",
+            "updated_at_ms": str(now),
             "last_pickup_ms": str(now),
             "started_at_ms": str(now - 1000),
         },
@@ -277,6 +396,7 @@ async def test_cluster_capacity_uses_custom_prefix(redis):
         mapping={
             "capacity": "4",
             "in_flight": "1",
+            "updated_at_ms": str(now),
             "last_pickup_ms": str(now),
             "started_at_ms": str(now - 1000),
         },
