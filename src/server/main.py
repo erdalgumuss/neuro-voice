@@ -52,7 +52,7 @@ logging.basicConfig(
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
 )
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 _registry = VoiceRegistry(
     voices_dir=settings.voices_dir,
