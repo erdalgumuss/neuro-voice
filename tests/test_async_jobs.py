@@ -79,7 +79,7 @@ async def setup(monkeypatch, tmp_path):
     monkeypatch.setenv("NQAI_QUEUE_DEPTH_LIMIT", "100")
 
     for mod_name in list(sys.modules):
-        if mod_name.startswith(("server", "db", "repos", "frontend", "registry")):
+        if mod_name.startswith(("server", "worker", "db", "repos", "frontend", "registry")):
             del sys.modules[mod_name]
 
     from db import AsyncSessionLocal, init_models_for_tests

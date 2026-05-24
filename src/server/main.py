@@ -57,14 +57,17 @@ from repos import (
     VoiceRepo,
 )
 
-from . import streaming
+# Engine + sentence streaming live in src/worker/ after Faz B.1 step 3.
+# Sync /v1/tts and /v1/tts/stream still call into them here for backward
+# compatibility (queue-proxy cutover lands in step 6); the import is
+# one-way (server → worker), no circular risk because worker imports
+# nothing from server.* other than server.queue (leaf wire schemas).
+from worker import streaming
+from worker.engine import BaseSynthEngine, get_engine
+
 from .admin import admin_router
 from .auth import AuthContext, require_auth
 from .config import settings
-from .engine import (
-    BaseSynthEngine,
-    get_engine,
-)
 from .queue import TtsJobPayload, TtsJobQueue, get_queue, parse_idempotency_key
 from .reference_resolver import (
     ReferenceAudioMissing,

@@ -75,16 +75,16 @@ def _reset_stub_counter():
 def _make_engine(cache_size: int = 3):
     # Late import so the voxcpm stub registers first.
     for mod_name in list(sys.modules):
-        if mod_name.startswith("server.engine"):
+        if mod_name.startswith("worker.engine"):
             del sys.modules[mod_name]
-    from server.engine import VoxCPM2Engine
+    from worker.engine import VoxCPM2Engine
 
     return VoxCPM2Engine(model_id="stub/voxcpm2", device="cpu", cache_size=cache_size)
 
 
 def _adapter(tmp_path: Path, name: str):
     """Build a usable LoRAAdapterSpec pointing at a tmp directory + config."""
-    from server.engine import LoRAAdapterSpec
+    from worker.engine import LoRAAdapterSpec
 
     adir = tmp_path / name
     adir.mkdir(parents=True, exist_ok=True)
@@ -184,8 +184,8 @@ def test_default_cache_size_from_env(monkeypatch):
     monkeypatch.setenv("NQAI_LORA_CACHE_SIZE", "7")
     # Force re-import so module-level constant picks up the env.
     for mod_name in list(sys.modules):
-        if mod_name.startswith("server.engine"):
+        if mod_name.startswith("worker.engine"):
             del sys.modules[mod_name]
-    from server.engine import DEFAULT_LORA_CACHE_SIZE
+    from worker.engine import DEFAULT_LORA_CACHE_SIZE
 
     assert DEFAULT_LORA_CACHE_SIZE == 7

@@ -41,7 +41,7 @@ async def setup(monkeypatch, tmp_path):
 
     # Reload server modules so they pick up the env
     for m in list(sys.modules):
-        if m.startswith(("server", "db", "repos", "frontend", "registry")):
+        if m.startswith(("server", "worker", "db", "repos", "frontend", "registry")):
             del sys.modules[m]
 
     from db import AsyncSessionLocal, init_models_for_tests

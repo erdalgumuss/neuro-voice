@@ -92,12 +92,10 @@ def _resolve_device(requested: str) -> str:
     return "cpu"
 
 
-# PCM/WAV helpers live in `src/audio/wav.py` so the gateway proxy and
-# the worker can both import them without dragging in VoxCPM2. Re-export
-# preserves the historical `from .engine import pcm16_to_wav_bytes`
-# call sites until Step 3 of the worker split moves this module entirely.
-from audio.wav import float_to_pcm16_bytes as _float_to_pcm16  # noqa: F401,E402
-from audio.wav import pcm16_to_wav_bytes  # noqa: F401,E402
+# PCM helpers come from the shared audio package. The engine itself
+# produces PCM int16 bytes; gateway sync proxy and result-stream
+# consumers do their own WAV assembly via `audio.wav.pcm16_to_wav_bytes`.
+from audio.wav import float_to_pcm16_bytes as _float_to_pcm16  # noqa: E402
 
 # Engine-level default knobs. Tune per voice in the manifest later.
 DEFAULT_CFG_VALUE = 2.0
