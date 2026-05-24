@@ -3,6 +3,8 @@
 **Doc owner:** DevOps lead · **Bağlı:** [scale-roadmap.md §12](scale-roadmap.md)
 **Sürüm:** v1 · **Stack:** Prometheus + Grafana + Loki + OpenTelemetry (→ Tempo veya Honeycomb)
 
+> **⚠️ ASPIRATIONAL CATALOG.** Bu dosya Faz C+ hedef metric kataloğudur. Bugün shipped olan subset (~15 metric, RED + waterfall + queue/worker health) için **ground truth** [`src/observability/metrics.py`](../../src/observability/metrics.py) ve [`deploy/grafana/dashboards/nqai-voice.json`](../../deploy/grafana/dashboards/nqai-voice.json). Catalogdaki GPU / connection-pool / per-route gateway metric'leri, OTel tracing exemplar'ları henüz yok — Faz C v2 ve Faz D'ye yayılır. Audit L4 drift 2026-05-25: doc & code arasında label vocabulary farkı (catalog `tenant_slug`/`voice_id`; code `tenant`/`voice`); code kullanımı authoritative.
+
 > "Üretemediğini ölçemezsin" — bu doc her metrik, log ve trace'in adını, formatını ve nedenini tanımlar. Ekibin her servis ekleme/refactor'unda buraya satır eklemesi şart (D-15).
 
 ---

@@ -687,6 +687,15 @@ async def synthesize_stream(
     different endpoint, not this one. See
     ``docs/architecture/streaming-protocol.md``.
     """
+    # Capture request-received timestamp at the TOP of the handler
+    # (audit L3 H2 2026-05-25). Pre-fix the timer was set AFTER auth +
+    # voice check + idempotency reserve + queue submit ran, silently
+    # excluding 5-50 ms of preamble from the client-facing TTFB metric.
+    # `time.monotonic_ns` avoids wall-clock jumps tripping the
+    # gateway_first_byte_ms_nonneg CHECK constraint.
+    import time as _time
+    request_received_ns = _time.monotonic_ns()
+
     if len(body.text) > settings.max_chars_per_request:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
@@ -752,15 +761,18 @@ async def synthesize_stream(
     }
 
     # Faz C v1 item 1 — gateway-side TTFB measurement.
-    # Captured at the start of request handling; the streaming generator
-    # records the first-byte timestamp and a background task UPDATEs the
-    # usage row (worker writes the row first when its pipeline commits;
-    # gateway just stitches its own column in). request_received_ms
-    # uses time.monotonic_ns rather than wall clock so a system clock
-    # jump can't produce a negative delta and trip the CHECK constraint.
-    import time as _time
-    request_received_ns = _time.monotonic_ns()
+    # request_received_ns was captured at the TOP of the handler so the
+    # measurement INCLUDES auth + voice check + idempotency + queue
+    # submit (audit L3 H2). The instrumented wrapper records first-byte
+    # AT the wire, INCLUDING the WAV header for wav mode (audit L3 H3).
     gateway_first_byte_ms_holder: dict[str, int] = {}
+
+    def _stamp_first_byte_if_unset() -> None:
+        if "ms" not in gateway_first_byte_ms_holder:
+            elapsed_ns = _time.monotonic_ns() - request_received_ns
+            gateway_first_byte_ms_holder["ms"] = max(
+                0, elapsed_ns // 1_000_000,
+            )
 
     async def _yield_pcm():
         try:
@@ -779,20 +791,17 @@ async def synthesize_stream(
                     break
                 if chunk.final:
                     break
-                # First PCM chunk reaching the gateway — this is the
-                # moment immediately before the byte goes onto the wire.
-                if "ms" not in gateway_first_byte_ms_holder:
-                    elapsed_ns = _time.monotonic_ns() - request_received_ns
-                    gateway_first_byte_ms_holder["ms"] = max(0, elapsed_ns // 1_000_000)
                 yield chunk.pcm_bytes
         except ResultStreamTimeout:
             logger.warning("sync-stream proxy timed out for rid=%s", rid)
             return
 
     async def _yield_wav():
-        # RIFF "infinite size" header trick — same as worker.streaming
-        # did before the cutover; we reproduce it here so gateway
-        # doesn't import any worker module.
+        # RIFF "infinite size" header trick: gateway sends 44 bytes of
+        # header up front, then PCM streams. The WAV header IS the
+        # client's first byte over the wire, so it counts toward TTFB
+        # (audit L3 H3 — pre-fix the metric set only on first PCM,
+        # excluding the header, understating real TTFB in WAV mode).
         import struct
         header = b"RIFF" + struct.pack("<I", 0xFFFFFFFF) + b"WAVE"
         header += b"fmt " + struct.pack(
@@ -809,9 +818,17 @@ async def synthesize_stream(
         (success OR client disconnect). The worker writes the usage row
         when its pipeline commits; the gateway updates only the column
         it can measure. Failures are best-effort — observability MUST
-        NOT break the stream itself."""
+        NOT break the stream itself.
+
+        First-byte capture (audit L3 H3): stamp on the FIRST yield out
+        of `inner`, regardless of mode. In WAV mode that's the RIFF
+        header (44 bytes the client receives first); in PCM mode it's
+        the first audio chunk. Either way it's "what the wire sees
+        first" — matches HTTP TTFB semantics.
+        """
         try:
             async for buf in inner:
+                _stamp_first_byte_if_unset()
                 yield buf
         finally:
             first_byte_ms = gateway_first_byte_ms_holder.get("ms")

@@ -254,6 +254,33 @@
         {"refId": "p50", "expr": "histogram_quantile(0.50, sum by (le) (rate(nqai_tts_reference_resolve_seconds_bucket{tenant=~\"$tenant\",voice=~\"$voice\"}[5m])))", "legendFormat": "p50"},
         {"refId": "p95", "expr": "histogram_quantile(0.95, sum by (le) (rate(nqai_tts_reference_resolve_seconds_bucket{tenant=~\"$tenant\",voice=~\"$voice\"}[5m])))", "legendFormat": "p95"}
       ]
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "First PCM (engine TTFA only)",
+      "description": "Engine-internal latency: inference start → first SynthChunk yielded. Subtract from `first_audio_seconds` to isolate the bridge / publish overhead.",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 36},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "targets": [
+        {"refId": "p50", "expr": "histogram_quantile(0.50, sum by (le) (rate(nqai_tts_first_pcm_seconds_bucket{tenant=~\"$tenant\",voice=~\"$voice\"}[5m])))", "legendFormat": "p50"},
+        {"refId": "p95", "expr": "histogram_quantile(0.95, sum by (le) (rate(nqai_tts_first_pcm_seconds_bucket{tenant=~\"$tenant\",voice=~\"$voice\"}[5m])))", "legendFormat": "p95"}
+      ]
+    },
+    {
+      "id": 33,
+      "type": "timeseries",
+      "title": "Deprecated endpoint hits (rate / 1m)",
+      "description": "Sunset readiness — watch this trend to 0 before the published Sunset date. Non-zero close to sunset = migration comms didn't land.",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 36},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {"defaults": {"unit": "reqps"}},
+      "targets": [{
+        "refId": "A",
+        "expr": "sum by (endpoint) (rate(nqai_tts_deprecated_endpoint_total[1m]))",
+        "legendFormat": "{{endpoint}}"
+      }]
     }
   ]
 }

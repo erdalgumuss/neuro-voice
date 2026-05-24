@@ -98,9 +98,30 @@ async def _run_async() -> int:
         stop_event=stop,
         # Production-ish defaults — env override for ops tuning.
         block_ms=int(os.environ.get("NQAI_WORKER_BLOCK_MS", "5000")),
+        # Two distinct knobs (audit L2 H2 2026-05-25):
+        #   * `xautoclaim_min_idle_ms` — how long a PEL message must
+        #     sit idle before another worker claims it. Sets the
+        #     "another worker assumes you're dead" threshold.
+        #     env: NQAI_WORKER_XAUTOCLAIM_IDLE_S (default 30 s)
+        #   * `xautoclaim_period_s` — how often a healthy worker
+        #     proactively sweeps for stale PEL entries even while
+        #     busy. Sets the "look for orphan work" cadence.
+        #     env: NQAI_WORKER_XAUTOCLAIM_PERIOD_S (default 5 s)
+        # Pre-fix the single `NQAI_WORKER_XAUTOCLAIM_INTERVAL_S` env
+        # var bled into the idle threshold but operators read it as
+        # the sweep cadence — opposite semantics. We keep the OLD name
+        # as a back-compat alias for the idle threshold so any
+        # production env-file mid-flight doesn't suddenly change
+        # meaning.
         xautoclaim_min_idle_ms=int(
-            os.environ.get("NQAI_WORKER_XAUTOCLAIM_INTERVAL_S", "30")
+            os.environ.get(
+                "NQAI_WORKER_XAUTOCLAIM_IDLE_S",
+                os.environ.get("NQAI_WORKER_XAUTOCLAIM_INTERVAL_S", "30"),
+            )
         ) * 1000,
+        xautoclaim_period_s=float(
+            os.environ.get("NQAI_WORKER_XAUTOCLAIM_PERIOD_S", "5.0")
+        ),
     )
 
     logger.info(

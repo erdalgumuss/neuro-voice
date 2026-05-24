@@ -101,12 +101,42 @@ async def iter_engine_chunks(
     caller controls framing. For HTTP chunked streaming we publish
     one sentence-chunk per result-stream entry; for WebRTC we'd
     split into 20ms frames via `split_pcm16_frames` instead.
+
+    Cancellation semantics (audit L3 H1 2026-05-25)
+    -----------------------------------------------
+    `cancel_event` is BEST-EFFORT. The producer thread checks it
+    BETWEEN yields, not inside a single `model.generate(...)` call.
+    For VoxCPM2 that means a cancel signal during inference will be
+    observed only after the current sentence finishes (multi-second
+    latency on cold worker). The Python C-API doesn't expose a way
+    to kill a thread mid-torch-op; honouring cancellation strictly
+    would require either a fork-per-job worker model OR an engine
+    API that takes a cancel-token. Both are big refactors.
+
+    What we DO guarantee:
+    * `_put_safe` swallows RuntimeError from `call_soon_threadsafe`
+      when the consumer side has already torn down its loop, so the
+      thread leak is bounded to "current inference call" and does
+      not surface a noisy exception on shutdown.
+    * The finally block sets `cancel_event` so the NEXT sentence
+      iteration short-circuits — bounded leak.
+    * `asyncio.wait_for(producer_task, timeout=1.0)` does NOT kill
+      the thread; it stops AWAITING it. The thread will finish its
+      current torch call and exit naturally.
     """
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue[object | BaseException | None] = asyncio.Queue()
 
-    def _put(item: object | BaseException | None) -> None:
-        loop.call_soon_threadsafe(queue.put_nowait, item)
+    def _put_safe(item: object | BaseException | None) -> None:
+        """Resilient queue write from the producer thread.
+
+        If the consumer's loop has already closed (process shutdown,
+        cancel + tear-down race), `call_soon_threadsafe` raises
+        RuntimeError. Swallow it — the producer thread is about to
+        exit anyway and there is nothing useful we could do with the
+        chunk."""
+        with contextlib.suppress(RuntimeError):
+            loop.call_soon_threadsafe(queue.put_nowait, item)
 
     def _producer() -> None:
         try:
@@ -118,11 +148,11 @@ async def iter_engine_chunks(
             ):
                 if cancel_event is not None and cancel_event.is_set():
                     return
-                _put(chunk)
+                _put_safe(chunk)
         except BaseException as exc:
-            _put(exc)
+            _put_safe(exc)
         finally:
-            _put(None)
+            _put_safe(None)
 
     producer_task = asyncio.create_task(asyncio.to_thread(_producer))
     try:
