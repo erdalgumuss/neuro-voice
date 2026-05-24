@@ -354,7 +354,6 @@ async def enroll_voice(
     try:
         duration_seconds = trim_and_resample_to_wav(
             src_bytes=data,
-            src_suffix=suffix,
             dst_path=target,
             trim_seconds=settings.reference_trim_seconds,
             target_sr=settings.reference_sample_rate,
@@ -725,13 +724,18 @@ async def create_tts_job(
     try:
         await queue.submit(payload)
     except Exception as e:
-        # XADD failed after we reserved the idempotency row — mark it
-        # failed so the client doesn't spin polling forever.
-        await idem.fail(idempotency_key)
+        # XADD failed after we reserved the idempotency row. The worker
+        # never saw the job, so the reservation is bogus — DELETE the
+        # row so the client can cleanly retry with the *same*
+        # Idempotency-Key (audit F5 fix, 2026-05-24). Marking it
+        # `failed` instead would poison the key: the next reserve_or_get
+        # would hit a stale `failed` row, body_hash would match, and
+        # the client would get back a job that was never enqueued.
+        await idem.delete(idempotency_key)
         await session.commit()
         raise HTTPException(
             status.HTTP_502_BAD_GATEWAY,
-            detail="failed to enqueue job; retry with a new Idempotency-Key",
+            detail="failed to enqueue job; retry with the same Idempotency-Key",
         ) from e
 
     return TTSJobAccepted(
@@ -775,12 +779,16 @@ async def get_tts_job(
     }
 
     if row.status == "complete":
-        # Worker side stamped response_uri with the R2 location. Mint a
-        # signed URL (Faz B+ when R2 storage is bound; for now we just
-        # surface the URI itself).
+        # Worker side stamped `response_uri` with an `s3://...` location.
+        # The client must NEVER see the internal URI — mint a presigned
+        # GET URL via the R2 helper (audit F6 fix, 2026-05-24). Falls
+        # back to the raw URI only when R2 isn't configured (dev path
+        # using `file://` references, env not set); in that case the
+        # client is local and the URI is already openable.
         if row.response_uri:
+            audio_url = _maybe_presigned_url(row.response_uri)
             response["output"] = TTSJobOutput(
-                audio_url=row.response_uri,
+                audio_url=audio_url,
                 expires_at=_signed_url_expiry_iso(),
                 content_type="audio/wav",
             )
@@ -853,6 +861,28 @@ def _signed_url_expiry_iso() -> str:
     from datetime import datetime, timedelta, timezone
 
     return (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+
+
+def _maybe_presigned_url(response_uri: str) -> str:
+    """If `response_uri` is an S3/R2 URI and R2 storage is configured,
+    return a presigned GET URL (1h TTL). Otherwise return the URI
+    unchanged — local dev with `file://` references doesn't need
+    presigning, and we never want to leak `s3://` to the client
+    (audit F6 fix, 2026-05-24).
+    """
+    if not response_uri.startswith(("s3://", "r2://")):
+        return response_uri
+    try:
+        from storage.r2 import get_r2_storage
+
+        return get_r2_storage().presigned_get_url(response_uri, expires_in=3600)
+    except Exception:
+        # R2 env not set or transient client error — fall back to the
+        # raw URI rather than 500ing the status poll. Worker-emitted
+        # URIs in production paths will always have R2 configured.
+        logger.warning("presigned URL minting failed for %s; returning raw URI",
+                       response_uri)
+        return response_uri
 
 
 def run() -> None:

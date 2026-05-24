@@ -1,4 +1,16 @@
-"""Reference-audio normalization — trim + resample + write as mono WAV."""
+"""Reference-audio normalization — trim + resample + write as mono WAV.
+
+VoxCPM2 expects reference audio at **16 kHz mono**. This module is the
+single bottleneck where arbitrary user-uploaded audio (MP3, WAV, M4A,
+OGG, FLAC) gets normalized to that contract; downstream code never
+sees the original format.
+
+The `target_sr` default is intentionally 16000 — drift here causes
+silent reference-contract violation downstream (VoxCPM2 will either
+fail to clone the voice or produce off-pitch output). Audit 2026-05-24
+(F3) caught a 24000 default that diverged from VoxCPM2's expectation
+and from `NQAI_REF_SR` env (also 16000).
+"""
 
 from __future__ import annotations
 
@@ -13,16 +25,18 @@ import soundfile as sf
 def trim_and_resample_to_wav(
     *,
     src_bytes: bytes,
-    src_suffix: str,
     dst_path: Path,
     trim_seconds: float = 15.0,
-    target_sr: int = 24000,
+    target_sr: int = 16000,
 ) -> float:
-    """Decode arbitrary audio bytes → trim to N seconds → resample → write mono WAV.
+    """Decode arbitrary audio bytes → trim to N seconds → resample to
+    `target_sr` → write mono PCM-16 WAV. Returns actual duration written.
 
-    Returns the actual duration (seconds) written.
+    `src_bytes` may be any format librosa/audioread can decode (WAV/MP3/
+    M4A/OGG/FLAC). For exotic codecs ffmpeg must be on PATH or
+    `librosa.load` raises a clear error.
     """
-    audio, src_sr = librosa.load(io.BytesIO(src_bytes), sr=target_sr, mono=True)
+    audio, _src_sr = librosa.load(io.BytesIO(src_bytes), sr=target_sr, mono=True)
     if audio.size == 0:
         raise ValueError("decoded audio is empty")
 

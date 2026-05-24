@@ -372,3 +372,85 @@ async def test_reserve_or_get_different_body_raises_conflict():
         # The exception carries the original row so the HTTP layer can
         # echo created_at + status to help the client debug.
         assert exc_info.value.existing.request_hash == "original"
+
+
+async def test_reserve_or_get_race_loser_sees_conflict_not_integrityerror(
+    monkeypatch,
+):
+    """Audit F1 fix (2026-05-24): the loser of a reserve_or_get race
+    (PK collision on request_id, mismatched body) must surface
+    IdempotencyConflict to its caller — never a raw IntegrityError.
+
+    We simulate the race by forcing the upfront get() to return None
+    even though the row exists, which drives reserve() into the PK
+    uniqueness violation. The recovery branch must re-read, detect the
+    body mismatch, and raise IdempotencyConflict."""
+    tid, _ = await _bootstrap_two_tenants()
+
+    async with AsyncSessionLocal() as s_winner:
+        k = await ApiKeyRepo(s_winner).create(
+            tenant_id=tid, prefix="nqai_dev_llllllllllllll", secret_hash="x",
+        )
+        await s_winner.commit()
+        rid = uuid.uuid4()
+        await IdempotencyRepo(s_winner, tid).reserve(
+            request_id=rid, api_key_id=k.id, request_hash="winner-hash",
+        )
+        await s_winner.commit()
+
+    async with AsyncSessionLocal() as s_loser:
+        idr = IdempotencyRepo(s_loser, tid)
+        api_key_lookup = await ApiKeyRepo(s_loser).lookup_active_by_prefix(
+            "nqai_dev_llllllllllllll"
+        )
+        assert api_key_lookup is not None
+        loser_key = api_key_lookup[0]
+
+        # Force the upfront get() to lie ("row doesn't exist yet") so we
+        # exercise the IntegrityError → recovery path. The real-world
+        # race window comes from snapshot isolation between sessions.
+        original_get = idr.get
+        get_calls = {"n": 0}
+
+        async def lying_get(request_id):
+            get_calls["n"] += 1
+            if get_calls["n"] == 1:
+                return None  # simulate stale read on first attempt
+            return await original_get(request_id)
+
+        monkeypatch.setattr(idr, "get", lying_get)
+
+        with pytest.raises(IdempotencyConflict) as exc_info:
+            await idr.reserve_or_get(
+                request_id=rid, api_key_id=loser_key.id,
+                request_hash="loser-hash",
+            )
+        assert exc_info.value.existing.request_hash == "winner-hash"
+        assert get_calls["n"] >= 2, "recovery branch must re-read after IntegrityError"
+
+
+async def test_delete_removes_reserved_row_within_tenant():
+    """Audit F5: delete() lets the gateway undo a bogus reservation
+    after XADD failure so the client can retry the same key cleanly."""
+    tid, _ = await _bootstrap_two_tenants()
+    async with AsyncSessionLocal() as s:
+        kr = ApiKeyRepo(s)
+        k = await kr.create(tenant_id=tid, prefix="nqai_dev_mmmmmmmmmmmmmm",
+                            secret_hash="x")
+        await s.commit()
+        idr = IdempotencyRepo(s, tid)
+        rid = uuid.uuid4()
+        await idr.reserve(request_id=rid, api_key_id=k.id, request_hash="h")
+        await s.commit()
+        assert await idr.get(rid) is not None
+
+        removed = await idr.delete(rid)
+        await s.commit()
+        assert removed == 1
+        assert await idr.get(rid) is None
+        # Retry with the same key + same body succeeds (no poison row).
+        row, is_new = await idr.reserve_or_get(
+            request_id=rid, api_key_id=k.id, request_hash="h",
+        )
+        assert is_new is True
+        await s.commit()

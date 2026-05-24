@@ -36,7 +36,7 @@ from sqlalchemy.dialects.postgresql import INET, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import TypeDecorator
 
-from .base import Base, BigIntPk, TimestampMixin, new_uuid
+from .base import Base, BigIntPk, TimestampMixin, new_uuid, utcnow
 
 # --------------------------------------------------------------------------- #
 # Cross-dialect helpers
@@ -156,7 +156,7 @@ class Operator(Base):
         _StringArrayPortable, nullable=False, default=lambda: ["admin"]
     )
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=lambda: __import__("datetime").datetime.utcnow()
+        DateTime(timezone=True), nullable=False, default=utcnow,
     )
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     disabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -189,7 +189,7 @@ class ApiKey(Base):
     label: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False,
-        default=lambda: __import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+        default=utcnow,
     )
     created_by_operator_id: Mapped[uuid.UUID | None] = mapped_column(
         _UUIDPortable, ForeignKey("operators.id", ondelete="SET NULL"),
@@ -311,7 +311,7 @@ class UsageRecord(Base):
     id: Mapped[int] = mapped_column(BigIntPk, primary_key=True, autoincrement=True)
     occurred_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False,
-        default=lambda: __import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+        default=utcnow,
     )
     tenant_id: Mapped[uuid.UUID] = mapped_column(
         _UUIDPortable, ForeignKey("tenants.id"), nullable=False
@@ -358,7 +358,7 @@ class AuditLog(Base):
     id: Mapped[int] = mapped_column(BigIntPk, primary_key=True, autoincrement=True)
     occurred_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False,
-        default=lambda: __import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+        default=utcnow,
     )
     actor_type: Mapped[str] = mapped_column(Text, nullable=False)
     actor_id: Mapped[uuid.UUID | None] = mapped_column(_UUIDPortable)
@@ -409,7 +409,7 @@ class JobIdempotency(Base):
     status: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False,
-        default=lambda: __import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+        default=utcnow,
     )
     expires_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False,

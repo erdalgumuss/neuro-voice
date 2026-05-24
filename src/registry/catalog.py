@@ -192,7 +192,6 @@ class VoiceRegistry:
             ref_path = self.reference_dir / ref_filename
             duration_seconds = trim_and_resample_to_wav(
                 src_bytes=reference_audio_bytes,
-                src_suffix=suffix,
                 dst_path=ref_path,
                 trim_seconds=reference_trim_seconds,
                 target_sr=target_sample_rate,

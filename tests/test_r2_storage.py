@@ -136,6 +136,77 @@ def test_download_to_cache_preserves_suffix(r2, tmp_path):
     assert cached.suffix == ".mp3"
 
 
+def test_download_to_cache_concurrent_same_uri_no_part_orphan(r2, tmp_path):
+    """Audit F2 fix: two threads fetching the same URI must not corrupt
+    the cache file, and no `.part` orphan must survive past the calls."""
+    import threading
+
+    payload = b"x" * 4096
+    src = _write_local(tmp_path, "race.wav", payload)
+    uri = r2.upload_file(src, "voices/race.wav")
+
+    results: list[Path] = []
+    errors: list[BaseException] = []
+
+    def _worker() -> None:
+        try:
+            results.append(r2.download_to_cache(uri.uri))
+        except BaseException as e:  # pragma: no cover — fail-loud
+            errors.append(e)
+
+    threads = [threading.Thread(target=_worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, errors
+    assert len({str(p) for p in results}) == 1, "all threads must see same cache path"
+    cached = results[0]
+    assert cached.read_bytes() == payload, "cache content corrupted by race"
+
+    # No `.part` orphans should remain in the cache dir.
+    orphans = list(r2.cache_dir.glob("*.part"))
+    assert not orphans, f"stale .part files: {orphans}"
+
+
+def test_download_to_cache_part_filename_is_unique_per_writer(r2, tmp_path):
+    """Audit F2 fix: each writer must use a PID+UUID-suffixed `.part`
+    so a second writer can't smash the first writer's temp file. We
+    verify by spying on os.replace and asserting unique tmp paths."""
+    import os
+    import threading
+
+    src = _write_local(tmp_path, "u.wav", b"abc")
+    uri = r2.upload_file(src, "voices/u.wav")
+
+    seen_tmp_paths: list[str] = []
+    real_replace = os.replace
+    lock = threading.Lock()
+
+    def spy_replace(src_path, dst_path):
+        with lock:
+            seen_tmp_paths.append(str(src_path))
+        return real_replace(src_path, dst_path)
+
+    # Clear cache so each thread actually downloads.
+    for f in r2.cache_dir.iterdir():
+        f.unlink()
+
+    import storage.r2 as r2mod
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(r2mod.os, "replace", spy_replace)
+    try:
+        # First download — populates cache; one replace expected.
+        r2.download_to_cache(uri.uri)
+        assert len(seen_tmp_paths) == 1
+        assert ".part" in seen_tmp_paths[0]
+        # Suffix encodes PID and a uuid hex; verify both shape elements.
+        assert str(os.getpid()) in seen_tmp_paths[0]
+    finally:
+        monkey.undo()
+
+
 # --------------------------------------------------------------------------- #
 # presigned URLs
 # --------------------------------------------------------------------------- #

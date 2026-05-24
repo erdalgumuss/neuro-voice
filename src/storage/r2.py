@@ -22,6 +22,8 @@ import hashlib
 import logging
 import os
 import threading
+import uuid
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -98,6 +100,13 @@ class R2Storage:
         )
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._client_lock = threading.Lock()
+        # Per-URI download locks — prevents two threads in the same
+        # process from racing on the same cache key (audit F2 fix).
+        # The defaultdict-of-locks pattern is bounded by the active
+        # working set; reference-audio URIs reuse the same Lock object
+        # so consecutive `download_to_cache(same_uri)` calls coalesce.
+        self._download_locks_guard = threading.Lock()
+        self._download_locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
         if s3_client is not None:
             self._client = s3_client
             return
@@ -173,12 +182,27 @@ class R2Storage:
             raise
 
     def download_to_cache(self, uri: str) -> Path:
-        """Pull an object into local cache. Idempotent — second call is a
-        no-op if the cached file already exists.
+        """Pull an object into local cache. Idempotent + race-safe.
 
-        The cache key is derived from the URI so two different URIs never
-        collide. The caller hands the returned Path to whatever consumer
-        wants a local file (e.g. VoxCPM2.generate(reference_wav_path=...)).
+        Concurrency model (audit F2 fix, 2026-05-24):
+        ---------------------------------------------
+        Two failure modes the original implementation had:
+          1. Deterministic `.part` filename → two threads downloading
+             the same URI both wrote to `local.with_suffix(".part")`;
+             the second `tmp.replace(local)` would atomically swap a
+             half-written file in over the first thread's good file,
+             then `finally: tmp.unlink(missing_ok=True)` could delete
+             the good file (race window between replace and unlink).
+          2. No coordination → multiple workers wasted bandwidth
+             pulling the same object N times.
+
+        Fix: (a) PID+UUID-suffixed `.part` so no two writers ever share
+        a temp path; (b) per-URI threading.Lock so a second caller for
+        the same URI blocks on the first download and then short-circuits
+        on the cache hit. Cross-process races (multiple worker pods on a
+        shared NFS cache) are still possible but rare and recoverable —
+        `os.replace` is atomic on POSIX, and the cache key is
+        content-deterministic per URI.
         """
         parsed = S3URI.parse(uri)
         # Bucket + key uniquely identifies the cached file; we hash the
@@ -186,16 +210,36 @@ class R2Storage:
         digest = hashlib.sha256(uri.encode("utf-8")).hexdigest()[:32]
         suffix = Path(parsed.key).suffix or ".bin"
         local = self.cache_dir / f"{digest}{suffix}"
+
+        # Fast path — already cached.
         if local.is_file() and local.stat().st_size > 0:
             return local
-        tmp = local.with_suffix(local.suffix + ".part")
-        try:
-            self._client.download_file(
-                Bucket=parsed.bucket, Key=parsed.key, Filename=str(tmp)
+
+        # Coordinate concurrent downloads of the *same* URI.
+        with self._download_locks_guard:
+            uri_lock = self._download_locks[uri]
+        with uri_lock:
+            # Re-check after acquiring the lock: another thread may have
+            # finished the download while we waited.
+            if local.is_file() and local.stat().st_size > 0:
+                return local
+
+            # Each writer gets its own .part path so a second concurrent
+            # writer (different process, same URI) can't smash ours.
+            tmp = local.with_suffix(
+                f"{local.suffix}.{os.getpid()}.{uuid.uuid4().hex}.part"
             )
-            tmp.replace(local)
-        finally:
-            tmp.unlink(missing_ok=True)
+            try:
+                self._client.download_file(
+                    Bucket=parsed.bucket, Key=parsed.key, Filename=str(tmp)
+                )
+                # os.replace is atomic on POSIX. If another writer
+                # already produced `local`, we lose the race but ours
+                # is byte-equivalent — overwriting is safe.
+                os.replace(str(tmp), str(local))
+            except Exception:
+                tmp.unlink(missing_ok=True)
+                raise
         logger.info("r2 download cached bucket=%s key=%s → %s",
                     parsed.bucket, parsed.key, local)
         return local

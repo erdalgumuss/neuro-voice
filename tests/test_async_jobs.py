@@ -240,6 +240,49 @@ def test_same_idempotency_key_different_voice_returns_409(client):
     assert r2.status_code == 409
 
 
+def test_xadd_failure_does_not_poison_idempotency_key(client, monkeypatch):
+    """Audit F5 fix (2026-05-24): when XADD raises after the gateway
+    reserves an idempotency row, the row must be DELETED (not marked
+    failed). The client must be able to retry with the *same*
+    Idempotency-Key and succeed.
+
+    Previously the gateway called `idem.fail(rid)`, which left a stale
+    `failed` row; the next reserve_or_get found it, body_hash matched,
+    and the client got a permanently dead key."""
+    _enroll_voice(client)
+    rid = str(uuid.uuid4())
+
+    # Force the *next* XADD to fail at the queue layer.
+    fake_queue = client.fake_queue
+    original_submit = fake_queue.submit
+    fail_once = {"armed": True}
+
+    async def transient_failure(payload):
+        if fail_once["armed"]:
+            fail_once["armed"] = False
+            raise ConnectionError("simulated Redis outage")
+        return await original_submit(payload)
+
+    monkeypatch.setattr(fake_queue, "submit", transient_failure)
+
+    # First attempt — XADD raises → gateway returns 502 + cleans up.
+    r1 = _create_job(client, idempotency_key=rid)
+    assert r1.status_code == 502
+    assert "same Idempotency-Key" in r1.json()["detail"]
+
+    # Retry with the same key + same body — must succeed (no poison row).
+    r2 = _create_job(client, idempotency_key=rid)
+    assert r2.status_code == 202, r2.text
+    assert r2.json()["job_id"] == rid
+    assert r2.json()["deduplicated"] is False  # truly first successful reserve
+
+    # Queue depth = 1 (only the second attempt enqueued).
+    import asyncio
+    async def _xlen():
+        return int(await client.fake_redis.xlen("nqai.tts.jobs.test"))
+    assert asyncio.run(_xlen()) == 1
+
+
 # --------------------------------------------------------------------------- #
 # Validation
 # --------------------------------------------------------------------------- #
@@ -337,6 +380,101 @@ def test_status_after_worker_completion(client, setup):
     assert body["metrics"]["inference_ms"] == 900
     assert body["metrics"]["generated_audio_ms"] == 2000
     assert body["metrics"]["rtf"] == pytest.approx(0.45)
+
+
+def test_status_response_mints_presigned_url_when_r2_bound(
+    client, setup, monkeypatch,
+):
+    """Audit F6 fix (2026-05-24): when R2 storage is configured, the
+    job status response must mint a presigned GET URL — never leak the
+    internal `s3://...` URI to the client."""
+    _, tenant_id = setup
+    _enroll_voice(client)
+    rid_uuid = uuid.uuid4()
+    _create_job(client, idempotency_key=str(rid_uuid))
+
+    # Stamp the job complete with an s3:// uri.
+    import asyncio
+
+    from sqlalchemy import select
+
+    from db import AsyncSessionLocal
+    from db.models import ApiKey
+    from repos import IdempotencyRepo, UsageRepo
+
+    async def _finish():
+        async with AsyncSessionLocal() as s:
+            key_row = (
+                await s.execute(select(ApiKey).where(ApiKey.tenant_id == tenant_id))
+            ).scalar_one()
+            await IdempotencyRepo(s, tenant_id).complete(
+                rid_uuid, response_uri="s3://outputs/demo-01/xyz.wav",
+            )
+            await UsageRepo(s, tenant_id).record(
+                api_key_id=key_row.id, voice_id="demo-01",
+                request_id=rid_uuid, text_char_count=14, sentence_count=1,
+                duration_ms=2000, elapsed_ms=900, rtf=0.45, status="ok",
+            )
+            await s.commit()
+
+    asyncio.run(_finish())
+
+    # Stub _maybe_presigned_url so it returns a clean https:// URL.
+    import server.main as main_mod
+
+    captured: dict[str, str] = {}
+
+    def fake_presigner(uri: str) -> str:
+        captured["uri"] = uri
+        return "https://r2.example.com/outputs/xyz.wav?X-Amz-Signature=abc123"
+
+    monkeypatch.setattr(main_mod, "_maybe_presigned_url", fake_presigner)
+
+    r = client.get(f"/v1/tts/jobs/{rid_uuid}")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert captured["uri"] == "s3://outputs/demo-01/xyz.wav"
+    assert body["output"]["audio_url"].startswith("https://r2.example.com/")
+    assert "X-Amz-Signature" in body["output"]["audio_url"]
+
+
+def test_status_response_falls_back_to_raw_uri_when_r2_unconfigured(client, setup):
+    """The fallback path: in dev when R2 env is unset, the helper
+    returns the raw URI instead of 500ing the status poll."""
+    _, tenant_id = setup
+    _enroll_voice(client)
+    rid_uuid = uuid.uuid4()
+    _create_job(client, idempotency_key=str(rid_uuid))
+
+    import asyncio
+
+    from sqlalchemy import select
+
+    from db import AsyncSessionLocal
+    from db.models import ApiKey
+    from repos import IdempotencyRepo, UsageRepo
+
+    async def _finish():
+        async with AsyncSessionLocal() as s:
+            key_row = (
+                await s.execute(select(ApiKey).where(ApiKey.tenant_id == tenant_id))
+            ).scalar_one()
+            await IdempotencyRepo(s, tenant_id).complete(
+                rid_uuid, response_uri="s3://outputs/demo-01/fallback.wav",
+            )
+            await UsageRepo(s, tenant_id).record(
+                api_key_id=key_row.id, voice_id="demo-01",
+                request_id=rid_uuid, text_char_count=14, sentence_count=1,
+                duration_ms=2000, elapsed_ms=900, rtf=0.45, status="ok",
+            )
+            await s.commit()
+
+    asyncio.run(_finish())
+
+    # No R2 env set → presigned mint raises → fallback to raw URI.
+    r = client.get(f"/v1/tts/jobs/{rid_uuid}")
+    assert r.status_code == 200
+    assert r.json()["output"]["audio_url"] == "s3://outputs/demo-01/fallback.wav"
 
 
 def test_status_unknown_job_404(client):
