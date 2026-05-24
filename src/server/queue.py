@@ -113,11 +113,19 @@ class TtsResult:
     """
 
     request_id: str         # UUID string; matches TtsJobPayload.request_id
-    seq: int                # 0-indexed chunk number
+    seq: int                # 0-indexed chunk number within this attempt
     pcm_bytes: bytes        # int16 PCM at engine.sample_rate (48 kHz)
     sentence_text: str | None = None  # None for final/error chunks
     final: bool = False
     error: str | None = None
+    # `attempt` is the worker's retry epoch — Redis PEL `times_delivered`
+    # at pickup time. It travels on every chunk so the gateway dedupe
+    # can distinguish "duplicate seq within the SAME attempt" (drop)
+    # from "seq=0 again because XAUTOCLAIM handed the job to a new
+    # attempt that reset its own counter" (reset the dedupe set, accept).
+    # Audit L3 2026-05-25: the previous attempt-blind `seen_seq` would
+    # discard the retry's audio entirely.
+    attempt: int = 0
 
     def encode(self) -> dict[str, str]:
         """Render to Redis-friendly field/value pairs. All values are
@@ -126,6 +134,7 @@ class TtsResult:
         out: dict[str, str] = {
             "request_id": self.request_id,
             "seq": str(self.seq),
+            "attempt": str(self.attempt),
             "pcm_b64": base64.b64encode(self.pcm_bytes).decode("ascii"),
             "final": "true" if self.final else "false",
         }
@@ -150,6 +159,9 @@ class TtsResult:
 
         request_id = _get("request_id") or ""
         seq = int(_get("seq") or "0")
+        # Default attempt=0 keeps decode backward-compatible with chunks
+        # that never carried the field (pre-B3 wire format).
+        attempt = int(_get("attempt") or "0")
         pcm_b64 = _get("pcm_b64") or ""
         pcm_bytes = base64.b64decode(pcm_b64) if pcm_b64 else b""
         final = (_get("final") or "false") == "true"
@@ -158,6 +170,7 @@ class TtsResult:
         return cls(
             request_id=request_id,
             seq=seq,
+            attempt=attempt,
             pcm_bytes=pcm_bytes,
             sentence_text=sentence_text,
             final=final,

@@ -50,7 +50,13 @@ def upgrade() -> None:
     )
 
     # Drop + recreate the per-owner UNIQUE so its name is stable too.
-    op.drop_constraint("uq_voices_tenant_id", "voices", type_="unique")
+    # Migration 0001 created this as "uq_voices_tenant_voice" (line 146);
+    # the earlier "uq_voices_tenant_id" name was a copy-paste typo in
+    # this file that crashed `alembic upgrade head` on every fresh
+    # Postgres (audit L5 2026-05-25). Fixed in place because 0002 had
+    # never successfully applied to any database; tests use
+    # `create_all` which bypasses migrations.
+    op.drop_constraint("uq_voices_tenant_voice", "voices", type_="unique")
     op.create_unique_constraint(
         "uq_voices_owner_tenant_id_voice_id",
         "voices",
@@ -58,7 +64,9 @@ def upgrade() -> None:
     )
 
     # Replace the catalog index (tenant_id → owner_tenant_id).
-    op.drop_index("ix_voices_tenant_id", table_name="voices")
+    # Same typo class as the UNIQUE above: 0001 named it
+    # "ix_voices_tenant_active" (line 167).
+    op.drop_index("ix_voices_tenant_active", table_name="voices")
     op.create_index(
         "ix_voices_owner_tenant_id_active",
         "voices",
@@ -139,10 +147,14 @@ def upgrade() -> None:
         "usage_records",
         sa.Column("app_label", sa.Text(), nullable=True),
     )
+    # `usage_records` has no `created_at` column — the time column is
+    # `occurred_at` (0001:176, models.py:383). Original "created_at"
+    # here was a third migration-time-only bug that fresh Postgres
+    # rejected with `column "created_at" does not exist`.
     op.create_index(
-        "ix_usage_records_tenant_id_app_label_created_at",
+        "ix_usage_records_tenant_id_app_label_occurred_at",
         "usage_records",
-        ["tenant_id", "app_label", "created_at"],
+        ["tenant_id", "app_label", "occurred_at"],
         postgresql_using="btree",
     )
 

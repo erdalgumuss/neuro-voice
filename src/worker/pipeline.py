@@ -142,30 +142,34 @@ async def _xadd_result(
 async def publish_chunk(
     redis: Redis, rid: uuid.UUID, *,
     seq: int, pcm: bytes, sentence_text: str | None,
+    attempt: int = 0,
 ) -> None:
     await _xadd_result(
         redis,
         result_stream_name(rid),
         TtsResult(
             request_id=str(rid), seq=seq, pcm_bytes=pcm,
-            sentence_text=sentence_text, final=False,
+            sentence_text=sentence_text, final=False, attempt=attempt,
         ),
     )
 
 
-async def publish_final(redis: Redis, rid: uuid.UUID, *, seq: int) -> None:
+async def publish_final(
+    redis: Redis, rid: uuid.UUID, *, seq: int, attempt: int = 0,
+) -> None:
     await _xadd_result(
         redis,
         result_stream_name(rid),
         TtsResult(
             request_id=str(rid), seq=seq, pcm_bytes=b"",
-            sentence_text=None, final=True,
+            sentence_text=None, final=True, attempt=attempt,
         ),
     )
 
 
 async def publish_error(
     redis: Redis, rid: uuid.UUID, *, seq: int, message: str,
+    attempt: int = 0,
 ) -> None:
     await _xadd_result(
         redis,
@@ -173,6 +177,7 @@ async def publish_error(
         TtsResult(
             request_id=str(rid), seq=seq, pcm_bytes=b"",
             sentence_text=None, final=False, error=message,
+            attempt=attempt,
         ),
     )
 
@@ -194,6 +199,7 @@ async def mark_terminal_failure(
     worker_id: str | None = None,
     elapsed_ms: int = 0,
     session_factory: Callable[[], Any] = AsyncSessionLocal,
+    attempt: int = 0,
 ) -> None:
     """Publish the terminal error surface and persist failed state.
 
@@ -206,7 +212,9 @@ async def mark_terminal_failure(
     tenant_id = uuid.UUID(job.tenant_id)
     api_key_id = uuid.UUID(job.api_key_id)
 
-    await publish_error(redis, rid, seq=seq, message=message or error_code)
+    await publish_error(
+        redis, rid, seq=seq, message=message or error_code, attempt=attempt,
+    )
     async with session_factory() as s:
         await IdempotencyRepo(s, tenant_id).fail(rid)
         existing_usage = (await s.execute(
@@ -263,6 +271,7 @@ async def process_one_job(
     archive_to_r2: ArchiveCallable | None = None,
     worker_id: str | None = None,
     worker_pickup_ms: int | None = None,
+    attempt: int = 0,
 ) -> None:
     """Process a single TTS job end-to-end.
 
@@ -307,6 +316,7 @@ async def process_one_job(
             worker_id=worker_id,
             elapsed_ms=int((time.monotonic() - started) * 1000),
             session_factory=session_factory,
+            attempt=attempt,
         )
         raise PoisonJob(f"voice {job.voice_id!r} not visible to tenant")
     voice_view = voice_view_from_db(voice_row)
@@ -332,6 +342,7 @@ async def process_one_job(
             worker_id=worker_id,
             elapsed_ms=int((time.monotonic() - started) * 1000),
             session_factory=session_factory,
+            attempt=attempt,
         )
         raise PoisonJob(f"reference for {job.voice_id!r} missing") from e
 
@@ -372,6 +383,7 @@ async def process_one_job(
                 seq=seq,
                 pcm=chunk.pcm_int16,
                 sentence_text=getattr(chunk, "sentence_text", None),
+                attempt=attempt,
             )
             if first_audio_ms is None:
                 first_audio_ms = int(
@@ -406,6 +418,7 @@ async def process_one_job(
             worker_id=worker_id,
             elapsed_ms=int((time.monotonic() - started) * 1000),
             session_factory=session_factory,
+            attempt=attempt,
         )
         raise PoisonJob(
             "engine produced no PCM — nothing to archive or stream"
@@ -501,7 +514,7 @@ async def process_one_job(
     # (gateway's result-stream consumer dedups via per-request stream
     # name = the request_id) and a fresh final.
     try:
-        await publish_final(redis, rid, seq=seq)
+        await publish_final(redis, rid, seq=seq, attempt=attempt)
     except Exception as e:
         logger.exception("publish_final XADD failed for %s post-commit", rid)
         raise TransientFailure(f"publish_final_failed: {e}") from e

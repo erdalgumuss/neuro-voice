@@ -194,10 +194,20 @@ app = FastAPI(
     responses={401: {"model": ErrorResponse}, 404: {"model": ErrorResponse}},
 )
 
+if "*" in settings.cors_origins:
+    logger.warning(
+        "NQAI_CORS_ORIGINS contains '*' — admin cookie cross-origin "
+        "will NOT work (Starlette silently drops credentials with a "
+        "wildcard origin). Set NQAI_CORS_ORIGINS to an explicit "
+        "allow-list in production.",
+    )
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
-    allow_credentials=False,
+    # True (not False) — spec auth-multi-tenant.md §6 requires it so the
+    # admin SPA can carry the `nqai_admin_access` cookie cross-origin.
+    allow_credentials=True,
     allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=[
@@ -676,11 +686,12 @@ async def synthesize_stream(
         ) from e
 
     sample_rate = settings.target_sample_rate
+    # NO Deprecation / Sunset headers here — /v1/tts/stream is the
+    # canonical streaming surface (streaming-protocol.md:49). The
+    # earlier inclusion was a copy-paste from sync /v1/tts; clients
+    # honouring RFC 8594 would have been silently nudged off the
+    # primary endpoint (audit L1 2026-05-25).
     headers = {
-        # NOTE: /v1/tts/stream is the PRIMARY streaming endpoint — these
-        # deprecation headers shouldn't be here. Keep for one release to
-        # avoid breaking existing parsers; remove once clients confirm.
-        **_SYNC_DEPRECATION_HEADERS,
         "X-NQAI-Request-Id": str(rid),
         "X-NQAI-Sample-Rate": str(sample_rate),
         "X-NQAI-Voice-Id": db_voice.voice_id,

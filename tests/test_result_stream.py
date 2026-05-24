@@ -156,22 +156,81 @@ async def test_collect_pcm_concatenates_until_final():
     assert err is None
 
 
-async def test_collect_pcm_ignores_duplicate_seq():
-    """Retry visibility hardening: if a failed attempt emitted seq=0
-    and a retry emits seq=0 again, the sync buffer must not duplicate
-    the sentence."""
+async def test_collect_pcm_ignores_duplicate_seq_within_same_attempt():
+    """Within a single attempt, a duplicate seq is a re-XADD by the
+    worker (shouldn't happen but defence-in-depth) and must be dropped
+    so the sync buffer doesn't double the sentence."""
     from server.queue import TtsResult
     from server.result_stream import collect_pcm_until_final
 
     redis = fakeredis.aioredis.FakeRedis()
     rid = str(uuid.uuid4())
     await _publish_chunks(redis, rid, [
-        TtsResult(request_id=rid, seq=0, pcm_bytes=b"old"),
-        TtsResult(request_id=rid, seq=0, pcm_bytes=b"new"),
-        TtsResult(request_id=rid, seq=1, pcm_bytes=b"", final=True),
+        TtsResult(request_id=rid, seq=0, pcm_bytes=b"first", attempt=1),
+        TtsResult(request_id=rid, seq=0, pcm_bytes=b"dup", attempt=1),
+        TtsResult(request_id=rid, seq=1, pcm_bytes=b"", final=True, attempt=1),
     ])
     pcm, n, err = await collect_pcm_until_final(redis, rid, block_ms=10)
-    assert pcm == b"old"
+    assert pcm == b"first"
+    assert n == 1
+    assert err is None
+
+
+async def test_collect_pcm_accepts_retry_seq_after_attempt_advance():
+    """B3 fix (audit L3 2026-05-25): a worker retry resets seq=0 and
+    advances `attempt`. The retry's audio MUST reach the client — the
+    pre-fix behaviour treated retry as a duplicate and dropped it,
+    losing the audio entirely.
+
+    Scenario: attempt 1 publishes seq=0 then dies. Worker retry runs
+    with attempt 2, deletes the stream, republishes seq=0,1,final.
+    Gateway must reset dedupe on the attempt advance.
+    """
+    from server.queue import TtsResult
+    from server.result_stream import collect_pcm_until_final
+
+    redis = fakeredis.aioredis.FakeRedis()
+    rid = str(uuid.uuid4())
+    # Simulate the retry: attempt 1's stale chunk then attempt 2 from
+    # scratch (worker would have DELed before republishing in reality;
+    # the gateway dedupe must handle the case regardless).
+    await _publish_chunks(redis, rid, [
+        TtsResult(request_id=rid, seq=0, pcm_bytes=b"attempt1", attempt=1),
+        # Worker retry: attempt advances, seq resets.
+        TtsResult(request_id=rid, seq=0, pcm_bytes=b"attempt2-0", attempt=2),
+        TtsResult(request_id=rid, seq=1, pcm_bytes=b"attempt2-1", attempt=2),
+        TtsResult(
+            request_id=rid, seq=2, pcm_bytes=b"", final=True, attempt=2,
+        ),
+    ])
+    pcm, n, err = await collect_pcm_until_final(redis, rid, block_ms=10)
+    # The first attempt's audio is correctly superseded by the retry —
+    # only attempt 2's chunks reach the client.
+    assert pcm == b"attempt2-0attempt2-1"
+    assert n == 2
+    assert err is None
+
+
+async def test_consume_drops_stale_attempt_chunk():
+    """Inverse of the above: once the gateway has seen a chunk with
+    attempt=N, any straggler from attempt < N must be dropped (a
+    crashed worker may finish publishing its old attempt's chunks
+    AFTER the retry started)."""
+    from server.queue import TtsResult
+    from server.result_stream import collect_pcm_until_final
+
+    redis = fakeredis.aioredis.FakeRedis()
+    rid = str(uuid.uuid4())
+    await _publish_chunks(redis, rid, [
+        TtsResult(request_id=rid, seq=0, pcm_bytes=b"new", attempt=2),
+        # Late chunk from the dying attempt 1 — must be ignored.
+        TtsResult(request_id=rid, seq=1, pcm_bytes=b"stale", attempt=1),
+        TtsResult(
+            request_id=rid, seq=1, pcm_bytes=b"", final=True, attempt=2,
+        ),
+    ])
+    pcm, n, err = await collect_pcm_until_final(redis, rid, block_ms=10)
+    assert pcm == b"new"
     assert n == 1
     assert err is None
 

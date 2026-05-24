@@ -305,6 +305,21 @@ class WorkerConsumer:
                 0, int(time.time() * 1000) - int(job.enqueued_at_ms),
             )
 
+        # B3 fix (audit L3 2026-05-25): the retry epoch travels onto
+        # every TtsResult chunk so the gateway dedupe can distinguish
+        # "duplicate seq within the SAME attempt" (drop) from "seq=0
+        # again on a XAUTOCLAIM-handed-off retry that reset its own
+        # counter" (reset dedupe + accept). delivery_count from PEL is
+        # already the authoritative retry source — see _delivery_count
+        # at line 412.
+        try:
+            attempt = await self._delivery_count(entry_id)
+        except Exception:
+            logger.exception(
+                "delivery_count read failed; falling back to attempt=0",
+            )
+            attempt = 0
+
         try:
             await process_one_job(
                 job,
@@ -314,6 +329,7 @@ class WorkerConsumer:
                 archive_to_r2=self._archive_to_r2,
                 worker_id=self._consumer_name,
                 worker_pickup_ms=worker_pickup_ms,
+                attempt=attempt,
             )
         except PoisonJob:
             # No point retrying — voice missing, ref missing, etc.
@@ -429,6 +445,7 @@ class WorkerConsumer:
             error_code=reason,
             message=f"{reason}: {error}",
             worker_id=self._consumer_name,
+            attempt=delivery_count,
         )
         await self._send_job_to_dlq(
             entry_id=entry_id,

@@ -65,7 +65,18 @@ async def consume_result_stream(
     """
     stream = result_stream_name(request_id)
     last_id = "0"
-    deadline = asyncio.get_event_loop().time() + overall_timeout_s
+    # asyncio.get_running_loop() (not get_event_loop) — the latter is
+    # deprecated for use inside a running coroutine since 3.10 and will
+    # raise on 3.12 in threads without a current loop (audit L2 fix).
+    deadline = asyncio.get_running_loop().time() + overall_timeout_s
+    # `seen_seq` is scoped to the current attempt epoch. When the worker
+    # retries (XAUTOCLAIM hands the job to a fresh delivery), it deletes
+    # the stream and republishes from seq=0 with attempt=N+1. The gateway
+    # sees the attempt advance and resets dedupe so the retry's audio
+    # actually reaches the client — the pre-fix behaviour dropped
+    # everything as "duplicate seq" (audit L3 B3 2026-05-25, pinned wrong
+    # in tests/test_result_stream.py before the fix).
+    current_attempt = -1
     seen_seq: set[int] = set()
     cleaned_up = False
 
@@ -79,7 +90,7 @@ async def consume_result_stream(
 
     try:
         while True:
-            if asyncio.get_event_loop().time() > deadline:
+            if asyncio.get_running_loop().time() > deadline:
                 await _cleanup()
                 raise ResultStreamTimeout(
                     f"no final chunk on {stream} within {overall_timeout_s}s"
@@ -109,10 +120,34 @@ async def consume_result_stream(
                     )
                     chunk = TtsResult.decode(fields)
                     is_terminal = bool(chunk.error or chunk.final)
+                    if chunk.attempt > current_attempt:
+                        # Fresh worker attempt (XAUTOCLAIM retry, or
+                        # the first attempt of the lifetime — bootstrap
+                        # case where current_attempt starts at -1 and
+                        # the first chunk has attempt=0 or 1).
+                        if current_attempt >= 0:
+                            logger.info(
+                                "result stream attempt advanced stream=%s "
+                                "%s → %s — resetting dedupe",
+                                stream, current_attempt, chunk.attempt,
+                            )
+                        current_attempt = chunk.attempt
+                        seen_seq.clear()
+                    elif chunk.attempt < current_attempt:
+                        # Late chunk from a superseded attempt — drop;
+                        # only the latest attempt's audio reaches the
+                        # client.
+                        logger.info(
+                            "stale-attempt chunk dropped stream=%s "
+                            "attempt=%s current=%s seq=%s",
+                            stream, chunk.attempt, current_attempt, chunk.seq,
+                        )
+                        continue
                     if chunk.seq in seen_seq and not is_terminal:
                         logger.info(
-                            "duplicate result seq ignored stream=%s seq=%s",
-                            stream, chunk.seq,
+                            "duplicate result seq ignored stream=%s "
+                            "attempt=%s seq=%s",
+                            stream, chunk.attempt, chunk.seq,
                         )
                         continue
                     if not is_terminal:
@@ -137,12 +172,31 @@ async def collect_pcm_until_final(
 
     Sentence count = number of NON-final, NON-error chunks (i.e.
     actual audio chunks). Error chunks short-circuit with the message.
+
+    Attempt-aware reset: when `chunk.attempt` advances mid-stream (a
+    XAUTOCLAIM retry started after the previous attempt died), the
+    sync buffer DISCARDS what it had collected so far so the returned
+    WAV is only the latest attempt's audio. The streaming
+    (`/v1/tts/stream`) path can't take back already-yielded bytes; this
+    helper has full control until it returns one body to the client.
     """
     pcm_buffer = bytearray()
     sentences = 0
     error_msg: str | None = None
+    current_attempt = -1
 
     async for chunk in consume_result_stream(redis, request_id, **kwargs):
+        if chunk.attempt > current_attempt:
+            # Retry started — drop everything from the dead attempt.
+            if current_attempt >= 0:
+                logger.info(
+                    "sync drain reset on attempt advance %s → %s "
+                    "(dropping %d bytes from prior attempt)",
+                    current_attempt, chunk.attempt, len(pcm_buffer),
+                )
+            current_attempt = chunk.attempt
+            pcm_buffer.clear()
+            sentences = 0
         if chunk.error:
             error_msg = chunk.error
             break

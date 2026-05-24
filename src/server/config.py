@@ -71,8 +71,16 @@ class Settings:
     ))
     api_keys: list[str] = field(default_factory=lambda: _env_list("NQAI_API_KEYS", []))
     require_auth: bool = field(default_factory=lambda: _env_bool("NQAI_REQUIRE_AUTH", True))
+    # CORS allow-list. Default targets local dev (gateway + an SPA on
+    # 5173). Production deployments MUST set NQAI_CORS_ORIGINS to the
+    # actual admin SPA origin. Wildcard "*" is incompatible with
+    # `allow_credentials=True` (Starlette silently drops credentials)
+    # which would re-break the admin cookie flow we just fixed; if you
+    # need wildcard, accept that admin cookies won't work cross-origin.
     cors_origins: list[str] = field(default_factory=lambda: _env_list(
-        "NQAI_CORS_ORIGINS", ["*"]
+        "NQAI_CORS_ORIGINS",
+        ["http://localhost:8000", "http://127.0.0.1:8000",
+         "http://localhost:5173", "http://127.0.0.1:5173"],
     ))
     enroll_max_upload_mb: int = field(default_factory=lambda: int(
         os.environ.get("NQAI_ENROLL_MAX_MB", "20")
