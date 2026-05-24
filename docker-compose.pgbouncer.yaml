@@ -1,0 +1,66 @@
+# NQAI Voice — pgBouncer overlay for the dev stack.
+#
+# Compose this on TOP of docker-compose.dev.yaml when you want to
+# exercise the production-shape connection topology locally:
+#
+#     docker compose \
+#         -f docker-compose.dev.yaml \
+#         -f docker-compose.pgbouncer.yaml \
+#         up -d
+#
+# The gateway + worker get NQAI_DB_PGBOUNCER=true and a routed
+# DATABASE_URL pointing at the pgBouncer service (port 6432). The
+# application then disables asyncpg's prepared-statement cache and
+# uses a smaller SQLAlchemy pool because pgBouncer is the real pool.
+#
+# WHEN to layer this in:
+#   * 50+ concurrent client connections per Postgres host
+#   * Multiple gateway / worker replicas
+#   * Production deployment (always)
+#
+# WHEN to skip it:
+#   * Local single-process dev — direct Postgres is simpler.
+
+services:
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_USER: nqai
+      DB_PASSWORD: nqai
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: nqai_voice
+      POOL_MODE: transaction
+      DEFAULT_POOL_SIZE: "20"
+      RESERVE_POOL_SIZE: "5"
+      MAX_CLIENT_CONN: "200"
+      SERVER_IDLE_TIMEOUT: "600"
+      QUERY_WAIT_TIMEOUT: "20"
+      AUTH_TYPE: scram-sha-256
+    ports:
+      - "127.0.0.1:6432:6432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 6432 -U nqai"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  gateway:
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+    environment:
+      NQAI_DATABASE_URL: "postgresql+asyncpg://nqai:nqai@pgbouncer:6432/nqai_voice"
+      NQAI_DB_PGBOUNCER: "true"
+
+  worker:
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+    environment:
+      NQAI_DATABASE_URL: "postgresql+asyncpg://nqai:nqai@pgbouncer:6432/nqai_voice"
+      NQAI_DB_PGBOUNCER: "true"

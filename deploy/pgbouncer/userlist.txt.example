@@ -1,0 +1,16 @@
+; pgBouncer SCRAM-SHA-256 userlist (Faz C v1 item 4).
+;
+; Format: "user" "SCRAM-SHA-256$..."
+;
+; Generate the hash with:
+;
+;     psql -U postgres -tAc "SELECT rolpassword FROM pg_authid \
+;         WHERE rolname='nqai'"
+;
+; (Requires that Postgres has SCRAM-SHA-256 password storage enabled —
+; the default since PG 14.)
+;
+; In production, prefer `auth_query` against a minimal-privilege
+; meta-role over a static file; see pgbouncer.ini for the snippet.
+
+"nqai" "SCRAM-SHA-256$REPLACE_ME"

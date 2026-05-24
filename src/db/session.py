@@ -1,13 +1,39 @@
 """Async engine + sessionmaker + FastAPI dependency.
 
-In production we use asyncpg against PostgreSQL 16. For tests we boot an
-in-memory aiosqlite engine — fast (~10 ms init) and good enough for the
-ORM round-trip / repository contract tests. Integration tests that need
+In production we use asyncpg against PostgreSQL 16, optionally fronted
+by pgBouncer in transaction pooling mode (recommended at >50
+concurrent clients per Postgres host). For tests we boot an in-memory
+aiosqlite engine — fast (~10 ms init) and good enough for the ORM
+round-trip / repository contract tests. Integration tests that need
 real Postgres semantics (RLS, advisory locks, JSONB ops) use
 testcontainers and call `get_engine()` directly with a temp DSN.
 
-The connection pool is sized to `(workers × threads × 2) + 5` slack —
-see scale-roadmap.md D-07.
+Pool sizing (Faz C v1 item 4)
+=============================
+
+Two distinct knobs:
+
+1. **SQLAlchemy pool** (`NQAI_DB_POOL_SIZE` + `NQAI_DB_MAX_OVERFLOW`):
+   how many DB connections each *process* opens.
+2. **pgBouncer** (transaction pool mode): how many *server* connections
+   pgBouncer multiplexes those onto.
+
+When `NQAI_DB_PGBOUNCER=true`:
+   * SQLAlchemy pool stays small (default 5+5) — pgBouncer is the real
+     pool, the process-local pool is a thin handle.
+   * asyncpg's prepared-statement cache is disabled (`statement_cache_
+     size=0`). Prepared statements survive across asyncpg sessions but
+     pgBouncer txn-mode bounces server connections between client
+     transactions, so a cached statement may point at a server that
+     no longer has it. Disabling the cache is the textbook fix.
+   * Pre-ping stays ON so a server-side connection drop doesn't take
+     out the next request.
+
+Direct Postgres (`NQAI_DB_PGBOUNCER=false`, default):
+   * Bigger SQLAlchemy pool (10+10).
+   * Default asyncpg statement cache (better single-process latency).
+
+See docs/runbooks/database-pool.md for the connection-count math.
 """
 
 from __future__ import annotations
@@ -37,6 +63,51 @@ def _default_database_url() -> str:
     )
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.lower() in {"true", "1", "yes", "on"}
+
+
+def _pool_kwargs_for(url: str) -> dict:
+    """Build SQLAlchemy create_async_engine kwargs for a Postgres URL.
+
+    Two paths:
+    - direct Postgres: larger pool, default asyncpg statement cache.
+    - pgBouncer transaction mode: small pool, asyncpg statement cache
+      disabled (required because txn-mode bounces server connections
+      between client transactions, breaking the prepared-statement
+      cache contract).
+    """
+    pgbouncer = _env_bool("NQAI_DB_PGBOUNCER")
+    # Defaults tuned per mode; env vars override if operator knows better.
+    if pgbouncer:
+        pool_size = int(os.environ.get("NQAI_DB_POOL_SIZE", "5"))
+        max_overflow = int(os.environ.get("NQAI_DB_MAX_OVERFLOW", "5"))
+    else:
+        pool_size = int(os.environ.get("NQAI_DB_POOL_SIZE", "10"))
+        max_overflow = int(os.environ.get("NQAI_DB_MAX_OVERFLOW", "10"))
+
+    kwargs: dict = {
+        "pool_size": pool_size,
+        "max_overflow": max_overflow,
+        "pool_timeout": int(os.environ.get("NQAI_DB_POOL_TIMEOUT_S", "30")),
+        "pool_recycle": int(os.environ.get("NQAI_DB_POOL_RECYCLE_S", "1800")),
+        "pool_pre_ping": True,
+    }
+
+    if pgbouncer and "asyncpg" in url:
+        kwargs["connect_args"] = {
+            # asyncpg-level prepared-statement caching is incompatible
+            # with pgBouncer transaction pool mode. SQLAlchemy's own
+            # query compilation cache is independent and stays on.
+            "statement_cache_size": 0,
+            "prepared_statement_cache_size": 0,
+        }
+    return kwargs
+
+
 def get_engine(database_url: str | None = None) -> AsyncEngine:
     """Return the process-wide async engine, lazy-built."""
     global _engine, _sessionmaker
@@ -49,15 +120,9 @@ def get_engine(database_url: str | None = None) -> AsyncEngine:
                 "echo": os.environ.get("NQAI_DB_ECHO", "false").lower() == "true",
                 "future": True,
             }
-            # Sensible pool defaults — see D-07 in scale-roadmap.md
+            # Sensible pool defaults — see D-07 in scale-roadmap.md.
             if url.startswith("postgresql"):
-                kwargs.update(
-                    pool_size=int(os.environ.get("NQAI_DB_POOL_SIZE", "10")),
-                    max_overflow=int(os.environ.get("NQAI_DB_MAX_OVERFLOW", "10")),
-                    pool_timeout=30,
-                    pool_recycle=1800,
-                    pool_pre_ping=True,
-                )
+                kwargs.update(_pool_kwargs_for(url))
             _engine = create_async_engine(url, **kwargs)
             _sessionmaker = async_sessionmaker(
                 _engine, class_=AsyncSession, expire_on_commit=False
