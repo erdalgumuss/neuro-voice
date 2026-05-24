@@ -1,0 +1,3 @@
+audio,text,speaker_id,style,emotion,notes
+0001.wav,"Merhaba, bugün seninle küçük bir oyun oynayacağız.",neeko-proto-v0,warm,neutral,"minimum example"
+0002.wav,"Şimdi biraz sakinleşelim ve derin bir nefes alalım.",neeko-proto-v0,calm,soft,"optional columns may be left blank"

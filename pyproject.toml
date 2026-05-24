@@ -12,19 +12,52 @@ license = { text = "Proprietary" }
 authors = [{ name = "NeuroQubit / NQAI" }]
 
 dependencies = [
+    # HTTP framework + ASGI
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",
     "pydantic>=2.9",
-    "pyyaml>=6.0",
+    "pydantic-settings>=2.6",
     "python-multipart>=0.0.12",
+    "httpx>=0.27",
+    "websockets>=13",
+
+    # Database + ORM + migrations
+    "sqlalchemy[asyncio]>=2.0.36",
+    "asyncpg>=0.30",
+    "alembic>=1.13",
+
+    # Cache + queue
+    "redis>=5.2",
+
+    # Object storage
+    "boto3>=1.35",
+
+    # Crypto + auth
+    "argon2-cffi>=23.1",
+    "pyjwt[crypto]>=2.9",
+    "itsdangerous>=2.2",
+
+    # Templating (admin UI)
+    "jinja2>=3.1",
+
+    # Observability
+    "structlog>=24.4",
+
+    # Config
+    "pyyaml>=6.0",
+
+    # Audio (frontend / registry)
     "numpy>=1.26",
     "soundfile>=0.12",
     "librosa>=0.11",
+
+    # Model runtime (worker process; gateway doesn't need these but we keep
+    # them in the umbrella package while the split is fresh — Faz B'de
+    # ayrı `nqai-voice-worker` paketine taşınır)
     "torch>=2.5",
     "torchaudio>=2.5",
     "transformers>=4.46",
     "voxcpm>=0.5",
-    "httpx>=0.27",
 ]
 
 [project.optional-dependencies]
@@ -33,10 +66,14 @@ dev = [
     "pytest-asyncio>=0.24",
     "ruff>=0.7",
     "mypy>=1.13",
+    "testcontainers[postgres,redis]>=4.8",
+    "aiosqlite>=0.20",          # in-memory SQLite for fast unit tests
+    "fakeredis>=2.26",          # for rate-limit unit tests
 ]
 client = [
     "httpx>=0.27",
     "rich>=13.0",
+    "websockets>=13",
 ]
 
 [project.scripts]
