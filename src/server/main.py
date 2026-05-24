@@ -46,6 +46,7 @@ from audio.wav import pcm16_to_wav_bytes
 from db.session import AsyncSessionLocal, get_session
 from observability import (
     QUEUE_DEPTH,
+    TTS_DEPRECATED_ENDPOINT_TOTAL,
     TTS_GATEWAY_FIRST_BYTE_SECONDS,
     TTS_REQUESTS,
     WORKER_CAPACITY,
@@ -264,6 +265,12 @@ async def metrics(
         WORKER_CAPACITY.set(cap.total_capacity)
         WORKER_INFLIGHT.set(cap.total_inflight)
         QUEUE_DEPTH.labels(stream="jobs").set(await queue.depth())
+        # DLQ depth (audit L4 H1 2026-05-25): metric was declared with a
+        # `stream` enum of {jobs, dlq} but only `jobs` was being set,
+        # making a jammed DLQ invisible to the dashboard.
+        from server.queue import DEFAULT_DLQ_STREAM
+        dlq_len = int(await queue.redis.xlen(DEFAULT_DLQ_STREAM))
+        QUEUE_DEPTH.labels(stream="dlq").set(dlq_len)
     except Exception:
         # Don't fail the scrape on a Redis blip — Prometheus would alarm
         # on /metrics 500s. Stale gauges are tolerable for one cycle.
@@ -528,6 +535,16 @@ async def synthesize(
     + result-stream overhead vs. the in-process engine; everything
     above that is the worker's inference time.
     """
+    # Sunset readiness counter (audit L4 H1). Every hit on this
+    # deprecated surface bumps a dedicated counter so an operator can
+    # plot rate(...) over time and see when migration is "done"
+    # (counter trends to 0). Independent from TTS_REQUESTS to avoid
+    # double-counting success.
+    try:
+        TTS_DEPRECATED_ENDPOINT_TOTAL.labels(endpoint="/v1/tts").inc()
+    except Exception:
+        logger.exception("deprecated counter increment failed — ignoring")
+
     if len(body.text) > settings.max_chars_per_request:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
@@ -541,34 +558,58 @@ async def synthesize(
     redis = queue._redis  # use the same client the queue is bound to
     await _check_queue_depth_or_503(queue, session, ctx, voice_id=body.voice_id)
 
-    # Reserve idempotency upfront so a duplicate sync POST with the
-    # same X-Request-Id replays cleanly (same path as async jobs).
+    # Idempotency replay (audit L1 H1 2026-05-25):
+    # `reserve_or_get` gives the Stripe pattern — same X-Request-Id + same
+    # body returns the existing row, different body raises
+    # IdempotencyConflict → 409. Pre-fix the sync paths used bare
+    # `reserve()` which crashed with raw IntegrityError on duplicate
+    # X-Request-Id (raw 500 to the client). Async /v1/tts/jobs already
+    # used this pattern; sync paths now match.
     idem = IdempotencyRepo(session, ctx.tenant_id)
-    await idem.reserve(
-        request_id=rid, api_key_id=ctx.api_key_id,
-        request_hash=_hash_sync_body(body),
-    )
+    try:
+        _row, reserved_new = await idem.reserve_or_get(
+            request_id=rid, api_key_id=ctx.api_key_id,
+            request_hash=_hash_sync_body(body),
+        )
+    except IdempotencyConflict as e:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail="X-Request-Id reuse with different body",
+        ) from e
     await session.commit()
 
-    payload = TtsJobPayload(
-        request_id=str(rid),
-        tenant_id=str(ctx.tenant_id),
-        api_key_id=str(ctx.api_key_id),
-        voice_id=db_voice.voice_id,
-        text=body.text,
-        language=body.language,
-        audio_format=body.audio_format,
-        app_label=_app_label_from(request),
-        enqueued_at_ms=int(time() * 1000),
-    )
-    try:
-        await queue.submit(payload)
-    except Exception as e:
-        await idem.delete(rid)
-        await session.commit()
-        raise HTTPException(
-            status.HTTP_502_BAD_GATEWAY, detail="failed to enqueue sync job",
-        ) from e
+    if not reserved_new:
+        # Cached replay path: a previous attempt with the same
+        # X-Request-Id is in flight or already finished. We don't
+        # re-enqueue (would double-charge the worker) — instead we
+        # subscribe to the existing result stream. If the prior attempt
+        # is still processing the client gets its audio; if it finished
+        # the worker has already DELed the stream and this will timeout
+        # → 504 with a hint to poll /v1/tts/jobs/{id}. Acceptable
+        # because the contract documented for the sync path is
+        # "fire-and-block"; replay-after-completion is rare and the
+        # async job surface is the right place to fetch the artifact.
+        logger.info("sync /v1/tts replay for rid=%s (no re-enqueue)", rid)
+    else:
+        payload = TtsJobPayload(
+            request_id=str(rid),
+            tenant_id=str(ctx.tenant_id),
+            api_key_id=str(ctx.api_key_id),
+            voice_id=db_voice.voice_id,
+            text=body.text,
+            language=body.language,
+            audio_format=body.audio_format,
+            app_label=_app_label_from(request),
+            enqueued_at_ms=int(time() * 1000),
+        )
+        try:
+            await queue.submit(payload)
+        except Exception as e:
+            await idem.delete(rid)
+            await session.commit()
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY, detail="failed to enqueue sync job",
+            ) from e
 
     t0 = time()
     try:
@@ -658,32 +699,45 @@ async def synthesize_stream(
     redis = queue._redis
     await _check_queue_depth_or_503(queue, session, ctx, voice_id=body.voice_id)
 
+    # Same reserve_or_get pattern as sync /v1/tts (audit L1 H1).
     idem = IdempotencyRepo(session, ctx.tenant_id)
-    await idem.reserve(
-        request_id=rid, api_key_id=ctx.api_key_id,
-        request_hash=_hash_sync_body(body),
-    )
+    try:
+        _row, reserved_new = await idem.reserve_or_get(
+            request_id=rid, api_key_id=ctx.api_key_id,
+            request_hash=_hash_sync_body(body),
+        )
+    except IdempotencyConflict as e:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail="X-Request-Id reuse with different body",
+        ) from e
     await session.commit()
 
-    payload = TtsJobPayload(
-        request_id=str(rid),
-        tenant_id=str(ctx.tenant_id),
-        api_key_id=str(ctx.api_key_id),
-        voice_id=db_voice.voice_id,
-        text=body.text,
-        language=body.language,
-        audio_format=body.audio_format,
-        app_label=_app_label_from(request),
-        enqueued_at_ms=int(time() * 1000),
-    )
-    try:
-        await queue.submit(payload)
-    except Exception as e:
-        await idem.delete(rid)
-        await session.commit()
-        raise HTTPException(
-            status.HTTP_502_BAD_GATEWAY, detail="failed to enqueue sync job",
-        ) from e
+    if reserved_new:
+        payload = TtsJobPayload(
+            request_id=str(rid),
+            tenant_id=str(ctx.tenant_id),
+            api_key_id=str(ctx.api_key_id),
+            voice_id=db_voice.voice_id,
+            text=body.text,
+            language=body.language,
+            audio_format=body.audio_format,
+            app_label=_app_label_from(request),
+            enqueued_at_ms=int(time() * 1000),
+        )
+        try:
+            await queue.submit(payload)
+        except Exception as e:
+            await idem.delete(rid)
+            await session.commit()
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY,
+                detail="failed to enqueue sync job",
+            ) from e
+    else:
+        logger.info(
+            "sync /v1/tts/stream replay for rid=%s (no re-enqueue)", rid,
+        )
 
     sample_rate = settings.target_sample_rate
     # NO Deprecation / Sunset headers here — /v1/tts/stream is the

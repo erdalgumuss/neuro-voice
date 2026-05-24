@@ -74,13 +74,30 @@ TTS_REQUESTS: Counter = Counter(
     labelnames=("tenant", "voice", "status"),
     registry=REGISTRY,
 )
-"""``status`` enum: ``success`` | ``error`` | ``backpressure`` | ``deprecated`` | ``auth_failed``.
+"""``status`` enum: ``success`` | ``error`` | ``backpressure`` | ``auth_failed``.
+
+``deprecated`` is NOT a status value — sunset readiness lives on a
+dedicated counter (``TTS_DEPRECATED_ENDPOINT_TOTAL`` below) so it
+doesn't double-count with ``success`` for the same request.
 
 NOTE: ``app_label`` is intentionally NOT a Prometheus label — it's a
 user-controlled header (``X-NQAI-App``) and Prometheus cardinality must
 stay bounded. Per-app breakdowns live in ``usage_records.app_label`` in
 Postgres, queried via a SQL exporter / Grafana datasource. See audit
 2026-05-24."""
+
+
+TTS_DEPRECATED_ENDPOINT_TOTAL: Counter = Counter(
+    "nqai_tts_deprecated_endpoint_total",
+    "Hits on a deprecated endpoint (RFC 8594 sunset clients still "
+    "calling). Watch `rate(...[5m])` trend toward 0 before the "
+    "sunset date — non-zero close to sunset means the migration "
+    "comms didn't land.",
+    labelnames=("endpoint",),
+    registry=REGISTRY,
+)
+"""``endpoint`` enum is small + bounded: ``/v1/tts`` for now. New
+deprecated endpoints add a label value here when they enter sunset."""
 
 
 TTS_ERRORS: Counter = Counter(
@@ -272,6 +289,7 @@ __all__ = [
     "CONTENT_TYPE_LATEST",
     "QUEUE_DEPTH",
     "REGISTRY",
+    "TTS_DEPRECATED_ENDPOINT_TOTAL",
     "TTS_ERRORS",
     "TTS_FIRST_AUDIO_SECONDS",
     "TTS_FIRST_PCM_SECONDS",

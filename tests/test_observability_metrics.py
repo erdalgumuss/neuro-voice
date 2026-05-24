@@ -46,6 +46,10 @@ EXPECTED_METRICS: dict[str, dict[str, object]] = {
         "type": "counter",
         "labels": {"type"},
     },
+    "nqai_tts_deprecated_endpoint_total": {
+        "type": "counter",
+        "labels": {"endpoint"},
+    },
     "nqai_worker_dlq_total": {
         "type": "counter",
         "labels": set(),

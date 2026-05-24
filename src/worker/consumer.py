@@ -331,10 +331,29 @@ class WorkerConsumer:
                 worker_pickup_ms=worker_pickup_ms,
                 attempt=attempt,
             )
-        except PoisonJob:
+        except PoisonJob as e:
             # No point retrying — voice missing, ref missing, etc.
             # Pipeline already published an error chunk + idem.fail().
-            logger.warning("poison job rid=%s — XACK to drain", rid_str)
+            # Archive the poisoned job to the DLQ so an operator can
+            # find it for postmortem (audit L2 H1 2026-05-25 — pre-fix
+            # poison jobs were XACKed without any forensic trail).
+            logger.warning("poison job rid=%s — XACK to drain + DLQ", rid_str)
+            try:
+                await self._send_job_to_dlq(
+                    entry_id=entry_id,
+                    fields=fields,
+                    job=job,
+                    reason="poison",
+                    error=e,
+                    delivery_count=attempt,
+                )
+                self.dlqed += 1
+                _safe_metric(WORKER_DLQ)
+            except Exception:
+                logger.exception(
+                    "DLQ archive of poison rid=%s failed — XACKing anyway",
+                    rid_str,
+                )
             await self._ack(entry_id)
             self.poisoned += 1
             _safe_metric(TTS_ERRORS, type="poison")

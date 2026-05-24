@@ -384,11 +384,20 @@ class UsageRecord(Base):
         DateTime(timezone=True), nullable=False,
         default=utcnow,
     )
+    # FK ondelete=RESTRICT — usage records are financial history; a
+    # tenant or key with any usage cannot be hard-deleted. Operators
+    # soft-delete via Tenant.status='deleted' / ApiKey.revoked_at
+    # (audit L5 H3 2026-05-25 — making the policy explicit at the
+    # schema level rather than relying on the Postgres default).
     tenant_id: Mapped[uuid.UUID] = mapped_column(
-        _UUIDPortable, ForeignKey("tenants.id"), nullable=False
+        _UUIDPortable,
+        ForeignKey("tenants.id", ondelete="RESTRICT"),
+        nullable=False,
     )
     api_key_id: Mapped[uuid.UUID] = mapped_column(
-        _UUIDPortable, ForeignKey("api_keys.id"), nullable=False
+        _UUIDPortable,
+        ForeignKey("api_keys.id", ondelete="RESTRICT"),
+        nullable=False,
     )
     voice_id: Mapped[str] = mapped_column(Text, nullable=False)
     request_id: Mapped[uuid.UUID] = mapped_column(
@@ -487,8 +496,12 @@ class AuditLog(Base):
     actor_type: Mapped[str] = mapped_column(Text, nullable=False)
     actor_id: Mapped[uuid.UUID | None] = mapped_column(_UUIDPortable)
     actor_label: Mapped[str | None] = mapped_column(Text)
+    # ondelete=SET NULL — audit_log MUST survive tenant deletion (D-04
+    # append-only + forensic). Pre-fix the FK defaulted to RESTRICT,
+    # blocking any operator who tried to remove an orphaned tenant.
+    # Audit L5 H2 2026-05-25.
     tenant_id: Mapped[uuid.UUID | None] = mapped_column(
-        _UUIDPortable, ForeignKey("tenants.id")
+        _UUIDPortable, ForeignKey("tenants.id", ondelete="SET NULL"),
     )
     action: Mapped[str] = mapped_column(Text, nullable=False)
     result: Mapped[str] = mapped_column(Text, nullable=False)

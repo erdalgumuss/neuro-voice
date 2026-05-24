@@ -171,10 +171,21 @@ class IdempotencyRepo:
         await self.session.flush()
 
     async def purge_expired(self) -> int:
-        """Cron-callable cleanup. Returns count of rows removed."""
+        """Cron-callable cleanup, tenant-scoped (D-08).
+
+        Audit L5 H1 2026-05-25: pre-fix this method silently bypassed
+        the tenant_id filter that the repo constructor enforces — a
+        cross-tenant DELETE driven by any operator calling
+        `purge_expired()` on a tenant-scoped repo instance. The cleanup
+        cron should still run per tenant; if global-scope purge is
+        needed (e.g. for the operator UI's bulk maintenance), add a
+        separate maintenance helper that takes no tenant_id and is
+        explicitly documented as cross-tenant.
+        """
         result = await self.session.execute(
             delete(JobIdempotency).where(
-                JobIdempotency.expires_at < datetime.now(timezone.utc)
+                JobIdempotency.tenant_id == self.tenant_id,
+                JobIdempotency.expires_at < datetime.now(timezone.utc),
             )
         )
         await self.session.flush()

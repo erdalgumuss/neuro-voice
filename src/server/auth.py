@@ -30,6 +30,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import ApiKey, Tenant
 from db.session import get_session
+from observability import TTS_REQUESTS
 from repos import ApiKeyRepo, AuditRepo
 from server.config import settings
 from server.rate_limit import RateLimiter
@@ -37,6 +38,28 @@ from server.security import APIKeyFormatError, parse_api_key
 from server.security.passwords import SecretMismatchError, verify_secret
 
 GENERIC_AUTH_ERROR = "invalid or revoked api key"
+
+
+def _emit_auth_failed(tenant_slug: str = "unknown") -> None:
+    """Fire the SLO-denominator counter for an auth/rate-limit failure
+    (audit L4 H1 2026-05-25). Pre-fix `status=auth_failed` was declared
+    in the metric enum but nothing emitted it — alerts on auth-fail
+    spikes would have stayed silent.
+
+    `tenant` label stays `"unknown"` for failures BEFORE we identify
+    the tenant (steps 1-3 of the pipeline); we don't fabricate an
+    identity. `voice` is always "unknown" at auth time — the body
+    hasn't been parsed yet. Cardinality stays bounded: small enum +
+    legit tenant slugs.
+    """
+    import contextlib
+    # Metric emission MUST NOT break the auth path.
+    with contextlib.suppress(Exception):
+        TTS_REQUESTS.labels(
+            tenant=tenant_slug,
+            voice="unknown",
+            status="auth_failed",
+        ).inc()
 
 
 # --------------------------------------------------------------------------- #
@@ -132,6 +155,7 @@ async def authenticate_bearer(
     if not authorization or not authorization.lower().startswith("bearer "):
         await _audit_async(session, action="auth.fail", result="denied",
                            payload={"reason": "missing_bearer"}, request=request)
+        _emit_auth_failed()
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=GENERIC_AUTH_ERROR,
@@ -146,6 +170,7 @@ async def authenticate_bearer(
     except APIKeyFormatError as e:
         await _audit_async(session, action="auth.fail", result="denied",
                            payload={"reason": "bad_format"}, request=request)
+        _emit_auth_failed()
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=GENERIC_AUTH_ERROR,
@@ -159,6 +184,7 @@ async def authenticate_bearer(
         await _audit_async(session, action="auth.fail", result="denied",
                            actor_label=parsed.prefix,
                            payload={"reason": "unknown_prefix"}, request=request)
+        _emit_auth_failed()
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=GENERIC_AUTH_ERROR,
@@ -174,6 +200,7 @@ async def authenticate_bearer(
                            tenant_id=tenant.id, actor_id=key.id,
                            actor_label=key.prefix,
                            payload={"reason": "secret_mismatch"}, request=request)
+        _emit_auth_failed(tenant_slug=tenant.slug)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=GENERIC_AUTH_ERROR,
@@ -187,6 +214,7 @@ async def authenticate_bearer(
                            actor_label=key.prefix,
                            payload={"reason": "tenant_status_" + tenant.status},
                            request=request)
+        _emit_auth_failed(tenant_slug=tenant.slug)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=GENERIC_AUTH_ERROR,
@@ -202,6 +230,7 @@ async def authenticate_bearer(
                                actor_label=key.prefix,
                                payload={"reason": "insufficient_scope",
                                         "missing": missing}, request=request)
+            _emit_auth_failed(tenant_slug=tenant.slug)
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="insufficient scope",
@@ -220,6 +249,7 @@ async def authenticate_bearer(
                            actor_label=key.prefix,
                            payload={"limit": key.rate_limit_per_minute,
                                     "count": key_check.count}, request=request)
+        _emit_auth_failed(tenant_slug=tenant.slug)
         retry_s = max(1, key_check.retry_after_ms // 1000 + 1)
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -235,6 +265,7 @@ async def authenticate_bearer(
                            actor_label=key.prefix,
                            payload={"scope": "tenant", "limit": tenant_limit,
                                     "count": tenant_check.count}, request=request)
+        _emit_auth_failed(tenant_slug=tenant.slug)
         retry_s = max(1, tenant_check.retry_after_ms // 1000 + 1)
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
