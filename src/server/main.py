@@ -2,15 +2,29 @@
 
 Run with:
     uvicorn server.main:app --host 0.0.0.0 --port 8000
+
+Auth surface:
+    * Bearer API key (DB-backed argon2id) on /v1/* and /admin/warmup
+    * JWT cookie (operator) on /admin/*
+    * /health is unauthenticated (k8s liveness)
+
+Faz A.6 cutover (this revision): TTS endpoints switched off the legacy
+env-list auth and the filesystem voice catalog onto the DB-backed
+auth pipeline + VoiceRepo. The legacy registry module still ships for
+the migration script but is no longer the source of truth at request
+time.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import uuid
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Annotated
+from time import time
+from typing import Annotated, Any
 
 from fastapi import (
     Depends,
@@ -18,24 +32,37 @@ from fastapi import (
     File,
     Form,
     HTTPException,
+    Request,
     Response,
     UploadFile,
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from registry import Voice, VoiceAlreadyExists, VoiceNotFound, VoiceRegistry
-from registry.catalog import InvalidVoiceId
+from db.session import get_session
+from registry.audio_io import trim_and_resample_to_wav  # still used by enroll
+from registry.catalog import (
+    ALLOWED_AUDIO_SUFFIXES,
+    InvalidVoiceId,
+    validate_voice_id,
+)
+from repos import AuditRepo, UsageRepo, VoiceRepo
 
 from . import streaming
 from .admin import admin_router
-from .auth_legacy import require_api_key  # legacy gateway auth — Faz A.6 cutover removes
+from .auth import AuthContext, require_auth
 from .config import settings
 from .engine import (
     BaseSynthEngine,
     get_engine,
     pcm16_to_wav_bytes,
+)
+from .reference_resolver import (
+    ReferenceAudioMissing,
+    UnsupportedReferenceURI,
+    resolve_reference_uri,
 )
 from .schemas import (
     DeleteResponse,
@@ -54,17 +81,11 @@ logging.basicConfig(
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
 )
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
-_registry = VoiceRegistry(
-    voices_dir=settings.voices_dir,
-    reference_dir=settings.reference_audio_dir,
-)
+# Engine singleton — lazy load. The model itself stays per-process; multi-
+# replica horizontal scale waits on the Faz B worker split.
 _engine: BaseSynthEngine | None = None
-
-
-def get_registry() -> VoiceRegistry:
-    return _registry
 
 
 def get_engine_dep() -> BaseSynthEngine:
@@ -82,30 +103,96 @@ def get_engine_dep() -> BaseSynthEngine:
     return _engine
 
 
-def _voice_or_404(voice_id: str, reg: VoiceRegistry) -> Voice:
+# --------------------------------------------------------------------------- #
+# VoiceView — duck-typed shape the engine consumes
+# --------------------------------------------------------------------------- #
+# The engine accesses three attributes on a "voice": `voice_id`,
+# `engine_params`, and `adapter` (an optional mapping understood by
+# engine._lora_from_mapping). Both the legacy registry.Voice and the
+# DB-backed db.models.Voice satisfy this loosely, but they're shaped
+# differently — DB carries adapter_uri/_sha256/_type as separate columns
+# while the engine wants a single dict. VoiceView is the canonical
+# adapter the request path uses.
+@dataclass(frozen=True)
+class VoiceView:
+    voice_id: str
+    engine_params: dict[str, Any] = field(default_factory=dict)
+    adapter: dict[str, Any] | None = None
+
+
+def _voice_view_from_db(v) -> VoiceView:
+    """Project a db.models.Voice → engine-shaped VoiceView."""
+    adapter: dict[str, Any] | None = None
+    if v.adapter_uri:
+        adapter = {
+            "type": v.adapter_type or "lora",
+            "path": v.adapter_uri,
+        }
+    return VoiceView(
+        voice_id=v.voice_id,
+        engine_params=v.engine_params or {},
+        adapter=adapter,
+    )
+
+
+async def _load_voice_or_404(
+    voice_id: str, tenant_id: uuid.UUID, session: AsyncSession
+):
+    """Tenant-scoped lookup returning (db_voice, VoiceView, resolved_path).
+
+    Raises HTTPException(404/400). Resolved reference path is a local
+    file — Faz B's R2 fetcher plugs in here for s3:// URIs.
+    """
     try:
-        return reg.get(voice_id)
+        validate_voice_id(voice_id)
     except InvalidVoiceId as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
-    except VoiceNotFound as e:
+
+    repo = VoiceRepo(session, tenant_id)
+    voice = await repo.get(voice_id)
+    if voice is None:
+        # Existence leak prevention — same 404 whether the voice belongs to
+        # another tenant or doesn't exist at all.
         raise HTTPException(
             status.HTTP_404_NOT_FOUND, detail=f"voice '{voice_id}' not found"
+        )
+
+    try:
+        ref_path = resolve_reference_uri(voice.reference_uri)
+    except ReferenceAudioMissing as e:
+        # Reference uploaded but file gone — operator must re-upload.
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"reference audio for '{voice_id}' is missing on this node",
+        ) from e
+    except UnsupportedReferenceURI as e:
+        raise HTTPException(
+            status.HTTP_501_NOT_IMPLEMENTED, detail=str(e)
         ) from e
 
-
-def _reference_path(voice: Voice) -> Path:
-    return voice.reference_path(settings.reference_audio_dir)
+    return voice, _voice_view_from_db(voice), ref_path
 
 
+# --------------------------------------------------------------------------- #
+# FastAPI app
+# --------------------------------------------------------------------------- #
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    logger.info("nqai-voice server starting (model=%s device=%s)", settings.model_id, settings.device)
-    logger.info("voices_dir=%s", settings.voices_dir)
-    logger.info("reference_dir=%s", settings.reference_audio_dir)
-    n = len(_registry.list_voices())
-    logger.info("loaded %d voice(s) from catalog", n)
+async def lifespan(_app: FastAPI):
+    logger.info(
+        "nqai-voice gateway %s starting (model=%s device=%s)",
+        VERSION,
+        settings.model_id,
+        settings.device,
+    )
+    logger.info(
+        "reference_dir=%s tenant_rate_limit/min=%d",
+        settings.reference_audio_dir,
+        settings.tenant_rate_limit_per_minute,
+    )
     yield
-    logger.info("nqai-voice server shutting down")
+    # In-flight drain is a Faz A.6+ item (lifespan shutdown hook). For now
+    # we just log so the K8s eviction trail is visible.
+    logger.info("nqai-voice gateway shutting down")
 
 
 app = FastAPI(
@@ -127,14 +214,24 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["*"],
-    expose_headers=["X-NQAI-Sample-Rate", "X-NQAI-Voice-Id", "X-NQAI-Sentences"],
+    expose_headers=[
+        "X-NQAI-Sample-Rate",
+        "X-NQAI-Voice-Id",
+        "X-NQAI-Sentences",
+        "X-NQAI-Duration-Seconds",
+        "X-NQAI-Elapsed-Seconds",
+        "X-NQAI-RTF",
+        "X-NQAI-Request-Id",
+    ],
 )
 
-# Admin (JWT-protected, DB-backed) — separate auth surface from the
-# legacy TTS endpoints. Lives under /admin.
+# Admin (JWT-protected, DB-backed) lives under /admin
 app.include_router(admin_router)
 
 
+# --------------------------------------------------------------------------- #
+# /health — unauthenticated liveness
+# --------------------------------------------------------------------------- #
 @app.get("/health", response_model=HealthResponse, tags=["meta"])
 async def health() -> HealthResponse:
     eng = get_engine_dep()
@@ -145,42 +242,65 @@ async def health() -> HealthResponse:
         device=getattr(eng, "_device", settings.device),
         sample_rate=getattr(eng, "sample_rate", 0),
         loaded=loaded,
-        voice_count=len(_registry.list_voices()),
+        voice_count=0,  # Faz B'de DB-aggregate; gateway voice-count'a karar vermez
         version=VERSION,
     )
 
 
+# --------------------------------------------------------------------------- #
+# /admin/warmup — admin-scoped (uses Bearer API key with admin:read scope)
+# --------------------------------------------------------------------------- #
 @app.post("/admin/warmup", tags=["meta"])
 async def warmup(
-    _: Annotated[str, Depends(require_api_key)],
+    _ctx: Annotated[AuthContext, Depends(require_auth("admin:read"))],
     eng: Annotated[BaseSynthEngine, Depends(get_engine_dep)],
 ) -> dict:
     eng.warmup()
     return {"loaded": True, "sample_rate": eng.sample_rate}
 
 
+# --------------------------------------------------------------------------- #
+# Voice catalog (tenant-scoped, DB-backed)
+# --------------------------------------------------------------------------- #
+def _voice_to_public(v) -> VoicePublic:
+    return VoicePublic(
+        voice_id=v.voice_id,
+        display_name=v.display_name,
+        language=v.language,
+        gender=v.gender,
+        style_tags=list(v.style_tags or []),
+        reference_seconds=v.reference_seconds,
+        source=v.source,
+        license=v.license,
+        created_at=v.created_at.isoformat(),
+        created_by=str(v.created_by_key_id) if v.created_by_key_id else "system",
+    )
+
+
 @app.get("/v1/voices", response_model=VoiceListResponse, tags=["voices"])
 async def list_voices(
-    _: Annotated[str, Depends(require_api_key)],
-    reg: Annotated[VoiceRegistry, Depends(get_registry)],
+    ctx: Annotated[AuthContext, Depends(require_auth("voice:read"))],
+    session: Annotated[AsyncSession, Depends(get_session)],
 ) -> VoiceListResponse:
-    voices = [VoicePublic(**v.to_public()) for v in reg.list_voices()]
+    repo = VoiceRepo(session, ctx.tenant_id)
+    voices = [_voice_to_public(v) for v in await repo.list()]
     return VoiceListResponse(voices=voices, count=len(voices))
 
 
 @app.get("/v1/voices/{voice_id}", response_model=VoicePublic, tags=["voices"])
 async def get_voice(
     voice_id: str,
-    _: Annotated[str, Depends(require_api_key)],
-    reg: Annotated[VoiceRegistry, Depends(get_registry)],
+    ctx: Annotated[AuthContext, Depends(require_auth("voice:read"))],
+    session: Annotated[AsyncSession, Depends(get_session)],
 ) -> VoicePublic:
-    return VoicePublic(**_voice_or_404(voice_id, reg).to_public())
+    db_voice, _view, _path = await _load_voice_or_404(voice_id, ctx.tenant_id, session)
+    return _voice_to_public(db_voice)
 
 
 @app.post("/v1/voices", response_model=EnrollResponse, tags=["voices"])
 async def enroll_voice(
-    api_key: Annotated[str, Depends(require_api_key)],
-    reg: Annotated[VoiceRegistry, Depends(get_registry)],
+    ctx: Annotated[AuthContext, Depends(require_auth("voice:write"))],
+    session: Annotated[AsyncSession, Depends(get_session)],
     voice_id: Annotated[str, Form(min_length=3, max_length=64)],
     display_name: Annotated[str, Form(min_length=1, max_length=120)],
     reference_audio: Annotated[UploadFile, File()],
@@ -188,8 +308,13 @@ async def enroll_voice(
     gender: Annotated[str, Form()] = "neutral",
     style_tags: Annotated[str, Form()] = "",
     source: Annotated[str, Form()] = "user-enroll",
-    license: Annotated[str, Form()] = "user-owned",
+    license: Annotated[str, Form()] = "user-owned",  # noqa: A002 — DB column name
 ) -> EnrollResponse:
+    try:
+        validate_voice_id(voice_id)
+    except InvalidVoiceId as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+
     data = await reference_audio.read()
     max_bytes = settings.enroll_max_upload_mb * 1024 * 1024
     if len(data) > max_bytes:
@@ -202,57 +327,161 @@ async def enroll_voice(
             status.HTTP_400_BAD_REQUEST, detail="reference audio too small (<1 KB)"
         )
 
-    suffix = Path(reference_audio.filename or "ref.wav").suffix.lower() or ".wav"
-    tags = [t.strip() for t in style_tags.split(",") if t.strip()]
-
-    try:
-        voice = reg.enroll(
-            voice_id=voice_id,
-            display_name=display_name,
-            reference_audio_bytes=data,
-            reference_audio_suffix=suffix,
-            language=language,
-            gender=gender,
-            style_tags=tags,
-            source=source,
-            license=license,
-            created_by=api_key,
-            reference_trim_seconds=settings.reference_trim_seconds,
-            # VoxCPM2 wants 16 kHz mono reference; output is 48 kHz.
-            target_sample_rate=settings.reference_sample_rate,
+    suffix = (Path(reference_audio.filename or "ref.wav").suffix.lower() or ".wav")
+    if suffix not in ALLOWED_AUDIO_SUFFIXES:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail=f"audio suffix '{suffix}' not allowed; use {sorted(ALLOWED_AUDIO_SUFFIXES)}",
         )
-    except InvalidVoiceId as e:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
-    except VoiceAlreadyExists as e:
-        raise HTTPException(status.HTTP_409_CONFLICT, detail=f"voice '{e}' already exists") from e
+
+    # Land the trimmed WAV on local disk under data/reference-audio/<tenant>/<voice>.wav
+    # for now. Faz B's R2 helper will replace this with bucket upload + s3:// URI.
+    tenant_dir = settings.reference_audio_dir / "tenants" / str(ctx.tenant_id)
+    tenant_dir.mkdir(parents=True, exist_ok=True)
+    target = tenant_dir / f"{voice_id}.wav"
+    try:
+        duration_seconds = trim_and_resample_to_wav(
+            src_bytes=data,
+            src_suffix=suffix,
+            dst_path=target,
+            trim_seconds=settings.reference_trim_seconds,
+            target_sr=settings.reference_sample_rate,
+        )
     except ValueError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
 
-    return EnrollResponse(voice=VoicePublic(**voice.to_public()))
+    import hashlib
+
+    sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
+
+    repo = VoiceRepo(session, ctx.tenant_id)
+    if await repo.get(voice_id) is not None:
+        target.unlink(missing_ok=True)
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail=f"voice '{voice_id}' already exists for tenant",
+        )
+
+    tags = [t.strip() for t in style_tags.split(",") if t.strip()]
+    voice = await repo.create(
+        voice_id=voice_id,
+        display_name=display_name,
+        reference_uri=f"file://{target}",
+        reference_sha256=sha256,
+        reference_seconds=duration_seconds,
+        reference_sample_rate=settings.reference_sample_rate,
+        language=language,
+        gender=gender,
+        style_tags=tags,
+        source=source,
+        license=license,
+        created_by_key_id=ctx.api_key_id,
+    )
+    await AuditRepo(session).record(
+        actor_type="api_key",
+        actor_id=ctx.api_key_id,
+        actor_label=ctx.api_key.prefix,
+        action="voice.create",
+        result="success",
+        tenant_id=ctx.tenant_id,
+        target_type="voice",
+        target_id=str(voice.id),
+        payload={"voice_id": voice_id, "reference_sha256": sha256},
+    )
+    await session.commit()
+    return EnrollResponse(voice=_voice_to_public(voice))
 
 
 @app.delete("/v1/voices/{voice_id}", response_model=DeleteResponse, tags=["voices"])
 async def delete_voice(
     voice_id: str,
-    _: Annotated[str, Depends(require_api_key)],
-    reg: Annotated[VoiceRegistry, Depends(get_registry)],
+    ctx: Annotated[AuthContext, Depends(require_auth("voice:write"))],
+    session: Annotated[AsyncSession, Depends(get_session)],
 ) -> DeleteResponse:
     try:
-        reg.delete(voice_id)
+        validate_voice_id(voice_id)
     except InvalidVoiceId as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
-    except VoiceNotFound as e:
+
+    repo = VoiceRepo(session, ctx.tenant_id)
+    deleted = await repo.soft_delete(voice_id)
+    if deleted is None:
         raise HTTPException(
             status.HTTP_404_NOT_FOUND, detail=f"voice '{voice_id}' not found"
-        ) from e
+        )
+    await AuditRepo(session).record(
+        actor_type="api_key",
+        actor_id=ctx.api_key_id,
+        actor_label=ctx.api_key.prefix,
+        action="voice.delete",
+        result="success",
+        tenant_id=ctx.tenant_id,
+        target_type="voice",
+        target_id=str(deleted.id),
+    )
+    await session.commit()
     return DeleteResponse(voice_id=voice_id)
+
+
+# --------------------------------------------------------------------------- #
+# Synthesis
+# --------------------------------------------------------------------------- #
+def _request_id_for(request: Request) -> uuid.UUID:
+    """Take an X-Request-Id from the client or mint one. Stripe-style
+    idempotency anchoring (D-01); the value is also exposed in the
+    response header for client correlation."""
+    header = request.headers.get("X-Request-Id")
+    if header:
+        try:
+            return uuid.UUID(header)
+        except ValueError:
+            pass
+    return uuid.uuid4()
+
+
+async def _record_usage(
+    session: AsyncSession,
+    *,
+    ctx: AuthContext,
+    voice_id: str,
+    request_id: uuid.UUID,
+    text_char_count: int,
+    sentence_count: int,
+    duration_ms: int,
+    elapsed_ms: int,
+    ttfb_ms: int | None,
+    rtf: float | None,
+    status_str: str,
+    error_code: str | None = None,
+) -> None:
+    try:
+        await UsageRepo(session, ctx.tenant_id).record(
+            api_key_id=ctx.api_key_id,
+            voice_id=voice_id,
+            request_id=request_id,
+            text_char_count=text_char_count,
+            sentence_count=sentence_count,
+            duration_ms=duration_ms,
+            elapsed_ms=elapsed_ms,
+            ttfb_ms=ttfb_ms,
+            rtf=rtf,
+            status=status_str,
+            error_code=error_code,
+            model_version=settings.model_id,
+        )
+        await session.commit()
+    except Exception:
+        # Usage logging is non-critical-path; structured log lands when
+        # Faz C structlog ships. Swallow but roll back to keep session sane.
+        await session.rollback()
 
 
 @app.post("/v1/tts", tags=["synthesis"])
 async def synthesize(
     body: TTSRequest,
-    _: Annotated[str, Depends(require_api_key)],
-    reg: Annotated[VoiceRegistry, Depends(get_registry)],
+    request: Request,
+    ctx: Annotated[AuthContext, Depends(require_auth("tts:write"))],
+    session: Annotated[AsyncSession, Depends(get_session)],
     eng: Annotated[BaseSynthEngine, Depends(get_engine_dep)],
 ) -> Response:
     if len(body.text) > settings.max_chars_per_request:
@@ -260,21 +489,43 @@ async def synthesize(
             status.HTTP_400_BAD_REQUEST,
             detail=f"text exceeds max_chars={settings.max_chars_per_request}",
         )
-    voice = _voice_or_404(body.voice_id, reg)
-    reference_path = _reference_path(voice)
+    db_voice, view, ref_path = await _load_voice_or_404(
+        body.voice_id, ctx.tenant_id, session
+    )
+    rid = _request_id_for(request)
+    t0 = time()
     result = eng.synthesize(
         text=body.text,
-        voice=voice,
-        reference_path=reference_path,
+        voice=view,
+        reference_path=ref_path,
         language_id=body.language,
     )
+    elapsed_ms = int((time() - t0) * 1000)
+    duration_ms = int(result.duration_seconds * 1000)
+    rtf = (result.elapsed_seconds / result.duration_seconds) if result.duration_seconds else None
+
+    await _record_usage(
+        session,
+        ctx=ctx,
+        voice_id=view.voice_id,
+        request_id=rid,
+        text_char_count=len(body.text),
+        sentence_count=result.sentence_count,
+        duration_ms=duration_ms,
+        elapsed_ms=elapsed_ms,
+        ttfb_ms=None,
+        rtf=rtf,
+        status_str="ok",
+    )
+
     headers = {
+        "X-NQAI-Request-Id": str(rid),
         "X-NQAI-Sample-Rate": str(result.sample_rate),
-        "X-NQAI-Voice-Id": voice.voice_id,
+        "X-NQAI-Voice-Id": view.voice_id,
         "X-NQAI-Sentences": str(result.sentence_count),
         "X-NQAI-Duration-Seconds": f"{result.duration_seconds:.3f}",
         "X-NQAI-Elapsed-Seconds": f"{result.elapsed_seconds:.3f}",
-        "X-NQAI-RTF": f"{result.elapsed_seconds / result.duration_seconds:.3f}" if result.duration_seconds else "inf",
+        "X-NQAI-RTF": f"{rtf:.3f}" if rtf is not None else "inf",
     }
     if body.audio_format == "pcm16":
         return Response(
@@ -289,8 +540,9 @@ async def synthesize(
 @app.post("/v1/tts/stream", tags=["synthesis"])
 async def synthesize_stream(
     body: TTSStreamRequest,
-    _: Annotated[str, Depends(require_api_key)],
-    reg: Annotated[VoiceRegistry, Depends(get_registry)],
+    request: Request,
+    ctx: Annotated[AuthContext, Depends(require_auth("tts:write"))],
+    session: Annotated[AsyncSession, Depends(get_session)],
     eng: Annotated[BaseSynthEngine, Depends(get_engine_dep)],
 ) -> StreamingResponse:
     if len(body.text) > settings.max_chars_per_request:
@@ -298,19 +550,22 @@ async def synthesize_stream(
             status.HTTP_400_BAD_REQUEST,
             detail=f"text exceeds max_chars={settings.max_chars_per_request}",
         )
-    voice = _voice_or_404(body.voice_id, reg)
-    reference_path = _reference_path(voice)
+    _db_voice, view, ref_path = await _load_voice_or_404(
+        body.voice_id, ctx.tenant_id, session
+    )
+    rid = _request_id_for(request)
     headers = {
+        "X-NQAI-Request-Id": str(rid),
         "X-NQAI-Sample-Rate": str(eng.sample_rate),
-        "X-NQAI-Voice-Id": voice.voice_id,
+        "X-NQAI-Voice-Id": view.voice_id,
     }
     if body.audio_format == "pcm16":
         return StreamingResponse(
             streaming.stream_pcm16(
                 eng,
                 text=body.text,
-                voice=voice,
-                reference_path=reference_path,
+                voice=view,
+                reference_path=ref_path,
                 language_id=body.language,
             ),
             media_type="application/octet-stream",
@@ -320,8 +575,8 @@ async def synthesize_stream(
         streaming.stream_wav(
             eng,
             text=body.text,
-            voice=voice,
-            reference_path=reference_path,
+            voice=view,
+            reference_path=ref_path,
             language_id=body.language,
         ),
         media_type="audio/wav",

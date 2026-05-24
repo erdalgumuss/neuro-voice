@@ -1,24 +1,29 @@
-"""End-to-end API smoke — registry CRUD + auth, model stubbed.
+"""End-to-end API smoke — DB-backed auth + tenant-scoped voices.
 
-This test runs without a GPU and without the real VoxCPM2 install by
-injecting a fake model into `sys.modules['voxcpm']`. The FastAPI
-dependency graph and the streaming/WAV code paths still get exercised
-on CI-class machines.
+Re-written for Faz A.6 cutover: TTS endpoints now go through the same
+multi-tenant auth pipeline as /admin. Tests provision a tenant + API
+key in the DB, then exercise the surface with that Bearer token.
+
+Voxcpm + voxcpm.model.voxcpm stubbed at module import so neither torch
+nor the real 4 GB model load.
 """
 
 from __future__ import annotations
 
 import io
 import sys
+import types as _types
 import wave
-from pathlib import Path
 
+import fakeredis.aioredis
 import numpy as np
 import pytest
 import soundfile as sf
 
-# Stub voxcpm before importing the server, so loading does not pull torch.
-_fake_voxcpm = type(sys)("voxcpm")
+# Stub voxcpm before importing the server.
+_fake_voxcpm = _types.ModuleType("voxcpm")
+_fake_voxcpm_model = _types.ModuleType("voxcpm.model")
+_fake_voxcpm_model_voxcpm = _types.ModuleType("voxcpm.model.voxcpm")
 
 
 class _StubInner:
@@ -51,40 +56,16 @@ class _StubFactory:
         return _StubModel()
 
 
+class _StubLoRAConfig:
+    def __init__(self, **_kwargs):
+        self.kwargs = _kwargs
+
+
 _fake_voxcpm.VoxCPM = _StubFactory
-sys.modules["voxcpm"] = _fake_voxcpm
-
-
-@pytest.fixture()
-def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    voices_dir = tmp_path / "voices"
-    ref_dir = tmp_path / "ref"
-    voices_dir.mkdir()
-    ref_dir.mkdir()
-
-    sr = 16000  # VoxCPM2 reference audio rate
-    seed = np.zeros(sr, dtype=np.float32)
-    sf.write(ref_dir / "seed.wav", seed, sr)
-
-    monkeypatch.setenv("NQAI_VOICES_DIR", str(voices_dir))
-    monkeypatch.setenv("NQAI_REFERENCE_DIR", str(ref_dir))
-    monkeypatch.setenv("NQAI_API_KEYS", "test-key-1,test-key-2")
-    monkeypatch.setenv("NQAI_REQUIRE_AUTH", "true")
-
-    # Force reload to pick up env
-    for mod_name in list(sys.modules):
-        if mod_name.startswith(("server", "registry", "frontend")):
-            del sys.modules[mod_name]
-
-    from fastapi.testclient import TestClient
-
-    from server.main import app
-
-    with TestClient(app) as c:
-        yield c
-
-
-HEADERS = {"Authorization": "Bearer test-key-1"}
+_fake_voxcpm_model_voxcpm.LoRAConfig = _StubLoRAConfig
+sys.modules.setdefault("voxcpm", _fake_voxcpm)
+sys.modules.setdefault("voxcpm.model", _fake_voxcpm_model)
+sys.modules.setdefault("voxcpm.model.voxcpm", _fake_voxcpm_model_voxcpm)
 
 
 def _make_wav_bytes(duration_s: float = 2.0, sr: int = 16000) -> bytes:
@@ -94,35 +75,120 @@ def _make_wav_bytes(duration_s: float = 2.0, sr: int = 16000) -> bytes:
     return buf.getvalue()
 
 
-def test_health(client):
+@pytest.fixture
+async def setup(monkeypatch, tmp_path):
+    """Provision a tenant + API key in a per-test SQLite DB.
+
+    Returns ``(full_key, tenant_id, ref_dir)``. The TestClient fixture
+    consumes ``setup`` to ensure env + DB are ready before importing
+    server.main.
+    """
+    db_file = tmp_path / "test.db"
+    db_url = f"sqlite+aiosqlite:///{db_file}"
+    ref_dir = tmp_path / "ref"
+    ref_dir.mkdir()
+
+    monkeypatch.setenv("NQAI_DATABASE_URL", db_url)
+    monkeypatch.setenv("NQAI_JWT_SECRET", "test-secret-must-be-at-least-32-chars-long")
+    monkeypatch.setenv("NQAI_REQUIRE_AUTH", "true")
+    monkeypatch.setenv("NQAI_REFERENCE_DIR", str(ref_dir))
+    monkeypatch.setenv("NQAI_COOKIE_SECURE", "false")
+
+    # Force-reset module state so the new env + DB take effect.
+    for mod_name in list(sys.modules):
+        if mod_name.startswith(("server", "db", "repos", "frontend", "registry")):
+            del sys.modules[mod_name]
+
+    from db import AsyncSessionLocal, init_models_for_tests
+    from repos import ApiKeyRepo, TenantRepo
+    from server.security import generate_api_key
+
+    await init_models_for_tests(db_url)
+
+    full_key, prefix, secret_hash = generate_api_key("dev")
+    async with AsyncSessionLocal() as s:
+        tr = TenantRepo(s)
+        tenant = await tr.create(slug="smoke-tenant", display_name="Smoke")
+        kr = ApiKeyRepo(s)
+        await kr.create(
+            tenant_id=tenant.id,
+            prefix=prefix,
+            secret_hash=secret_hash,
+            scopes=[
+                "tts:read",
+                "tts:write",
+                "voice:read",
+                "voice:write",
+                "admin:read",
+            ],
+            rate_limit_per_minute=1000,  # tests issue lots of requests
+        )
+        await s.commit()
+        tenant_id = tenant.id
+
+    return full_key, tenant_id, ref_dir
+
+
+@pytest.fixture
+def client(setup):
+    full_key, _tid, _ref = setup
+
+    # Inject fakeredis as the rate-limit + cache backend.
+    from server.auth import get_redis
+
+    fake_redis = fakeredis.aioredis.FakeRedis()
+
+    from fastapi.testclient import TestClient
+
+    from server.main import app
+
+    app.dependency_overrides[get_redis] = lambda: fake_redis
+    try:
+        with TestClient(app) as c:
+            c.headers.update({"Authorization": f"Bearer {full_key}"})
+            yield c
+    finally:
+        app.dependency_overrides.clear()
+
+
+# --------------------------------------------------------------------------- #
+# /health is unauthenticated
+# --------------------------------------------------------------------------- #
+def test_health_does_not_require_auth(client):
     r = client.get("/health")
     assert r.status_code == 200
     body = r.json()
     assert body["status"] in {"ok", "warming"}
-    assert body["version"] == "0.2.0"
+    assert body["version"] == "0.3.0"
 
 
-def test_auth_rejects_missing_key(client):
+# --------------------------------------------------------------------------- #
+# Auth gates
+# --------------------------------------------------------------------------- #
+def test_voices_requires_bearer(client):
+    client.headers.pop("Authorization", None)
     r = client.get("/v1/voices")
     assert r.status_code == 401
 
 
-def test_auth_rejects_bad_key(client):
+def test_voices_rejects_bad_key(client):
     r = client.get("/v1/voices", headers={"Authorization": "Bearer bogus"})
     assert r.status_code == 401
 
 
-def test_list_voices_empty(client):
-    r = client.get("/v1/voices", headers=HEADERS)
-    assert r.status_code == 200
+# --------------------------------------------------------------------------- #
+# Voice CRUD on the DB-backed catalog
+# --------------------------------------------------------------------------- #
+def test_voices_listing_starts_empty(client):
+    r = client.get("/v1/voices")
+    assert r.status_code == 200, r.text
     assert r.json() == {"voices": [], "count": 0}
 
 
-def test_enroll_and_list_and_delete(client):
+def test_enroll_then_list_then_delete(client):
     wav = _make_wav_bytes()
     r = client.post(
         "/v1/voices",
-        headers=HEADERS,
         data={
             "voice_id": "alice-warm-01",
             "display_name": "Alice (warm)",
@@ -136,26 +202,24 @@ def test_enroll_and_list_and_delete(client):
     body = r.json()
     assert body["voice"]["voice_id"] == "alice-warm-01"
     assert body["voice"]["style_tags"] == ["warm", "clear"]
+    assert body["voice"]["language"] == "tr"
 
-    listing = client.get("/v1/voices", headers=HEADERS).json()
+    listing = client.get("/v1/voices").json()
     assert listing["count"] == 1
 
-    r2 = client.delete("/v1/voices/alice-warm-01", headers=HEADERS)
-    assert r2.status_code == 200
-
-    listing = client.get("/v1/voices", headers=HEADERS).json()
-    assert listing["count"] == 0
+    r2 = client.delete("/v1/voices/alice-warm-01")
+    assert r2.status_code == 200, r2.text
+    assert client.get("/v1/voices").json()["count"] == 0
 
 
-def test_enroll_rejects_bad_id(client):
+def test_enroll_rejects_bad_voice_id(client):
     wav = _make_wav_bytes()
     r = client.post(
         "/v1/voices",
-        headers=HEADERS,
         data={"voice_id": "Bad Id!", "display_name": "x"},
         files={"reference_audio": ("x.wav", wav, "audio/wav")},
     )
-    assert r.status_code == 400
+    assert r.status_code == 400, r.text
 
 
 def test_enroll_rejects_duplicate(client):
@@ -164,30 +228,40 @@ def test_enroll_rejects_duplicate(client):
     def _files():
         return {"reference_audio": ("d.wav", _make_wav_bytes(), "audio/wav")}
 
-    r1 = client.post("/v1/voices", headers=HEADERS, data=fields, files=_files())
-    assert r1.status_code == 200
-    r2 = client.post("/v1/voices", headers=HEADERS, data=fields, files=_files())
-    assert r2.status_code == 409
+    r1 = client.post("/v1/voices", data=fields, files=_files())
+    assert r1.status_code == 200, r1.text
+    r2 = client.post("/v1/voices", data=fields, files=_files())
+    assert r2.status_code == 409, r2.text
 
 
+def test_enroll_rejects_tiny_audio(client):
+    r = client.post(
+        "/v1/voices",
+        data={"voice_id": "tiny-01", "display_name": "Tiny"},
+        files={"reference_audio": ("t.wav", b"\x00\x01", "audio/wav")},
+    )
+    assert r.status_code == 400
+
+
+# --------------------------------------------------------------------------- #
+# TTS happy + edge
+# --------------------------------------------------------------------------- #
 def test_tts_with_stub_engine(client):
     wav = _make_wav_bytes()
     client.post(
         "/v1/voices",
-        headers=HEADERS,
         data={"voice_id": "bob-01", "display_name": "Bob"},
         files={"reference_audio": ("b.wav", wav, "audio/wav")},
     )
     r = client.post(
         "/v1/tts",
-        headers=HEADERS,
         json={"text": "Merhaba dünya. Bu bir test cümlesidir.", "voice_id": "bob-01"},
     )
     assert r.status_code == 200, r.text
     assert r.headers["content-type"].startswith("audio/wav")
     assert int(r.headers["X-NQAI-Sentences"]) >= 1
     assert int(r.headers["X-NQAI-Sample-Rate"]) == 48000
-    # Parse it as WAV to confirm the bytes are valid
+    assert "X-NQAI-Request-Id" in r.headers
     with wave.open(io.BytesIO(r.content), "rb") as w:
         assert w.getnchannels() == 1
         assert w.getsampwidth() == 2
@@ -198,100 +272,91 @@ def test_tts_with_stub_engine(client):
 def test_tts_voice_404(client):
     r = client.post(
         "/v1/tts",
-        headers=HEADERS,
         json={"text": "merhaba", "voice_id": "nobody-here"},
     )
     assert r.status_code == 404
 
 
-def test_loads_manifest_with_unquoted_iso_datetime(client, tmp_path: Path):
-    """YAML auto-parses ISO 8601 timestamps as `datetime`; the registry must
-    still hand the API layer a plain string, or `GET /v1/voices/{id}` 500s."""
-    import yaml
-
-    from registry.catalog import VoiceRegistry
-
-    voices_dir = tmp_path / "vdir"
-    ref_dir = tmp_path / "rdir"
-    voices_dir.mkdir()
-    ref_dir.mkdir()
-    (ref_dir / "ref.wav").write_bytes(_make_wav_bytes())
-    (voices_dir / "yaml-ts.yaml").write_text(
-        yaml.safe_dump({
-            "voice_id": "yaml-ts",
-            "display_name": "YAML timestamp test",
-            "language": "tr",
-            "gender": "neutral",
-            "style_tags": ["a", "b"],
-            "reference_audio": "ref.wav",
-            "reference_seconds": 1.0,
-            "source": "test",
-            "license": "internal-bridge",
-            "created_at": "2026-05-19T20:17:18+00:00",
-            "created_by": "system",
-        }),
-        encoding="utf-8",
-    )
-    reg = VoiceRegistry(voices_dir=voices_dir, reference_dir=ref_dir)
-    v = reg.get("yaml-ts")
-    assert isinstance(v.created_at, str)
-    # Round-trip the public dict (this is what the API endpoint does)
-    public = v.to_public()
-    assert isinstance(public["created_at"], str)
-
-
-def test_manifest_accepts_private_lora_adapter_fields(client, tmp_path: Path):
-    import yaml
-
-    from registry.catalog import VoiceRegistry
-
-    voices_dir = tmp_path / "vdir"
-    ref_dir = tmp_path / "rdir"
-    voices_dir.mkdir()
-    ref_dir.mkdir()
-    (ref_dir / "ref.wav").write_bytes(_make_wav_bytes())
-    (voices_dir / "neeko-proto.yaml").write_text(
-        yaml.safe_dump({
-            "voice_id": "neeko-proto",
-            "display_name": "NEEKO proto",
-            "language": "tr",
-            "gender": "neutral",
-            "style_tags": ["warm", "child-directed"],
-            "reference_audio": "ref.wav",
-            "reference_seconds": 1.0,
-            "source": "voice-talent",
-            "license": "internal-owned",
-            "created_at": "2026-05-24T00:00:00+00:00",
-            "created_by": "system",
-            "adapter": {"type": "lora", "path": "/models/neeko/lora/latest"},
-            "engine_params": {"cfg_value": 1.5, "inference_timesteps": 20},
-        }),
-        encoding="utf-8",
-    )
-
-    voice = VoiceRegistry(voices_dir=voices_dir, reference_dir=ref_dir).get("neeko-proto")
-    assert voice.adapter == {"type": "lora", "path": "/models/neeko/lora/latest"}
-    assert voice.engine_params == {"cfg_value": 1.5, "inference_timesteps": 20}
-    public = voice.to_public()
-    assert "adapter" not in public
-    assert "engine_params" not in public
-
-
-def test_tts_stream(client):
+def test_tts_stream_returns_wav(client):
     wav = _make_wav_bytes()
     client.post(
         "/v1/voices",
-        headers=HEADERS,
         data={"voice_id": "carol-01", "display_name": "Carol"},
         files={"reference_audio": ("c.wav", wav, "audio/wav")},
     )
     with client.stream(
         "POST",
         "/v1/tts/stream",
-        headers=HEADERS,
         json={"text": "Birinci cümle. İkinci cümle burada.", "voice_id": "carol-01"},
     ) as r:
         chunks = b"".join(r.iter_bytes())
     assert chunks.startswith(b"RIFF")
     assert b"WAVE" in chunks[:20]
-    assert len(chunks) > 44  # header + at least some PCM
+    assert len(chunks) > 44
+
+
+def test_request_id_round_trip(client):
+    """X-Request-Id supplied by the caller must come back in the response."""
+    wav = _make_wav_bytes()
+    client.post(
+        "/v1/voices",
+        data={"voice_id": "dave-01", "display_name": "Dave"},
+        files={"reference_audio": ("d.wav", wav, "audio/wav")},
+    )
+    # uuid.UUID accepts both hyphenated and bare-hex; we send a canonical
+    # UUIDv4 so the gateway echoes it back unchanged.
+    rid_uuid = "550e8400-e29b-41d4-a716-446655440000"
+    r = client.post(
+        "/v1/tts",
+        headers={"X-Request-Id": rid_uuid},
+        json={"text": "Test.", "voice_id": "dave-01"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.headers["X-NQAI-Request-Id"] == rid_uuid
+
+
+# --------------------------------------------------------------------------- #
+# Cross-tenant isolation — second tenant cannot see first tenant's voices
+# --------------------------------------------------------------------------- #
+@pytest.fixture
+async def second_tenant_key(setup):
+    """Spin up a second tenant with its own key on the same DB."""
+    from db import AsyncSessionLocal
+    from repos import ApiKeyRepo, TenantRepo
+    from server.security import generate_api_key
+
+    full_key, prefix, secret_hash = generate_api_key("dev")
+    async with AsyncSessionLocal() as s:
+        tr = TenantRepo(s)
+        tenant = await tr.create(slug="other-tenant", display_name="Other")
+        kr = ApiKeyRepo(s)
+        await kr.create(
+            tenant_id=tenant.id,
+            prefix=prefix,
+            secret_hash=secret_hash,
+            scopes=["tts:read", "tts:write", "voice:read", "voice:write"],
+            rate_limit_per_minute=1000,
+        )
+        await s.commit()
+    return full_key
+
+
+def test_tenant_isolation_voice_invisible_to_other_tenant(client, second_tenant_key):
+    # Tenant 1 enrolls
+    wav = _make_wav_bytes()
+    client.post(
+        "/v1/voices",
+        data={"voice_id": "private-01", "display_name": "Private"},
+        files={"reference_audio": ("p.wav", wav, "audio/wav")},
+    )
+    # Tenant 2 with different key cannot see it
+    r = client.get(
+        "/v1/voices/private-01",
+        headers={"Authorization": f"Bearer {second_tenant_key}"},
+    )
+    assert r.status_code == 404  # existence-leak prevention
+    listing = client.get(
+        "/v1/voices",
+        headers={"Authorization": f"Bearer {second_tenant_key}"},
+    ).json()
+    assert listing["count"] == 0
