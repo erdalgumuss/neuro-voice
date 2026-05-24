@@ -15,6 +15,50 @@ AudioFormat = Literal["wav", "pcm16", "mp3", "opus"]
 StreamFormat = Literal["wav", "pcm16", "mp3", "opus"]
 
 
+# --------------------------------------------------------------------------- #
+# Voice settings — Dalga 2.1, per-request voice fine-tuning
+# --------------------------------------------------------------------------- #
+class VoiceSettings(BaseModel):
+    """Per-request voice tuning knobs.
+
+    Vendor parity layer: ElevenLabs ships
+    ``{stability, similarity_boost, style, use_speaker_boost, speed}``;
+    MiniMax ships ``{speed, vol, pitch}``. We accept the superset so
+    NEEKO/NIVA/NeuroCourse can use the same SDK shapes they're used to;
+    fields the engine doesn't act on YET are documented as forward-
+    compatible (validated + persisted but no-op on the model).
+
+    Field semantics (NQAI mapping):
+    * ``stability`` (0.0–1.0): more stable = more inference timesteps.
+      Maps to ``inference_timesteps`` offset (-4 at 0.0, +8 at 1.0).
+      0.5 means "use the model_id preset's default steps".
+    * ``similarity_boost`` (0.0–1.0): higher = stronger adherence to
+      the reference voice. Maps to ``cfg_value`` offset (-0.3 at 0.0,
+      +0.5 at 1.0). 0.5 = preset default.
+    * ``style`` (0.0–1.0): emotional exaggeration. Currently
+      forward-compatible (persisted on the request, no engine action
+      yet — wires into style_tag selection in Dalga 2.6 follow-up).
+    * ``use_speaker_boost`` (bool): clarity boost. Forward-compatible
+      until VoxCPM2 exposes a matching flag.
+    * ``speed`` (0.7–1.2): playback rate. Worker-side PCM resample;
+      pitch will shift slightly at extremes (acceptable for voice in
+      this range). Pitch-preserving time stretch is Dalga 2.6.
+    * ``pitch`` (-12.0–+12.0 semitones): MiniMax-style pitch shift.
+      Forward-compatible.
+
+    All fields are optional — the gateway falls through to the
+    ``model_id`` preset + voice catalog defaults when omitted.
+    """
+    model_config = ConfigDict(protected_namespaces=())
+
+    stability: float | None = Field(default=None, ge=0.0, le=1.0)
+    similarity_boost: float | None = Field(default=None, ge=0.0, le=1.0)
+    style: float | None = Field(default=None, ge=0.0, le=1.0)
+    use_speaker_boost: bool | None = Field(default=None)
+    speed: float | None = Field(default=None, ge=0.7, le=1.2)
+    pitch: float | None = Field(default=None, ge=-12.0, le=12.0)
+
+
 class TTSRequest(BaseModel):
     # `model_id` collides with pydantic v2's protected namespace; silence
     # the warning — this is intentional vendor parity (ElevenLabs and
@@ -29,6 +73,9 @@ class TTSRequest(BaseModel):
     # at the worker against `server.models.resolve_model`; unknown ids
     # surface as 400 from the gateway. None = registry default.
     model_id: str | None = Field(default=None, max_length=64)
+    # Faz B.5 Dalga 2.1 — per-request voice tuning. See VoiceSettings
+    # docstring for the field-by-field NQAI mapping.
+    voice_settings: VoiceSettings | None = None
 
 
 class TTSStreamRequest(TTSRequest):
@@ -121,6 +168,7 @@ class TTSJobCreate(BaseModel):
     language: Literal["tr", "en"] = "tr"
     audio_format: AudioFormat = "wav"
     model_id: str | None = Field(default=None, max_length=64)
+    voice_settings: VoiceSettings | None = None
     params: TTSJobParams | None = None
 
 

@@ -72,6 +72,12 @@ class TtsJobPayload:
     # Faz B.5 Dalga 1.2 — preset knob, resolved against server.models
     # at worker pickup. None = registry default.
     model_id: str | None = None
+    # Faz B.5 Dalga 2.1 — per-request voice tuning (stability,
+    # similarity_boost, style, use_speaker_boost, speed, pitch). Dict
+    # rather than VoiceSettings dataclass keeps the wire format JSON-
+    # friendly without a forward-references import dance. Schema is
+    # validated by pydantic on the gateway before reaching here.
+    voice_settings: dict[str, Any] | None = None
     params: dict[str, Any] | None = None  # cfg_value, inference_timesteps overrides
     app_label: str | None = None  # product attribution from X-NQAI-App header
     callback_url: str | None = None  # Faz B+: server-to-server completion hook

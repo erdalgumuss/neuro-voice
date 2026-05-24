@@ -391,6 +391,32 @@ async def process_one_job(
         "cfg_value": preset.cfg_value,
         "inference_timesteps": preset.inference_timesteps,
     }
+
+    # Faz B.5 Dalga 2.1 — voice_settings → engine knob adjustments.
+    # Stability and similarity_boost are vendor-named neutral-0.5 knobs
+    # we map onto our two real engine params; the mapping is bounded
+    # and clamped to the engine's safe ranges (TTSJobParams limits).
+    voice_settings = job.voice_settings or {}
+    if voice_settings.get("similarity_boost") is not None:
+        # -0.3 at 0.0, +0.5 at 1.0 around the preset baseline.
+        engine_overrides["cfg_value"] = float(
+            engine_overrides["cfg_value"]
+            + (voice_settings["similarity_boost"] - 0.5) * 1.0
+        )
+    if voice_settings.get("stability") is not None:
+        # -4 at 0.0, +8 at 1.0 around the preset baseline.
+        engine_overrides["inference_timesteps"] = int(
+            engine_overrides["inference_timesteps"]
+            + (voice_settings["stability"] - 0.5) * 16
+        )
+    # Clamp to engine-safe envelopes (matches TTSJobParams Field bounds).
+    engine_overrides["cfg_value"] = max(
+        1.0, min(3.5, float(engine_overrides["cfg_value"])),
+    )
+    engine_overrides["inference_timesteps"] = max(
+        4, min(40, int(engine_overrides["inference_timesteps"])),
+    )
+
     if job.params:
         # Explicit request-level params win — pre-validated by pydantic
         # via TTSJobParams (cfg_value in [1.0, 3.5], steps in [4, 40]).
@@ -398,6 +424,13 @@ async def process_one_job(
             v = job.params.get(k)
             if v is not None:
                 engine_overrides[k] = v
+
+    # Faz B.5 Dalga 2.1 — speed post-process. We resample per-chunk
+    # rather than at the end because /v1/tts/stream needs to forward
+    # ALREADY-sped audio to the client in real time; concatenating
+    # and resampling at the end would defeat streaming. Linear interp
+    # is voice-grade for the 0.7–1.2x range the schema bounds.
+    from audio.postprocess import apply_voice_settings as _apply_vs
 
     try:
         async for chunk in iter_engine_chunks(
@@ -412,10 +445,17 @@ async def process_one_job(
                 first_pcm_ms = int(
                     (time.monotonic() - inference_started) * 1000,
                 )
+            # Apply PCM-side voice_settings (currently `speed` only).
+            # Zero-cost fast path when voice_settings is None / empty.
+            pcm_out = _apply_vs(
+                chunk.pcm_int16,
+                sample_rate=chunk.sample_rate,
+                voice_settings=voice_settings,
+            )
             await publish_chunk(
                 redis, rid,
                 seq=seq,
-                pcm=chunk.pcm_int16,
+                pcm=pcm_out,
                 sentence_text=getattr(chunk, "sentence_text", None),
                 attempt=attempt,
             )
@@ -423,7 +463,7 @@ async def process_one_job(
                 first_audio_ms = int(
                     (time.monotonic() - inference_started) * 1000,
                 )
-            pcm_buffer.extend(chunk.pcm_int16)
+            pcm_buffer.extend(pcm_out)
             seq += 1
     except Exception as e:
         # TRANSIENT — DO NOT publish error chunk or fail the idempotency

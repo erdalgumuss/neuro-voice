@@ -647,6 +647,10 @@ async def synthesize(
             language=body.language,
             audio_format=body.audio_format,
             model_id=preset.model_id,
+            voice_settings=(
+                body.voice_settings.model_dump(exclude_none=True)
+                if body.voice_settings is not None else None
+            ),
             app_label=_app_label_from(request),
             enqueued_at_ms=int(time() * 1000),
         )
@@ -811,6 +815,10 @@ async def synthesize_stream(
             language=body.language,
             audio_format=body.audio_format,
             model_id=preset.model_id,
+            voice_settings=(
+                body.voice_settings.model_dump(exclude_none=True)
+                if body.voice_settings is not None else None
+            ),
             app_label=_app_label_from(request),
             enqueued_at_ms=int(time() * 1000),
         )
@@ -1248,6 +1256,10 @@ async def create_tts_job(
         language=body.language,
         audio_format=body.audio_format,
         model_id=preset.model_id,
+        voice_settings=(
+            body.voice_settings.model_dump(exclude_none=True)
+            if body.voice_settings is not None else None
+        ),
         params=body.params.model_dump(exclude_none=True) if body.params else None,
         app_label=_app_label_from(request),
         enqueued_at_ms=int(time() * 1000),

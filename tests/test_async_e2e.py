@@ -146,6 +146,92 @@ def _enroll_voice(client, voice_id: str = "demo-01") -> None:
     assert r.status_code == 200, r.text
 
 
+async def test_stream_voice_settings_speed_shortens_output(setup):
+    """Faz B.5 Dalga 2.1 — speed=1.2 on /v1/tts/stream produces a
+    shorter audio body than the speed=1.0 baseline (same text, same
+    voice, same engine).
+
+    The worker pipeline post-processes each PCM chunk via
+    apply_voice_settings BEFORE publish_chunk; the resampled chunk
+    flows through the same gateway codec path as a normal chunk."""
+    import httpx
+
+    from server.auth import get_redis
+    from server.main import app
+    from server.queue import DEFAULT_STREAM, TtsJobQueue, get_queue
+    from worker.consumer import WorkerConsumer
+
+    fake_redis = fakeredis.aioredis.FakeRedis()
+    queue = TtsJobQueue(fake_redis, stream=DEFAULT_STREAM)
+    app.dependency_overrides[get_redis] = lambda: fake_redis
+    app.dependency_overrides[get_queue] = lambda: queue
+
+    stop = asyncio.Event()
+    consumer = WorkerConsumer(
+        redis=fake_redis, engine=_StubEngine(),
+        archive_to_r2=setup["archive"],
+        stop_event=stop, block_ms=10,
+    )
+    worker_task = asyncio.create_task(consumer.run())
+
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test",
+            headers={"Authorization": f"Bearer {setup['bearer']}"},
+            timeout=10.0,
+        ) as client:
+            wav = _make_wav_bytes()
+            await client.post(
+                "/v1/voices",
+                data={"voice_id": "vs-voice", "display_name": "VS"},
+                files={"reference_audio": ("v.wav", wav, "audio/wav")},
+            )
+
+            # Baseline at speed=1.0 (PCM mode for byte-exact comparison;
+            # codec layers add their own framing variability).
+            async def _collect(speed: float | None) -> int:
+                payload = {
+                    "text": "Test cumlesi.",
+                    "voice_id": "vs-voice",
+                    "audio_format": "pcm16",
+                }
+                if speed is not None:
+                    payload["voice_settings"] = {"speed": speed}
+                async with client.stream(
+                    "POST", "/v1/tts/stream",
+                    json=payload,
+                ) as r:
+                    body = b""
+                    async for piece in r.aiter_bytes():
+                        body += piece
+                return len(body)
+
+            baseline = await _collect(None)
+            sped_up = await _collect(1.2)
+            slowed = await _collect(0.8)
+
+            assert baseline > 0
+            # 1.2x → ~83% of baseline length, allow ±5% slack for
+            # rounding in the per-chunk resample.
+            assert sped_up < baseline * 0.90, (
+                f"speed=1.2 did not shorten output: "
+                f"baseline={baseline} sped_up={sped_up}"
+            )
+            # 0.8x → ~125% of baseline.
+            assert slowed > baseline * 1.10, (
+                f"speed=0.8 did not lengthen output: "
+                f"baseline={baseline} slowed={slowed}"
+            )
+    finally:
+        stop.set()
+        try:
+            await asyncio.wait_for(worker_task, timeout=2.0)
+        except asyncio.TimeoutError:
+            worker_task.cancel()
+        app.dependency_overrides.clear()
+
+
 # --------------------------------------------------------------------------- #
 # E2E: POST → worker → GET complete
 # --------------------------------------------------------------------------- #
