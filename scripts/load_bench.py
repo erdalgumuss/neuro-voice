@@ -82,11 +82,26 @@ class RunReport:
     finished_at: str
     wall_time_s: float
     total_requests: int
+    # Outcome bucketing (Codex audit 2026-05-25):
+    #   successes              — admitted + completed cleanly (status 2xx, full body)
+    #   admission_rejections   — gateway said 503 (capacity-aware OR XLEN ceiling).
+    #                            Controlled, NOT failure. Sized backpressure.
+    #   uncontrolled_failures  — 5xx other than 503, client timeouts, transport
+    #                            errors. Always pages the on-call.
     successes: int
-    failures: int
+    admission_rejections: int
+    uncontrolled_failures: int
     error_breakdown: dict[str, int]
     throughput_rps: float
-    success_rate: float
+    # Two rates so the dashboard doesn't lie:
+    #   accepted_success_rate    — successes / (successes + uncontrolled_failures).
+    #                              Excludes 503s: backpressure is the system
+    #                              working as designed, not a regression.
+    #   admission_rejection_rate — admission_rejections / total_requests.
+    #                              Tracks how often we refused. Too high means
+    #                              undersized cluster; never zero means well-tuned.
+    accepted_success_rate: float
+    admission_rejection_rate: float
     latency_first_byte_ms: dict[str, float | None]
     latency_total_ms: dict[str, float | None]
     notes: list[str] = field(default_factory=list)
@@ -121,15 +136,23 @@ def _stats_block(values: list[float]) -> dict[str, float | None]:
     }
 
 
+_WAV_HEADER_SIZE = 44  # See latency_bench._WAV_HEADER_SIZE.
+
+
 async def _one_call(
     client: httpx.AsyncClient,
     *,
     voice: str,
     text: str,
     run_start_mono: float,
+    audio_format: str,
 ) -> Sample:
+    """Codex audit fix (2026-05-25): in WAV mode skip the 44-byte
+    RIFF/WAVE header so first_byte timing reflects actual audio. In
+    pcm16 mode (the default) the first byte IS audio."""
     started_mono = time.monotonic()
     started_off_ms = int((started_mono - run_start_mono) * 1000)
+    skip_remaining = _WAV_HEADER_SIZE if audio_format == "wav" else 0
     first_byte_at: float | None = None
     audio_bytes = 0
     status_code = 0
@@ -141,7 +164,7 @@ async def _one_call(
             "/v1/tts/stream",
             json={
                 "text": text, "voice_id": voice,
-                "language": "tr", "audio_format": "wav",
+                "language": "tr", "audio_format": audio_format,
             },
         ) as r:
             status_code = r.status_code
@@ -150,6 +173,12 @@ async def _one_call(
                 error_type = f"http_{r.status_code}"
             else:
                 async for chunk in r.aiter_bytes():
+                    if skip_remaining > 0:
+                        consumed = min(skip_remaining, len(chunk))
+                        skip_remaining -= consumed
+                        chunk = chunk[consumed:]
+                        if not chunk:
+                            continue
                     if first_byte_at is None:
                         first_byte_at = time.monotonic()
                     audio_bytes += len(chunk)
@@ -187,13 +216,16 @@ async def _worker_loop(
     deadline_mono: float,
     samples: list[Sample],
     samples_lock: asyncio.Lock,
+    audio_format: str,
 ) -> None:
     """One concurrent client. Keeps requesting until the deadline."""
     i = 0
     while time.monotonic() < deadline_mono:
         text = sentences[(worker_idx + i) % len(sentences)]
         sample = await _one_call(
-            client, voice=voice, text=text, run_start_mono=run_start_mono,
+            client, voice=voice, text=text,
+            run_start_mono=run_start_mono,
+            audio_format=audio_format,
         )
         async with samples_lock:
             samples.append(sample)
@@ -213,9 +245,33 @@ def _format_markdown(report: RunReport) -> str:
     lines.append(f"- **Concurrency:** {report.concurrency}")
     lines.append(f"- **Total requests:** {report.total_requests}")
     lines.append(f"- **Throughput:** {report.throughput_rps:.2f} req/s")
-    lines.append(f"- **Success rate:** "
-                 f"{report.success_rate * 100:.1f}% "
-                 f"({report.successes} / {report.total_requests})")
+    lines.append("")
+    lines.append("## Outcome bucketing")
+    lines.append("")
+    lines.append("| Bucket | Count | Notes |")
+    lines.append("|---|---|---|")
+    lines.append(
+        f"| Successes | {report.successes} | admitted + completed cleanly |"
+    )
+    lines.append(
+        f"| Admission rejections (503) | {report.admission_rejections} | "
+        f"controlled backpressure — sized capacity at work |"
+    )
+    lines.append(
+        f"| Uncontrolled failures | {report.uncontrolled_failures} | "
+        f"non-503 5xx, timeouts, transport errors — investigate |"
+    )
+    lines.append("")
+    lines.append(
+        f"- **Accepted success rate:** "
+        f"{report.accepted_success_rate * 100:.1f}% "
+        f"(excludes 503s — backpressure is by design)"
+    )
+    lines.append(
+        f"- **Admission rejection rate:** "
+        f"{report.admission_rejection_rate * 100:.1f}% "
+        f"(non-zero with well-tuned backpressure is OK; bound it under load)"
+    )
     lines.append("")
     if report.error_breakdown:
         lines.append("## Error breakdown")
@@ -285,6 +341,7 @@ async def _amain(args: argparse.Namespace) -> int:
                 voice=args.voice, sentences=sentences,
                 run_start_mono=run_start_mono, deadline_mono=deadline_mono,
                 samples=samples, samples_lock=samples_lock,
+                audio_format=args.audio_format,
             ))
             for idx in range(args.concurrency)
         ]
@@ -295,11 +352,21 @@ async def _amain(args: argparse.Namespace) -> int:
 
     total = len(samples)
     successes = sum(1 for s in samples if s.ok)
-    failures = total - successes
+    admission_rejections = sum(
+        1 for s in samples if (not s.ok) and s.error_type == "http_503"
+    )
+    uncontrolled_failures = total - successes - admission_rejections
     error_breakdown = Counter(s.error_type or "ok" for s in samples if not s.ok)
 
     successful_fb = [s.first_byte_offset_ms for s in samples if s.ok and s.first_byte_offset_ms > 0]
     successful_total = [s.total_ms for s in samples if s.ok]
+
+    # accepted_success_rate excludes 503s: backpressure is by design.
+    decided = successes + uncontrolled_failures
+    accepted_success_rate = (successes / decided) if decided else 0.0
+    admission_rejection_rate = (
+        admission_rejections / total if total else 0.0
+    )
 
     report = RunReport(
         hardware_label=args.hardware_label,
@@ -312,15 +379,20 @@ async def _amain(args: argparse.Namespace) -> int:
         wall_time_s=wall_time_s,
         total_requests=total,
         successes=successes,
-        failures=failures,
+        admission_rejections=admission_rejections,
+        uncontrolled_failures=uncontrolled_failures,
         error_breakdown=dict(error_breakdown),
         throughput_rps=total / max(wall_time_s, 1e-9),
-        success_rate=successes / total if total else 0.0,
+        accepted_success_rate=accepted_success_rate,
+        admission_rejection_rate=admission_rejection_rate,
         latency_first_byte_ms=_stats_block(successful_fb),
         latency_total_ms=_stats_block(successful_total),
         notes=[
             "Latency stats exclude failed samples (errors aren't latency).",
             "Throughput counts ALL requests issued (success + failure).",
+            "503s are bucketed as `admission_rejections` (controlled "
+            "backpressure), NOT failures. Only non-503 errors page the "
+            "on-call.",
         ],
     )
 
@@ -350,6 +422,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--timeout-s", type=float, default=60.0)
     p.add_argument("--text-set", type=Path, default=None)
+    p.add_argument(
+        "--audio-format",
+        choices=("pcm16", "wav"),
+        default="pcm16",
+        help="Default `pcm16` so first_byte timing measures audio, not "
+             "the WAV header. `wav` is supported and skips the header.",
+    )
     args = p.parse_args(argv)
     return asyncio.run(_amain(args))
 

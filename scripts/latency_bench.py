@@ -137,20 +137,35 @@ def _percentile(values: list[float], q: float) -> float | None:
     return s[lo] + (s[hi] - s[lo]) * frac
 
 
+_WAV_HEADER_SIZE = 44  # RIFF (12) + fmt (24) + data (8). Gateway's
+# `_yield_wav` emits exactly this layout before any PCM payload.
+
+
 async def _one_call(
     client: httpx.AsyncClient,
     *,
     voice: str,
     text: str,
+    audio_format: str,
 ) -> CallSample:
-    """One /v1/tts/stream POST, measured client-side."""
+    """One /v1/tts/stream POST, measured client-side.
+
+    Codex audit fix (2026-05-25): when audio_format=wav the gateway
+    sends the 44-byte RIFF/WAVE header BEFORE any audio. Counting that
+    header byte as "first audio" produced pembe latency numbers. We
+    now skip the first ``_WAV_HEADER_SIZE`` bytes in WAV mode before
+    arming the first-byte timer; in pcm16 mode the first byte IS
+    audio. Default is pcm16 to keep measurements honest by construction.
+    """
     rid = str(uuid.uuid4())
     payload = {
         "text": text,
         "voice_id": voice,
         "language": "tr",
-        "audio_format": "wav",
+        "audio_format": audio_format,
     }
+    skip_remaining = _WAV_HEADER_SIZE if audio_format == "wav" else 0
+
     t0 = time.monotonic()
     first_byte_at: float | None = None
     audio_bytes = 0
@@ -176,6 +191,12 @@ async def _one_call(
                     error=body.decode("utf-8", errors="replace")[:200],
                 )
             async for chunk in r.aiter_bytes():
+                if skip_remaining > 0:
+                    consumed = min(skip_remaining, len(chunk))
+                    skip_remaining -= consumed
+                    chunk = chunk[consumed:]
+                    if not chunk:
+                        continue
                 if first_byte_at is None:
                     first_byte_at = time.monotonic()
                 audio_bytes += len(chunk)
@@ -342,7 +363,12 @@ async def _amain(args: argparse.Namespace) -> int:
     ) as client:
         async def _bounded(text: str) -> CallSample:
             async with sem:
-                return await _one_call(client, voice=args.voice, text=text)
+                return await _one_call(
+                    client,
+                    voice=args.voice,
+                    text=text,
+                    audio_format=args.audio_format,
+                )
 
         tasks = [
             asyncio.create_task(_bounded(sentences[i % len(sentences)]))
@@ -419,6 +445,14 @@ def main(argv: list[str] | None = None) -> int:
                    help="free-form label for the report header, e.g. 'L4-runpod', 'A100-lambda'")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--timeout-s", type=float, default=60.0)
+    p.add_argument(
+        "--audio-format",
+        choices=("pcm16", "wav"),
+        default="pcm16",
+        help="Default `pcm16` so client_first_byte_ms measures first AUDIO "
+             "byte, not a WAV header byte. `wav` is supported and skips "
+             "the 44-byte RIFF/WAVE header before arming the timer.",
+    )
     p.add_argument(
         "--db-url",
         default=None,

@@ -16,6 +16,7 @@ assert wire behaviour and side-effect semantics, not byte-exact audio.
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import time
 import types as _types
@@ -619,4 +620,87 @@ async def test_pipeline_publishes_first_chunk_before_engine_finishes(
     assert publish_at_ms[0] < second_yield_ms, (
         f"first publish at {publish_at_ms[0]}ms came AFTER second "
         f"sentence yielded at {second_yield_ms}ms — bridge not active"
+    )
+
+
+async def test_pipeline_publishes_all_chunks_before_slow_archive_runs(
+    setup_db, monkeypatch,
+):
+    """Codex audit 2026-05-25 — R2-slow chaos invariant pinned.
+
+    Operationally: if R2 slows to a crawl (2 s archive latency), the
+    client's `gateway_first_byte_ms` MUST NOT degrade. The pipeline
+    contract that supports this is "publish-before-archive": every
+    `publish_chunk` runs in step 4 of the pipeline; the archive call
+    is step 5 and only runs after the result-stream consumer has
+    drained the chunks it cares about.
+
+    Verifies: with a 200 ms artificial delay on archive_to_r2, ALL
+    publish_chunk calls land BEFORE archive_to_r2 starts. A regression
+    that re-orders these (e.g. moves archive ahead of the publish
+    loop) would surface here as a publish-after-archive interleave.
+    """
+    import time as _time
+
+    setup = setup_db
+    import worker.pipeline as pmod
+    from worker.pipeline import process_one_job
+
+    real_publish_chunk = pmod.publish_chunk
+    publish_at_ms: list[int] = []
+    archive_started_at_ms: list[int] = []
+    archive_finished_at_ms: list[int] = []
+    started = _time.monotonic()
+
+    async def spy_publish_chunk(redis, rid, **kw):
+        publish_at_ms.append(int((_time.monotonic() - started) * 1000))
+        await real_publish_chunk(redis, rid, **kw)
+
+    base_archive = _local_archiver(setup)
+
+    async def slow_archive(rid, pcm, sample_rate):
+        archive_started_at_ms.append(int((_time.monotonic() - started) * 1000))
+        # 200ms is enough to interleave if the ordering were wrong;
+        # no need to go to 2 s and slow the test suite.
+        await asyncio.sleep(0.2)
+        uri = await base_archive(rid, pcm, sample_rate)
+        archive_finished_at_ms.append(int((_time.monotonic() - started) * 1000))
+        return uri
+
+    monkeypatch.setattr(pmod, "publish_chunk", spy_publish_chunk)
+
+    redis = fakeredis.aioredis.FakeRedis()
+    engine = _StubEngine(sentences=["Bir.", "İki.", "Üç."])
+    job = _job(setup)
+    await _reserve(setup, job)
+    await process_one_job(
+        job, redis=redis, engine=engine,
+        resolve_reference=_stub_resolver(setup),
+        archive_to_r2=slow_archive,
+    )
+
+    # All chunks published. Archive ran exactly once.
+    assert len(publish_at_ms) == 3, publish_at_ms
+    assert len(archive_started_at_ms) == 1, archive_started_at_ms
+    assert len(archive_finished_at_ms) == 1, archive_finished_at_ms
+
+    # THE INVARIANT: every publish landed BEFORE archive started.
+    # We use `<=` because the millisecond-resolution timer can pin the
+    # last publish and the first archive call to the same tick — that's
+    # not an ordering violation, that's "no gap between them". A true
+    # regression (archive before publish) would show as pms > archive
+    # by a margin > the archive sleep duration (≥150 ms below).
+    archive_started = archive_started_at_ms[0]
+    for i, pms in enumerate(publish_at_ms):
+        assert pms <= archive_started, (
+            f"publish_chunk #{i} at {pms}ms ran AFTER archive started "
+            f"at {archive_started}ms — first-byte latency now depends "
+            f"on R2 speed (regression)"
+        )
+
+    # Sanity: the artificial archive delay was actually observed.
+    archive_finished = archive_finished_at_ms[0]
+    assert archive_finished - archive_started >= 150, (
+        f"archive delay too short ({archive_finished - archive_started}ms) "
+        "— test is no longer exercising the slow path"
     )

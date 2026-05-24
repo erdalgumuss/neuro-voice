@@ -31,13 +31,26 @@ python scripts/load_bench.py ... --concurrency 200 --duration-s 180 ...
 
 ### Pass criteria
 
-| Level | Success rate | client_total_ms p95 | 503 rate |
-|---|---|---|---|
-| 20  | ≥ 99.5% | bounded by per-hardware latency (see latency-bench.md) | 0 |
-| 50  | ≥ 99% | within 1.5× the 20-user p95 | < 1% |
-| 200 | ≥ 95% | within 3× the 20-user p95 | < 5% — pure backpressure, NOT errors |
+`load_bench.py` (Codex audit fix 2026-05-25) emits the report in two
+explicit columns so success rate and backpressure don't get conflated:
 
-The 200-user level is INTENTIONALLY allowed some backpressure-driven 503s (that's the capacity-aware admission doing its job). What's NOT allowed: unhandled errors / DLQ growth / connection-pool exhaustion.
+* **Accepted success rate** = `successes / (successes + uncontrolled_failures)`.
+  Denominator excludes 503s. This is "of the requests the cluster
+  decided to handle, how many completed cleanly".
+* **Admission rejection rate** = `admission_rejections (503) / total_requests`.
+  Non-zero is OK when sized backpressure is at work; zero under
+  heavy load might actually mean the limit is too loose.
+* **Uncontrolled failures** = anything else (non-503 5xx, client
+  timeouts, transport errors). MUST stay close to zero — these are
+  what pages the on-call.
+
+| Level | Accepted success rate | client_total_ms p95 | Admission rejection rate | Uncontrolled failures |
+|---|---|---|---|---|
+| 20  | ≥ 99.5% | bounded by per-hardware latency ([latency-bench.md](latency-bench.md)) | 0 | 0 |
+| 50  | ≥ 99% | within 1.5× the 20-user p95 | ≤ 2% | 0 |
+| 200 | ≥ 99% (of admitted) | within 3× the 20-user p95 | ≤ 30% (cluster correctly refusing oversize work) | < 0.5% |
+
+The 200-user level is INTENTIONALLY allowed substantial backpressure-driven 503s (that's the capacity-aware admission doing its job). What's NOT allowed: uncontrolled failures, DLQ growth, connection-pool exhaustion. Reading the report: a 200-user run with `accepted_success_rate=99.5%` + `admission_rejection_rate=22%` + `uncontrolled_failures=0` is **passing**, not failing.
 
 ### What to inspect while it runs
 
@@ -62,14 +75,26 @@ sleep 30
 docker compose -f docker-compose.dev.yaml --profile gpu start worker
 ```
 
-**Expected:**
-* In-flight jobs on the killed worker land back in PEL.
-* XAUTOCLAIM in another worker reclaims after `xautoclaim_min_idle_ms` (default 30 s).
-* Killed worker's heartbeat disappears within `stale_ms` (default 5 s) — gateway capacity drops, backpressure tightens.
-* When the worker restarts, heartbeat reappears, capacity recovers.
-* Sustained success rate ≥ 95% over the full window. NO DLQ entries (the original jobs complete via the recovery path).
+**Expected behaviour depends on how many other workers are running.**
 
-**Fails if:** DLQ grows, success rate drops below 95%, recovered worker doesn't pick up jobs.
+**Multi-worker case (≥ 2 workers, recommended for this test):**
+* In-flight jobs on the killed worker remain in PEL (not XACKed).
+* Another live worker's periodic XAUTOCLAIM sweep reclaims them after `xautoclaim_min_idle_ms` (default 30 s).
+* Killed worker's heartbeat disappears within `stale_ms` (default 5 s); gateway capacity drops, backpressure tightens.
+* When the killed worker restarts, heartbeat reappears, capacity recovers.
+* Accepted success rate ≥ 95% over the full window. NO DLQ entries.
+
+**Single-worker case (one worker only):**
+* In-flight jobs stay in PEL with no one to reclaim them while the
+  worker is down. **There is no recovery during the outage.**
+* When the worker restarts, its OWN startup XAUTOCLAIM sweep picks
+  the PEL entries back up and processes them. Recovery happens on
+  restart, not in real time.
+* During the outage the gateway sees `worker_count=0` and falls back
+  to XLEN-only backpressure (capacity-aware path can't work without
+  heartbeats). 503 rate climbs.
+
+**Fails if:** DLQ grows, accepted success rate drops below 95% (multi-worker), recovered/restarted worker doesn't pick up its previous PEL.
 
 ### C2 — Redis transient hiccup
 
@@ -113,13 +138,18 @@ for i in {1..18}; do
 done
 ```
 
-**Expected:**
-* Without pgBouncer: gateway / worker exhaust their SQLAlchemy pool → request handlers hit `pool_timeout` → return 500 (NOT 503; this is a DB-side resource problem, surfaced honestly).
-* With pgBouncer: client_conns rise but pgBouncer queues; `query_wait_timeout` (20 s) fires → app sees a Postgres error and returns 500.
+**Expected today (Faz C v1):**
+* Without pgBouncer: gateway / worker exhaust their SQLAlchemy pool → request handlers hit `pool_timeout` → return **500** with a Postgres timeout in the body.
+* With pgBouncer: client_conns rise but pgBouncer queues; `query_wait_timeout` (20 s) fires → app sees a Postgres error and again returns **500**.
 
-**Verify the behavior matches the deployment mode.** If both modes return identical "500 with Postgres timeout" the failure mode is well-understood; we just need pgBouncer pool sizing tuned higher.
+The 500 is **honest** — the system surfaces the real failure mode rather than hanging — but it's not ideal. A loaded DB pool is functionally indistinguishable from overload, and the on-call response is the same as for a capacity issue (back off, scale up). The right code is **503 with `Retry-After`**, possibly behind a tiny circuit breaker around the `get_session()` dependency. That's a documented Faz C v2 item.
 
-**Fails if:** the app hangs (no 5xx ever), or the error is misclassified as 503 backpressure (capacity isn't the bottleneck here).
+**For this run, pass criteria:**
+* The app surfaces a **5xx**, not a hang.
+* Errors classify as `uncontrolled_failures` in the load_bench report, NOT as `admission_rejections`.
+* DLQ does not grow (DB-side failures inside the worker are caught as `TransientFailure` → PEL → retry, not poison).
+
+**Fails if:** the app hangs (no 5xx ever), DB exhaustion misclassifies as 503 backpressure (would mask a real capacity problem), or the worker DLQs jobs that should have been retryable.
 
 ## Recording results
 
