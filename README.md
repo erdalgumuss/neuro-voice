@@ -1,10 +1,10 @@
 # neuro-voice
 
-NQAI'nin Türkçe + voice-cloning + streaming TTS yığını. **VoxCPM2** (Apache 2.0, OpenBMB, 2B param) üzerine multi-tenant API gateway + Türkçe text frontend + sentence-chunked synthesis + Stripe-style async job queue.
+NQAI'nin Türkçe + voice-cloning + streaming TTS yığını. **VoxCPM2** (Apache 2.0, OpenBMB, 2B param) üzerine multi-tenant API gateway + Türkçe text frontend + Stripe-style async job queue + B.1.5 WebRTC-first live TTS omurgası.
 
-## Şu an (2026-05-24, commit `5cd83d0` — Faz B.1 tamam)
+## Şu an (2026-05-24 — Faz B.1.5 başlangıcı)
 
-**Gateway/worker süreç ayrımı bitti.** Gateway CPU/I/O katmanı (Hetzner CX22 sığar); worker GPU node'unda `python -m worker.main` ile koşar. Async TTS jobs uçtan uca çalışır; sync `/v1/tts` aynı Redis queue üzerinden geriye-uyumlu proxy (RFC 8594 `Deprecation`/`Sunset` header, 2026-09-01 sunset). At-least-once delivery XAUTOCLAIM chaos test'iyle kanıtlı.
+**Gateway/worker süreç ayrımı bitti ve live TTS yüzeyi başladı.** Gateway CPU/I/O katmanı (Hetzner CX22 sığar); worker GPU node'unda `python -m worker.main` ile koşar. Async TTS jobs uçtan uca çalışır; sync `/v1/tts` aynı Redis queue üzerinden geriye-uyumlu proxy (RFC 8594 `Deprecation`/`Sunset` header, 2026-09-01 sunset). At-least-once delivery XAUTOCLAIM + bounded retry/DLQ ile korunur.
 
 - Checkpoint + Faz B yol haritası: [docs/audit/checkpoint-2026-05-24-faz-a-exit.md](docs/audit/checkpoint-2026-05-24-faz-a-exit.md)
 - Kanonik mimari (v1.0 hedefi): [docs/architecture/scale-roadmap.md](docs/architecture/scale-roadmap.md)
@@ -12,9 +12,9 @@ NQAI'nin Türkçe + voice-cloning + streaming TTS yığını. **VoxCPM2** (Apach
 - VoxCPM2 entegrasyon detayları: [docs/architecture/voxcpm2-integration.md](docs/architecture/voxcpm2-integration.md)
 - Mimari index: [docs/architecture/README.md](docs/architecture/README.md)
 
-**Şu an çalışan:** 4 tenant × N API key, DB-backed Bearer auth (argon2id), R2 voice catalog + artifact storage, sync `POST /v1/tts` (queue proxy, `Deprecation: true`), async `POST /v1/tts/jobs` (Stripe Idempotency-Key + worker uçtan uca tamamlar + presigned R2 URL), admin UI (FastAPI + Jinja2 + HTMX), worker süreci (`python -m worker.main`) — gerçek consumer, R2 archive, periyodik XAUTOCLAIM, SIGTERM graceful drain.
+**Şu an çalışan:** 4 tenant × N API key, DB-backed Bearer auth (argon2id), R2 voice catalog + artifact storage, sync `POST /v1/tts` (queue proxy, `Deprecation: true`), async `POST /v1/tts/jobs` (Stripe Idempotency-Key + worker uçtan uca tamamlar + presigned R2 URL), admin UI (FastAPI + Jinja2 + HTMX), worker süreci (`python -m worker.main`) — gerçek consumer, R2 archive, periyodik XAUTOCLAIM, SIGTERM graceful drain. B.1.5 için `POST /v1/tts/live/sessions` warm live worker capacity varsa LiveKit room/token üretir; worker `nqai.worker.live.*` heartbeat ile canlı kapasite duyurur.
 
-**Faz B.1.5'e bilinçli ertelenenler** (latency-focused, ayrı scope): true frame-level streaming (drain-then-emit → thread→asyncio bridge), WebSocket endpoint, WebRTC, warm-worker sticky routing, ttfb/first-pcm metrikleri, capacity-based backpressure, DLQ. Detaylar: [docs/audit/checkpoint-2026-05-24-faz-b1-exit.md](docs/audit/checkpoint-2026-05-24-faz-b1-exit.md) §6.
+**Faz B.1.5'te sıradaki iş:** LiveKit room'a gerçek worker participant olarak bağlanıp audio track publish eden runtime wiring + gerçek model/VoxCPM2 latency raporu. Frame bridge, waterfall, session admission ve local LiveKit dev stack repo içinde.
 
 ## Hedef
 

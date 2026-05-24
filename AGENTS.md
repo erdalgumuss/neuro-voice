@@ -114,6 +114,10 @@ label it explicitly and keep the B.1 correctness path stable.
 - Reference audio and LoRA adapter access should be cache-aware and bounded.
 - Measure latency as a waterfall: queue wait, worker pickup, reference resolve, adapter load,
   first model frame, first PCM, gateway first chunk, client TTFB, total inference, RTF.
+- B.1.5 live TTS is WebRTC-first through LiveKit. WebSocket/HTTP streaming are compatibility
+  or debug paths, not the primary low-latency media path.
+- Live requests must use admission control from `nqai.worker.live.*` heartbeats; they should
+  not sit in the durable Redis job queue waiting for capacity.
 
 ## Commands
 
@@ -222,8 +226,9 @@ B.1 is done when:
 B.1.5 is done when:
 
 - First audio is emitted before full generation completes.
-- Live streaming endpoint exists and is measured.
+- Live session endpoint exists and returns a LiveKit room/token only when warm worker capacity exists.
 - Latency waterfall metrics are recorded.
 - Warm worker/reference/adapter cache behavior is explicit.
 - R2 artifact finalization is not on the live first-audio critical path.
 - A measured report distinguishes infra latency from model/runtime latency.
+- `src/worker/live.py` keeps latency-sensitive generation on a thread-to-async frame bridge, not a full-drain list.

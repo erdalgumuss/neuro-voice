@@ -1,7 +1,7 @@
-# Streaming Protocol — WebSocket + HTTP Chunked (kanonik)
+# Streaming Protocol — WebRTC Live + Compatibility Streams (kanonik)
 
 **Doc owner:** Backend lead · **Bağlı:** [scale-roadmap.md §7](scale-roadmap.md)
-**Sürüm:** v1 · **Hat:** WebSocket primary, HTTP/2 chunked WAV fallback
+**Sürüm:** v1.5 · **Hat:** LiveKit/WebRTC primary, WebSocket/HTTP compatibility
 
 Bu dokuman client'ların NQAI Voice TTS uç noktasıyla nasıl konuştuğunun normatif tanımıdır. SDK'lar bu spec'ten doğar; spec değişimi → breaking change → versiyon bump.
 
@@ -11,18 +11,91 @@ Bu dokuman client'ların NQAI Voice TTS uç noktasıyla nasıl konuştuğunun no
 
 | Hedef | Çözüm |
 |---|---|
-| True low-latency streaming (browser, native, mobile) | WebSocket (Starlette WS, Sec-WebSocket-Protocol negotiation) |
-| Basit curl / ffplay / Postman uyumluluğu | HTTP/2 chunked Transfer-Encoding + RIFF "infinite size" trick |
-| Geriye uyumluluk | URL path versiyonlama (`/v1/tts/...`) + subprotocol versiyonlama (`nqai.tts.v1`) |
+| True low-latency media (browser, native, mobile) | LiveKit self-host + WebRTC audio track |
+| Control plane | `POST /v1/tts/live/sessions` + LiveKit data channel protocol `nqai.tts.live.v1` |
+| Basit curl / ffplay / Postman uyumluluğu | Deprecated `/v1/tts` and `/v1/tts/stream` queue proxies |
+| Geriye uyumluluk | URL path versiyonlama (`/v1/tts/...`) + control protocol versiyonlama (`nqai.tts.live.v1`) |
 | Backpressure | WebSocket close code 1013 (Try Again Later) + HTTP 429 + `Retry-After` |
 | Crash recovery (worker) | At-least-once + idempotent request_id (D-05) |
 | Network kesinti recovery (client) | `resume` mesajı + son alınan `chunk_seq` (planlı v2 — v1'de basit close) |
 
 ---
 
-## 1. WebSocket protocol (primary)
+## 1. Live WebRTC protocol (primary, B.1.5)
 
-### 1.1 Bağlantı kurma
+### 1.1 Session creation
+
+**URL:** `POST /v1/tts/live/sessions`
+
+Gateway görevleri:
+
+- Bearer API key auth
+- tenant/workspace voice access policy
+- warm worker admission via `nqai.worker.live.*` Redis heartbeat
+- LiveKit room/token minting
+- session metadata TTL store
+
+Request:
+
+```json
+{
+  "voice_id": "neeko-v01",
+  "language": "tr",
+  "client_request_created_ms": 1790000000000
+}
+```
+
+Response:
+
+```json
+{
+  "session_id": "<uuid>",
+  "room_name": "nqai-tts-<uuid>",
+  "livekit_url": "ws://localhost:7880",
+  "participant_token": "<jwt>",
+  "expires_at": "2026-05-24T12:00:00+00:00",
+  "sample_rate": 48000,
+  "audio_codec": "opus",
+  "control_protocol": "nqai.tts.live.v1",
+  "worker_id": "worker-a",
+  "metrics": {
+    "gateway_received_ms": 1790000000010,
+    "session_admitted_ms": 1790000000025
+  }
+}
+```
+
+Admission failure is explicit: no warm live worker capacity returns `503` + `Retry-After`.
+Live requests must not silently fall back into the durable job queue.
+
+### 1.2 Media and control split
+
+- Audio travels as a LiveKit/WebRTC audio track. Internally workers publish PCM16 mono 48 kHz frames; WebRTC/LiveKit carries Opus on the wire.
+- JSON control travels on the LiveKit data channel under `nqai.tts.live.v1`.
+
+Control messages:
+
+| Yön | Type | Açıklama |
+|---|---|---|
+| C → S | `synthesize` | Aktif live session içinde yeni TTS isteği |
+| C → S | `cancel` | Aktif sentezi best-effort iptal et |
+| C → S | `ping` | Keepalive |
+| S → C | `accepted` | Worker isteği aldı |
+| S → C | `first_audio` | İlk audio frame media path'e verildi |
+| S → C | `chunk_meta` | Audio frame dışı caption/seq metadata |
+| S → C | `done` | Sentez bitti, metrics içerir |
+| S → C | `error` | Terminal hata |
+| S → C | `cancelled` | İstek iptal edildi |
+| S → C | `pong` | Ping cevabı |
+
+The older WebSocket design below is retained as compatibility/reference until
+the SDK surface is fully WebRTC-native.
+
+---
+
+## 2. WebSocket protocol (compatibility/debug)
+
+### 2.1 Bağlantı kurma
 
 **URL:** `wss://api.nqai.voice/v1/tts/ws`
 
@@ -55,7 +128,7 @@ X-NQAI-Request-Id: <connection-uuid>   ; connection-level trace id
 | Rate limit aşıldı (per-key/min) | 429 + `Retry-After: 30` | gateway upgrade etmez |
 | Queue depth threshold üstünde | 503 + `Retry-After: 5` | backpressure (D-14) |
 
-### 1.2 Mesaj formatı (her iki yön)
+### 2.2 Mesaj formatı (her iki yön)
 
 JSON Text Frame (RFC 6455 Opcode 0x1). UTF-8 zorunlu.
 
@@ -81,7 +154,7 @@ JSON Text Frame (RFC 6455 Opcode 0x1). UTF-8 zorunlu.
 | S → C | `error` | Hata + recovery hint |
 | S → C | `pong` | Ping cevabı |
 
-### 1.3 `synthesize` (C → S)
+### 2.3 `synthesize` (C → S)
 
 ```json
 {
@@ -114,7 +187,7 @@ JSON Text Frame (RFC 6455 Opcode 0x1). UTF-8 zorunlu.
 | `sample_rate` | int | ✗ | `48000` | VoxCPM2 native; downsample sadece `audio_format=opus` ile |
 | `params` | object | ✗ | server defaults | Per-request engine override (yalnızca whitelist alanlar) |
 
-### 1.4 `accepted` (S → C)
+### 2.4 `accepted` (S → C)
 
 ```json
 {
@@ -127,7 +200,7 @@ JSON Text Frame (RFC 6455 Opcode 0x1). UTF-8 zorunlu.
 
 Gateway queue'ya XADD ettiğinde hemen gönderilir. `queue_position` ve `estimated_start_ms` advisory — kesin değil.
 
-### 1.5 `chunk` (S → C)
+### 2.5 `chunk` (S → C)
 
 ```json
 {
@@ -150,7 +223,7 @@ Gateway queue'ya XADD ettiğinde hemen gönderilir. `queue_position` ve `estimat
 
 **Binary frame alternatifi (Faz B sonu opt-in):** `chunk` mesajı için JSON yerine **Binary Frame** (RFC 6455 Opcode 0x2) — 16-byte header (`chunk_seq:u32 | sentence_index:u32 | flags:u32 | reserved:u32`) + raw PCM bytes. Base64 overhead'i (~33%) kalkar; client `Sec-WebSocket-Protocol: nqai.tts.v1+binary` ile opt-in eder.
 
-### 1.6 `sentence` (S → C, opsiyonel)
+### 2.6 `sentence` (S → C, opsiyonel)
 
 ```json
 {
@@ -166,7 +239,7 @@ Gateway queue'ya XADD ettiğinde hemen gönderilir. `queue_position` ve `estimat
 
 Cümle başında gönderilir (chunk'lardan önce). UI'da caption rendering / token alignment için. `tokens` v2'de doldurulur.
 
-### 1.7 `done` (S → C)
+### 2.7 `done` (S → C)
 
 ```json
 {
@@ -182,7 +255,7 @@ Cümle başında gönderilir (chunk'lardan önce). UI'da caption rendering / tok
 
 Worker XACK öncesi son mesaj. Bu mesajdan sonra `cancel` ignore edilir.
 
-### 1.8 `error` (S → C)
+### 2.8 `error` (S → C)
 
 ```json
 {
@@ -211,7 +284,7 @@ Worker XACK öncesi son mesaj. Bu mesajdan sonra `cancel` ignore edilir.
 
 Error sonrası connection açık kalır (client başka istek atabilir). Auth fail'de bağlantı kapatılır (Close 4401).
 
-### 1.9 `cancel` + `ping/pong`
+### 2.9 `cancel` + `ping/pong`
 
 ```json
 {"type": "cancel", "request_id": "01J5K3R7Z2QHDF8P9V6M2T1WAA"}
@@ -223,7 +296,7 @@ Error sonrası connection açık kalır (client başka istek atabilir). Auth fai
 
 `ping/pong`: keepalive — istemci 30 sn'de bir ping, server 10 sn'de cevap. Heartbeat 90 sn alınmazsa server kapatır.
 
-### 1.10 Close codes
+### 2.10 Close codes
 
 | Code | Anlam |
 |---|---|
@@ -237,11 +310,11 @@ Error sonrası connection açık kalır (client başka istek atabilir). Auth fai
 
 ---
 
-## 2. HTTP/2 chunked WAV fallback
+## 3. HTTP/2 chunked WAV fallback
 
 WebSocket destekleyemeyen istemciler (curl, ffplay, basit IoT) için.
 
-### 2.1 Request
+### 3.1 Request
 
 ```http
 POST /v1/tts/stream HTTP/1.1
@@ -259,7 +332,7 @@ X-Request-Id: 01J5K3R7Z2QHDF8P9V6M2T1WAA
 }
 ```
 
-### 2.2 Response
+### 3.2 Response
 
 ```http
 HTTP/1.1 200 OK
@@ -287,7 +360,7 @@ X-NQAI-RTF: 0.487
 - HTTP/2 frame-level multiplexing → daha hızlı first byte; HTTP/1.1 üzerinde de çalışır
 - Trailer headers (`X-NQAI-Sentences`, `X-NQAI-Duration-Seconds`, `X-NQAI-RTF`) sonunda; bazı middleware drop edebilir, opsiyonel
 
-### 2.3 Error response
+### 3.3 Error response
 
 ```http
 HTTP/1.1 404 Not Found
@@ -312,7 +385,7 @@ WebSocket error code → HTTP status mapping:
 
 ---
 
-## 3. Latency budget (gerçekçi p95 hedefler)
+## 4. Latency budget (gerçekçi p95 hedefler)
 
 [scale-roadmap.md §7.3](scale-roadmap.md) ile aynı, burada detaylı breakdown:
 
@@ -340,9 +413,9 @@ T4 ile (Faz A-B): TTFB p95 ~2.5 s, E2E p95 ~8 s — kabul edilebilir geliştirme
 
 ---
 
-## 4. Client SDK örnekleri
+## 5. Client SDK örnekleri
 
-### 4.1 Python (httpx + websockets)
+### 5.1 Python (httpx + websockets)
 
 ```python
 import asyncio, json, base64
@@ -376,7 +449,7 @@ async def synthesize_streaming(text: str, voice_id: str = "neeko-v01"):
     return b"".join(pcm_chunks)  # raw 48kHz int16 mono PCM
 ```
 
-### 4.2 JavaScript (browser)
+### 5.2 JavaScript (browser)
 
 ```javascript
 const ws = new WebSocket('wss://api.nqai.voice/v1/tts/ws',
@@ -412,7 +485,7 @@ ws.onmessage = (ev) => {
 
 > **Browser auth uyarısı:** Bearer token tarayıcıda saklanırsa XSS riskli. Faz D'de **session token exchange** endpoint'i eklenir: client backend'i bizim `/v1/auth/session-token` ile kısa-ömürlü WS token alır, browser onunla bağlanır. v1'de doğrudan key OK (server-to-server tüketicilerde).
 
-### 4.3 curl (HTTP chunked)
+### 5.3 curl (HTTP chunked)
 
 ```bash
 KEY="nqai_prod_..._..."
@@ -427,21 +500,21 @@ curl -N -X POST $URL/v1/tts/stream \
 
 ---
 
-## 5. Backpressure ve flow control
+## 6. Backpressure ve flow control
 
-### 5.1 Server-side
+### 6.1 Server-side
 
 - Redis Streams queue length izlenir; `> N_workers × 4` → yeni istek 429 + `Retry-After: 5` (HTTP) veya close 1013 (WS)
 - WebSocket: Starlette default `max_size=16MB`, `max_queue=32` mesaj backlog'u — server tarafında full olursa connection slow client'tı disconnect eder
 
-### 5.2 Client-side
+### 6.2 Client-side
 
 - WebSocket'te slow consumer durumu: server backpressure header gönderir (`{"type":"warning","code":"slow_consumer","message":"backlog growing"}`) — istemci `cancel` veya yavaşlatma yapmalı
 - HTTP chunked'te TCP window full → server natural backpressure (yazma bloklanır), problem değil
 
 ---
 
-## 6. Versiyonlama
+## 7. Versiyonlama
 
 - **URL versiyon:** `/v1/tts/...` — major breaking change yeni path (`/v2/...`)
 - **Subprotocol versiyon:** `nqai.tts.v1`, `nqai.tts.v1+binary` (opt-in binary frames) — bilinmeyen subprotocol 426
@@ -452,10 +525,13 @@ Deprecation policy: v2 yayınlandığında v1 6 ay grace, sonra 410 Gone.
 
 ---
 
-## 7. Test stratejisi
+## 8. Test stratejisi
 
 | Test | Araç | Kapsam |
 |---|---|---|
+| Live session admission | pytest + fakeredis | warm worker yoksa 503, varsa LiveKit token + session store |
+| Worker live bridge | pytest + fake engine | first frame full generation bitmeden çıkar |
+| LiveKit smoke | local LiveKit container | client room join + worker audio track publish |
 | WS upgrade + auth | pytest + httpx + websockets | 401/403/426/429 path'leri |
 | Mesaj round-trip | pytest + websockets | synthesize → chunks → done |
 | Cancel mid-stream | pytest + asyncio | cancel sonrası worker stop'u doğrulanır |
@@ -466,7 +542,7 @@ Deprecation policy: v2 yayınlandığında v1 6 ay grace, sonra 410 Gone.
 
 ---
 
-## 8. Açık konular (v2'ye ertelendi)
+## 9. Açık konular (v2'ye ertelendi)
 
 - **Resumable streaming:** v1'de network drop = restart. v2'de `resume` mesajı + son `chunk_seq` ile mid-stream resume.
 - **Voice cloning over WS:** v1'de voice enroll HTTP POST. v2'de WS üzerinden chunked upload + immediate use.

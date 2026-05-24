@@ -17,7 +17,7 @@ Tek-process VoxCPM2 prototipinden, **4 tenant × 5 concurrent = 20 user başlang
 Çekirdek varsayımlar:
 - 4 client uygulama (NEEKO toy, NIVA call-center, NeuroCourse instructor, NARO) ortak omurgayı tüketir.
 - Her account (tenant) kendi API key'lerini üretir; ürünler `X-NQAI-App` header ile rollup edilir.
-- Streaming TTS uç noktası **WebSocket primary** (true low-latency); HTTP/2 chunked WAV fallback.
+- Streaming TTS canlı hattı **WebRTC/LiveKit primary**; WebSocket/HTTP chunked compatibility/debug fallback.
 - Birincil base model: VoxCPM2 (Apache-2.0). Inference runtime: önce direct `voxcpm`, Faz C'de `nano-vllm-voxcpm` (resmi paket, RTX 4090'da RTF 0.13, batched concurrent + FastAPI server).
 - "Premium" tanımı [voxcpm2-integration.md](voxcpm2-integration.md) bölümünde, sayısal hedefler [observability.md](observability.md) SLO'larında.
 
@@ -226,7 +226,7 @@ Hardware sizing 20-user baseline; 200-user için worker sayısı × 4, DB/Redis 
 | **D-09** | Secret'ler ortam değişkeninden okunur — kod, config dosyası, Docker image içinde **yasak** | Secret leak engellenme |
 | **D-10** | Voice reference audio yalnızca object storage'da; DB'de URI + sha256 + size + sample-rate metadata | Postgres performansı, backup boyutu, replication maliyeti |
 | **D-11** | Worker model'i lazy-load eder ama process boyunca canlı tutar; HTTP /admin/warmup ile eager trigger | Cold-start latency kullanıcıya yansımaz |
-| **D-12** | Streaming response için **WebSocket primary, HTTP chunked fallback** — istemci `Sec-WebSocket-Protocol: nqai.tts.v1` header'ı ile negotiate eder | İki istemci sınıfı destekleniyor: native app (WS) + curl/legacy (chunked) |
+| **D-12** | Live TTS için **WebRTC/LiveKit primary**, compatibility için WebSocket/HTTP chunked fallback | Native/mobile/browser media path jitter ve codec yönetimini WebRTC'ye bırakır; legacy/curl path korunur |
 | **D-13** | Rate limit Redis sliding window (Lua atomic) — per-key + per-tenant aggregate; aşan istek 429 + `Retry-After` header | Multi-tenant fairness |
 | **D-14** | Backpressure: Redis Streams queue depth `> N_workers × 4` → gateway 429 + `Retry-After` (queue dolduğunda istek almak `OOM` riskine girer) | Cascading failure önleme |
 | **D-15** | Her metric label seti **bounded** — tenant_id, voice_id, status — sınırsız cardinality'li label yasak (örn. request_id label olarak değil, exemplar olarak) | Prometheus memory blow-up önleme |
@@ -235,49 +235,26 @@ Hardware sizing 20-user baseline; 200-user için worker sayısı × 4, DB/Redis 
 
 ## 7. Streaming protocol (uç nokta detayı)
 
-### 7.1 WebSocket primary path
+### 7.1 WebRTC/LiveKit primary path
 
 ```
-Client                             Gateway                       Redis            Worker
-  │  CONNECT wss://api.nqai/v1/tts/ws
-  │  Sec-WebSocket-Protocol: nqai.tts.v1
+Client                             Gateway                       Redis            Worker / LiveKit
+  │  POST /v1/tts/live/sessions
   │  Authorization: Bearer <key>
   ├──────────────────────────────►│
-  │                               │  validate key + tenant
-  │                               │  open connection
-  │  ◄── 101 Switching Protocols ─┤
+  │                               │  validate key + tenant + voice access
+  │                               │  read nqai.worker.live.* heartbeat
+  │                               │  mint LiveKit room/token
+  │  ◄── session_id + token + room ┤
   │
-  │  → {"type":"synthesize",
-  │      "request_id":"01J...",
-  │      "voice_id":"neeko-v01",
-  │      "text":"...",
-  │      "mode":"sleep"}
-  ├──────────────────────────────►│
-  │                               │  XADD nqai.tts.jobs
-  │                               ├────────────────►│
-  │                               │                 │  XREADGROUP
-  │                               │                 ├──────────────►│
-  │                               │                 │               │  generate cümle 1
-  │                               │                 │  XADD result  │
-  │                               │                 │◄──────────────┤
-  │                               │  XREAD result   │
-  │                               │◄────────────────┤
-  │  ← {"type":"chunk",            │
-  │      "seq":0,
-  │      "pcm":"<base64>"}
-  │◄──────────────────────────────┤
-  │  ... (cümle 2, 3, ...)
-  │                               │                 │               │  generate cümle N
-  │                               │                 │               │  XADD final result
-  │                               │                 │◄──────────────┤
-  │                               │                 │               │  XACK
-  │                               │                 │               ├──────────────►Redis
-  │  ← {"type":"done",
-  │      "sentence_count":3,
-  │      "duration_ms":4820}
-  │◄──────────────────────────────┤
-  │  → CLOSE
-  ├──────────────────────────────►│
+  │  Join LiveKit room with token │
+  ├─────────────────────────────────────────────────────────────────►│
+  │  DataChannel synthesize       │                 │               │
+  ├─────────────────────────────────────────────────────────────────►│
+  │                               │                 │               │ resolve ref/cache
+  │                               │                 │               │ generate first frame
+  │  ◄════════ WebRTC audio track ════════════════════════════════════│
+  │  ◄── DataChannel done/metrics ════════════════════════════════════│
 ```
 
 ### 7.2 HTTP/2 chunked WAV fallback
@@ -607,7 +584,7 @@ Tek satır cevaplar, detay → bileşen matrisi (§4) veya zorunlu kararlar (§6
 | **Inference runtime?** | `voxcpm` (Faz A-B) → `nano-vllm-voxcpm` (Faz C+) | Triton Faz D B2B SDK için |
 | **Auth?** | API key + argon2id + DB scope + Redis rate limit | Yok — bu pattern oturuyor |
 | **Admin UI?** | FastAPI + Jinja2 + HTMX (server-side) | Next.js Faz E ekip büyürse |
-| **Streaming?** | WebSocket primary + HTTP chunked fallback | gRPC eklenebilir Faz D'de |
+| **Streaming?** | WebRTC/LiveKit primary + WebSocket/HTTP fallback | gRPC eklenebilir Faz D'de |
 | **Container?** | Docker Compose (dev) → Kubernetes (prod, Faz D+) | Nomad alternatif (küçük ekip için daha basit) |
 | **GPU cloud?** | RunPod (start) → Modal/Lambda (Faz D karşılaştırma) | self-managed Faz E (>$5000/ay GPU spend'de) |
 | **Observability?** | Prometheus + Grafana + Loki + OTel | Honeycomb traces için Faz D'de değerlendirilir |

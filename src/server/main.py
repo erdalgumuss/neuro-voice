@@ -21,6 +21,7 @@ import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from time import time
 from typing import Annotated, Any
@@ -42,6 +43,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from audio.wav import pcm16_to_wav_bytes
 from db.session import get_session
+from live import (
+    CONTROL_PROTOCOL,
+    DEFAULT_SAMPLE_RATE,
+    LiveKitConfig,
+    LiveKitTokenIssuer,
+    LiveLatencyWaterfall,
+    LiveSession,
+    LiveSessionStore,
+    LiveWorkerRegistry,
+    now_ms,
+)
 from registry.audio_io import trim_and_resample_to_wav  # still used by enroll
 from registry.catalog import (
     ALLOWED_AUDIO_SUFFIXES,
@@ -75,6 +87,8 @@ from .schemas import (
     TTSJobMetrics,
     TTSJobOutput,
     TTSJobStatusResponse,
+    TTSLiveSessionCreate,
+    TTSLiveSessionResponse,
     TTSRequest,
     TTSStreamRequest,
     VoiceListResponse,
@@ -681,6 +695,125 @@ def _hash_sync_body(body) -> str:
     import hashlib
     canonical = body.model_dump_json(by_alias=False)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+# --------------------------------------------------------------------------- #
+# Live TTS sessions — B.1.5 WebRTC-first control plane
+# --------------------------------------------------------------------------- #
+@app.post(
+    "/v1/tts/live/sessions",
+    response_model=TTSLiveSessionResponse,
+    status_code=status.HTTP_201_CREATED,
+    tags=["synthesis"],
+)
+async def create_live_tts_session(
+    body: TTSLiveSessionCreate,
+    request: Request,
+    ctx: Annotated[AuthContext, Depends(require_auth("tts:write"))],
+    session: Annotated[AsyncSession, Depends(get_session)],
+    queue: Annotated[TtsJobQueue, Depends(get_queue)],
+) -> TTSLiveSessionResponse:
+    """Create a WebRTC-first live TTS session.
+
+    This is a control-plane endpoint only. Audio does not flow through
+    FastAPI; the client joins the returned LiveKit room and sends
+    `nqai.tts.live.v1` data-channel messages. Gateway admits only when a
+    warm live-capable worker heartbeat is present.
+    """
+    session_id = LiveSession.new_id()
+    trace = LiveLatencyWaterfall(request_id=session_id)
+    if body.client_request_created_ms is not None:
+        trace.mark("client_request_created_ms", body.client_request_created_ms)
+    trace.mark("gateway_received_ms")
+
+    db_voice = await _assert_voice_accessible_or_404(
+        body.voice_id, ctx.tenant_id, session,
+    )
+    trace.mark("auth_done_ms")
+
+    redis = queue._redis
+    registry = LiveWorkerRegistry(redis)
+    worker = await registry.select_available_worker(voice_id=db_voice.voice_id)
+    if worker is None:
+        await AuditRepo(session).record(
+            actor_type="api_key",
+            actor_id=ctx.api_key_id,
+            actor_label=ctx.api_key.prefix,
+            action="tts.live.admission",
+            result="denied",
+            tenant_id=ctx.tenant_id,
+            payload={"voice_id": db_voice.voice_id, "reason": "no_live_capacity"},
+        )
+        await session.commit()
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="no warm live TTS worker capacity; retry shortly",
+            headers={"Retry-After": "5"},
+        )
+    trace.mark("worker_selected_ms")
+
+    ttl_s = int(os.environ.get("NQAI_LIVE_SESSION_TTL_S", "600"))
+    created_ms = now_ms()
+    expires_ms = created_ms + ttl_s * 1000
+    room_name = f"nqai-tts-{session_id}"
+    livekit_config = LiveKitConfig.from_env()
+    token = LiveKitTokenIssuer(livekit_config).issue_join_token(
+        room_name=room_name,
+        identity=f"client-{session_id}",
+        name=f"NQAI live TTS {session_id}",
+        can_publish=False,
+        can_subscribe=True,
+        can_publish_data=True,
+    )
+
+    live_session = LiveSession(
+        session_id=session_id,
+        tenant_id=str(ctx.tenant_id),
+        api_key_id=str(ctx.api_key_id),
+        voice_id=db_voice.voice_id,
+        worker_id=worker.worker_id,
+        room_name=room_name,
+        created_at_ms=created_ms,
+        expires_at_ms=expires_ms,
+        protocol=CONTROL_PROTOCOL,
+    )
+    store = LiveSessionStore(redis, ttl_s=ttl_s)
+    await store.save(live_session)
+    await store.enqueue_assignment(
+        live_session,
+        livekit_url=livekit_config.url,
+        assigned_at_ms=created_ms,
+    )
+    trace.mark("session_admitted_ms")
+
+    await AuditRepo(session).record(
+        actor_type="api_key",
+        actor_id=ctx.api_key_id,
+        actor_label=ctx.api_key.prefix,
+        action="tts.live.session.create",
+        result="success",
+        tenant_id=ctx.tenant_id,
+        payload={
+            "voice_id": db_voice.voice_id,
+            "session_id": session_id,
+            "worker_id": worker.worker_id,
+            "room_name": room_name,
+            "app_label": _app_label_from(request),
+        },
+    )
+    await session.commit()
+
+    expires_at = datetime.fromtimestamp(expires_ms / 1000, timezone.utc).isoformat()
+    return TTSLiveSessionResponse(
+        session_id=session_id,
+        room_name=room_name,
+        livekit_url=livekit_config.public_url,
+        participant_token=token,
+        expires_at=expires_at,
+        sample_rate=DEFAULT_SAMPLE_RATE,
+        worker_id=worker.worker_id,
+        metrics=trace.as_dict(),
+    )
 
 
 # --------------------------------------------------------------------------- #

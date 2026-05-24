@@ -1,8 +1,6 @@
-# NQAI Voice gateway image — slim, no GPU. The TTS engine pulls
-# voxcpm/torch only when /admin/warmup or /v1/tts is hit; for the
-# admin-only deployment you can build a slimmer variant by removing
-# torch + voxcpm from pyproject.toml. For Faz B the worker has its
-# own Dockerfile (deploy/worker.Dockerfile).
+# NQAI Voice gateway image — CPU/control-plane process. VoxCPM2 inference
+# lives in deploy/worker.Dockerfile; gateway owns auth, queue submit,
+# job status, and B.1.5 live-session admission/token minting.
 
 FROM python:3.12-slim
 
