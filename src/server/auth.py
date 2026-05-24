@@ -18,9 +18,10 @@ about which dimension failed.
 
 from __future__ import annotations
 
-import asyncio
+import os
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Annotated, Awaitable, Callable
+from typing import Annotated
 from uuid import UUID
 
 from fastapi import Depends, Header, HTTPException, Request, status
@@ -30,11 +31,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from db.models import ApiKey, Tenant
 from db.session import get_session
 from repos import ApiKeyRepo, AuditRepo
+from server.config import settings
 from server.rate_limit import RateLimiter
-from server.security import (
-    APIKeyFormatError,
-    parse_api_key,
-)
+from server.security import APIKeyFormatError, parse_api_key
 from server.security.passwords import SecretMismatchError, verify_secret
 
 GENERIC_AUTH_ERROR = "invalid or revoked api key"
@@ -68,20 +67,17 @@ _redis_client: Redis | None = None
 
 
 def get_redis() -> Redis:
-    """Process-wide Redis connection. Replace with FakeRedis injection in tests
-    via dependency_overrides[get_redis]."""
+    """Process-wide Redis connection.
+
+    Tests override this via ``app.dependency_overrides[get_redis]`` (the
+    canonical FastAPI test-injection path) rather than mutating the global,
+    so a stale singleton can never leak across test fixtures.
+    """
     global _redis_client
     if _redis_client is None:
-        import os
         url = os.environ.get("NQAI_REDIS_URL", "redis://localhost:6379/0")
         _redis_client = Redis.from_url(url, decode_responses=False)
     return _redis_client
-
-
-def _set_redis_for_tests(redis: Redis) -> None:
-    """Test override hook — call from fixture before instantiating TestClient."""
-    global _redis_client
-    _redis_client = redis
 
 
 # --------------------------------------------------------------------------- #
@@ -147,14 +143,14 @@ async def authenticate_bearer(
     # ---- 2. Parse format --------------------------------------------------
     try:
         parsed = parse_api_key(token)
-    except APIKeyFormatError:
+    except APIKeyFormatError as e:
         await _audit_async(session, action="auth.fail", result="denied",
                            payload={"reason": "bad_format"}, request=request)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=GENERIC_AUTH_ERROR,
             headers={"WWW-Authenticate": 'Bearer realm="nqai-voice"'},
-        )
+        ) from e
 
     # ---- 3. DB lookup by prefix -------------------------------------------
     kr = ApiKeyRepo(session)
@@ -173,7 +169,7 @@ async def authenticate_bearer(
     # ---- 4. argon2id verify (constant-time) -------------------------------
     try:
         verify_secret(key.secret_hash, parsed.secret)
-    except SecretMismatchError:
+    except SecretMismatchError as e:
         await _audit_async(session, action="auth.fail", result="denied",
                            tenant_id=tenant.id, actor_id=key.id,
                            actor_label=key.prefix,
@@ -182,7 +178,7 @@ async def authenticate_bearer(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=GENERIC_AUTH_ERROR,
             headers={"WWW-Authenticate": 'Bearer realm="nqai-voice"'},
-        )
+        ) from e
 
     # ---- 5. Tenant status check -------------------------------------------
     if tenant.status != "active":
@@ -231,12 +227,13 @@ async def authenticate_bearer(
             headers={"Retry-After": str(retry_s)},
         )
 
-    tenant_check = await limiter.check_tenant(tenant.id, per_minute=600)
+    tenant_limit = settings.tenant_rate_limit_per_minute
+    tenant_check = await limiter.check_tenant(tenant.id, per_minute=tenant_limit)
     if not tenant_check.allowed:
         await _audit_async(session, action="auth.rate_limited", result="denied",
                            tenant_id=tenant.id, actor_id=key.id,
                            actor_label=key.prefix,
-                           payload={"scope": "tenant", "limit": 600,
+                           payload={"scope": "tenant", "limit": tenant_limit,
                                     "count": tenant_check.count}, request=request)
         retry_s = max(1, tenant_check.retry_after_ms // 1000 + 1)
         raise HTTPException(

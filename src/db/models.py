@@ -22,8 +22,6 @@ from typing import Any
 from sqlalchemy import (
     ARRAY,
     JSON,
-    BigInteger,
-    Boolean,
     CheckConstraint,
     DateTime,
     Float,
@@ -39,7 +37,6 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.types import TypeDecorator
 
 from .base import Base, BigIntPk, TimestampMixin, new_uuid
-
 
 # --------------------------------------------------------------------------- #
 # Cross-dialect helpers
@@ -118,10 +115,10 @@ class Tenant(Base, TimestampMixin):
         "metadata", _JSONBPortable, nullable=False, default=dict
     )
 
-    api_keys: Mapped[list["ApiKey"]] = relationship(
+    api_keys: Mapped[list[ApiKey]] = relationship(
         back_populates="tenant", cascade="all, delete-orphan", passive_deletes=True
     )
-    voices: Mapped[list["Voice"]] = relationship(
+    voices: Mapped[list[Voice]] = relationship(
         back_populates="tenant", cascade="all, delete-orphan", passive_deletes=True
     )
 
@@ -201,7 +198,7 @@ class ApiKey(Base):
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     revoked_reason: Mapped[str | None] = mapped_column(Text)
 
-    tenant: Mapped["Tenant"] = relationship(back_populates="api_keys")
+    tenant: Mapped[Tenant] = relationship(back_populates="api_keys")
 
     __table_args__ = (
         CheckConstraint(
@@ -264,7 +261,7 @@ class Voice(Base, TimestampMixin):
     )
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
-    tenant: Mapped["Tenant"] = relationship(back_populates="voices")
+    tenant: Mapped[Tenant] = relationship(back_populates="voices")
 
     __table_args__ = (
         UniqueConstraint("tenant_id", "voice_id", name="tenant_voice_unique"),

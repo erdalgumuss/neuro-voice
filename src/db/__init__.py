@@ -8,6 +8,7 @@ Public surface:
     init_models_for_tests()  fast in-memory SQLite bootstrap for unit tests
 """
 
+from . import models  # noqa: F401 — registers ORM classes with Base.metadata
 from .base import Base
 from .session import (
     AsyncSessionLocal,
@@ -15,7 +16,6 @@ from .session import (
     get_session,
     init_models_for_tests,
 )
-from . import models  # noqa: F401 — registers ORM classes with Base.metadata
 
 __all__ = [
     "Base",

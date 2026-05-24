@@ -5,27 +5,18 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import BigInteger, DateTime, Integer, MetaData, event
-from sqlalchemy.engine import Engine
+from sqlalchemy import BigInteger, DateTime, Integer, MetaData
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-
 # BigInteger PK that autoincrements correctly on SQLite (INTEGER alias) but
-# stays BIGSERIAL on Postgres.
+# stays BIGSERIAL on Postgres. SQLite needs the rowid INTEGER alias to
+# trigger AUTOINCREMENT; Postgres BIGSERIAL is the right column type at scale.
 BigIntPk = BigInteger().with_variant(Integer(), "sqlite")
 
-
-@event.listens_for(Engine, "connect")
-def _enable_sqlite_foreign_keys(dbapi_connection, connection_record):
-    """SQLite defaults to FK constraints OFF — we want CASCADE deletes to
-    actually cascade in test fixtures. No-op on Postgres."""
-    is_sqlite = dbapi_connection.__class__.__module__.startswith(
-        ("sqlite3", "aiosqlite")
-    )
-    if is_sqlite:
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
+# SQLite FK enforcement (PRAGMA foreign_keys=ON) is bound on the test engine
+# in db.session.init_models_for_tests() — we intentionally do NOT register a
+# module-level Engine event so this package never mutates global SQLAlchemy
+# state for unrelated Engines that might live in the same process.
 
 # Deterministic naming convention — Alembic generates stable constraint names,
 # `alembic --autogenerate` produces clean diffs.

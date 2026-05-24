@@ -60,11 +60,12 @@ async def test_tenant_suspend_reactivate():
 
 
 async def test_tenant_list_active_excludes_deleted():
+    from datetime import datetime, timezone
+
     async with AsyncSessionLocal() as s:
         tr = TenantRepo(s)
-        active = await tr.create(slug="alive", display_name="A")
+        await tr.create(slug="alive", display_name="A")
         deleted = await tr.create(slug="dead", display_name="D")
-        from datetime import datetime, timezone
         deleted.deleted_at = datetime.now(timezone.utc)
         await s.commit()
         rows = await tr.list_active()
@@ -273,7 +274,7 @@ async def test_idempotency_reserve_and_complete():
 async def test_idempotency_expired_not_returned():
     tid, _ = await _bootstrap_two_tenants()
     async with AsyncSessionLocal() as s:
-        from datetime import datetime, timedelta, timezone
+        from datetime import timedelta
 
         kr = ApiKeyRepo(s)
         k = await kr.create(tenant_id=tid, prefix="nqai_dev_gggggggggggggg",

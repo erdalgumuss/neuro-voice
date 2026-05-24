@@ -44,7 +44,7 @@ async def setup(monkeypatch, tmp_path):
         if m.startswith(("server", "db", "repos", "frontend", "registry")):
             del sys.modules[m]
 
-    from db import init_models_for_tests, AsyncSessionLocal
+    from db import AsyncSessionLocal, init_models_for_tests
     from repos import OperatorRepo
     from server.security.passwords import hash_secret
 
@@ -62,6 +62,7 @@ async def setup(monkeypatch, tmp_path):
 @pytest.fixture
 def client(setup):
     from fastapi.testclient import TestClient
+
     from server.main import app
     with TestClient(app) as c:
         yield c

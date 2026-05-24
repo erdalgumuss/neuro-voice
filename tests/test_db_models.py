@@ -183,7 +183,7 @@ async def test_audit_log_insert_only():
 
 
 async def test_job_idempotency_round_trip():
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime, timedelta, timezone
     async with AsyncSessionLocal() as s:
         t = await _make_tenant(s, slug="idem")
         k = await _make_key(s, t)

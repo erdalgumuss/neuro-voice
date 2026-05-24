@@ -6,7 +6,6 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-
 AudioFormat = Literal["wav", "pcm16"]
 StreamFormat = Literal["wav", "pcm16"]
 

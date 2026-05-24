@@ -77,6 +77,7 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             del sys.modules[mod_name]
 
     from fastapi.testclient import TestClient
+
     from server.main import app
 
     with TestClient(app) as c:
@@ -158,12 +159,14 @@ def test_enroll_rejects_bad_id(client):
 
 
 def test_enroll_rejects_duplicate(client):
-    wav = _make_wav_bytes()
     fields = {"voice_id": "dup-01", "display_name": "Dup"}
-    files = lambda: {"reference_audio": ("d.wav", _make_wav_bytes(), "audio/wav")}
-    r1 = client.post("/v1/voices", headers=HEADERS, data=fields, files=files())
+
+    def _files():
+        return {"reference_audio": ("d.wav", _make_wav_bytes(), "audio/wav")}
+
+    r1 = client.post("/v1/voices", headers=HEADERS, data=fields, files=_files())
     assert r1.status_code == 200
-    r2 = client.post("/v1/voices", headers=HEADERS, data=fields, files=files())
+    r2 = client.post("/v1/voices", headers=HEADERS, data=fields, files=_files())
     assert r2.status_code == 409
 
 
@@ -205,6 +208,7 @@ def test_loads_manifest_with_unquoted_iso_datetime(client, tmp_path: Path):
     """YAML auto-parses ISO 8601 timestamps as `datetime`; the registry must
     still hand the API layer a plain string, or `GET /v1/voices/{id}` 500s."""
     import yaml
+
     from registry.catalog import VoiceRegistry
 
     voices_dir = tmp_path / "vdir"

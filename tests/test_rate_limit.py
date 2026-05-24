@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-import time
 import uuid
 
-import pytest
 import fakeredis.aioredis
+import pytest
 
 from server.rate_limit import RateLimiter
 

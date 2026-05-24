@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import re
 
-
 _SENTENCE_END_RE = re.compile(
     r"(?<=[.!?…])\s+(?=[A-ZÇĞİÖŞÜ0-9\"'\(])",
     re.UNICODE,

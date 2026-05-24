@@ -64,6 +64,12 @@ class Settings:
     enroll_max_upload_mb: int = field(default_factory=lambda: int(
         os.environ.get("NQAI_ENROLL_MAX_MB", "20")
     ))
+    # Per-tenant aggregate cap (sum across all keys in the tenant). Acts as
+    # an upper bound the operator can lift via DB; per-key limits in
+    # api_keys.rate_limit_per_minute are independent and checked first.
+    tenant_rate_limit_per_minute: int = field(default_factory=lambda: int(
+        os.environ.get("NQAI_TENANT_RATE_LIMIT_PER_MINUTE", "600")
+    ))
 
 
 settings = Settings()

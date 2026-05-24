@@ -7,7 +7,6 @@ import unicodedata
 
 from .numbers import decimal_to_turkish, number_to_turkish
 
-
 # Order matters: longer keys first to avoid prefix collisions.
 _ABBREVIATIONS: list[tuple[str, str]] = [
     ("TBMM", "Türkiye Büyük Millet Meclisi"),

@@ -18,6 +18,12 @@ from dataclasses import dataclass
 from redis.asyncio import Redis
 from redis.exceptions import NoScriptError, ResponseError
 
+# Redis emits this verbatim string for cache-evicted scripts. We pattern-match
+# rather than catch broad ResponseError — that exception covers wrong-type
+# errors, syntax errors, and other bugs that should not silently fall back to
+# inline EVAL (which would hide real failures behind a slower retry path).
+_NOSCRIPT_RESPONSE_MARKER = "NOSCRIPT"
+
 SLIDING_WINDOW_LUA = """
 -- KEYS[1] = window-set key (sorted set)
 -- ARGV[1] = now_ms
@@ -94,12 +100,26 @@ class RateLimiter:
             raw = await self._redis.evalsha(
                 sha, 1, bucket_key, now_ms, window_ms, limit, m
             )
-        except (NoScriptError, ResponseError):
-            # Cache miss or fakeredis lacking EVALSHA — re-EVAL inline.
+        except NoScriptError:
+            # Redis evicted the script from its cache — re-EVAL inline (which
+            # also re-caches the script) and let the next call pick the SHA
+            # up via _ensure_script_loaded().
+            self._script_sha = None
             raw = await self._redis.eval(
                 SLIDING_WINDOW_LUA, 1, bucket_key, now_ms, window_ms, limit, m
             )
-            self._script_sha = None  # force reload on next call
+        except ResponseError as e:
+            # fakeredis (older versions) and some Redis-compatible servers
+            # report EVALSHA cache misses as a generic ResponseError instead
+            # of NOSCRIPT. We only fall back when the message looks like a
+            # missing-script signal — every other ResponseError is a real
+            # bug and bubbles up.
+            if _NOSCRIPT_RESPONSE_MARKER not in str(e).upper():
+                raise
+            self._script_sha = None
+            raw = await self._redis.eval(
+                SLIDING_WINDOW_LUA, 1, bucket_key, now_ms, window_ms, limit, m
+            )
 
         # Redis returns Lua tables as Python lists; values come back as ints
         # or bytes depending on the client decode mode.

@@ -84,6 +84,13 @@ nqai-voice-smoke = "scripts.smoke_test:main"
 where = ["src"]
 include = ["server*", "registry*", "frontend*", "db*", "repos*"]
 
+[tool.setuptools.package-data]
+# Admin UI Jinja templates ship with the package so `pip install` (and
+# Docker image builds with `pip install -e .`) include them under
+# server/admin/templates/. Without this entry, pip would install only the
+# .py files and the dashboard endpoint would 500 with TemplateNotFound.
+"server.admin" = ["templates/*.html"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py310"
@@ -91,6 +98,25 @@ target-version = "py310"
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "SIM"]
 ignore = ["E501"]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI dependency injection style uses Depends(...) as a default — not a bug.
+extend-immutable-calls = [
+    "fastapi.Depends",
+    "fastapi.Header",
+    "fastapi.Cookie",
+    "fastapi.Query",
+    "fastapi.Path",
+    "fastapi.File",
+    "fastapi.Form",
+    "fastapi.Body",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Alembic migrations use upgrade()/downgrade() at module level by design.
+"migrations/versions/*.py" = ["E402"]
+# Tests build SQLAlchemy default factories that look like fn-call-in-default.
+"tests/*.py" = ["B008"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

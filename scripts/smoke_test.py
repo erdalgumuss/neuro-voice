@@ -22,7 +22,6 @@ from pathlib import Path
 
 import httpx
 
-
 TEST_SENTENCES = [
     ("01", "oyun",        "Hadi birlikte sıradaki hayvanı bulalım!"),
     ("02", "uyku",        "Şimdi gözlerini kapatıp derin bir nefes alalım."),

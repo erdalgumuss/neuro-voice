@@ -16,6 +16,7 @@ Auth model:
 
 from __future__ import annotations
 
+import os
 import uuid
 from pathlib import Path
 from typing import Annotated
@@ -30,10 +31,11 @@ from fastapi import (
     Response,
     status,
 )
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from db.models import ApiKey
 from db.session import get_session
 from repos import (
     ApiKeyRepo,
@@ -45,7 +47,6 @@ from repos import (
 from server.security import (
     decode_operator_jwt,
     generate_api_key,
-    hash_secret,
     issue_operator_jwt,
 )
 from server.security.jwt_tokens import JWTError
@@ -56,14 +57,12 @@ templates = Jinja2Templates(directory=str(_TEMPLATE_DIR))
 
 admin_router = APIRouter(prefix="/admin", tags=["admin"])
 
-import os as _os
-
 ACCESS_COOKIE = "nqai_admin_access"
 REFRESH_COOKIE = "nqai_admin_refresh"
 # NQAI_COOKIE_SECURE=false only in tests / local HTTP dev. Production stays on.
 COOKIE_KWARGS = dict(
     httponly=True,
-    secure=_os.environ.get("NQAI_COOKIE_SECURE", "true").lower() == "true",
+    secure=os.environ.get("NQAI_COOKIE_SECURE", "true").lower() == "true",
     samesite="strict",
 )
 
@@ -79,8 +78,8 @@ async def _current_operator(
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "operator login required")
     try:
         claims = decode_operator_jwt(nqai_admin_access, expected_type="access")
-    except JWTError:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "session invalid")
+    except JWTError as e:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "session invalid") from e
     op = await OperatorRepo(session).get(claims.operator_id)
     if op is None or op.disabled_at is not None:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "operator disabled")
@@ -105,8 +104,8 @@ async def login(
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid credentials")
     try:
         verify_secret(op.password_hash, password)
-    except SecretMismatchError:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid credentials")
+    except SecretMismatchError as e:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid credentials") from e
 
     access, refresh, family = issue_operator_jwt(op.id, op.roles)
     await opr.touch_login(op.id)
@@ -266,7 +265,7 @@ async def revoke_api_key(
     session: Annotated[AsyncSession, Depends(get_session)] = ...,
 ):
     kr = ApiKeyRepo(session)
-    key = await session.get(__import__("db.models", fromlist=["ApiKey"]).ApiKey, key_id)
+    key = await session.get(ApiKey, key_id)
     if key is None or key.tenant_id != tenant_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "key not found")
     if key.revoked_at is not None:

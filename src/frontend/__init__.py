@@ -15,7 +15,7 @@ Out of scope of v0 (will be filled by Faz-1 hafta 1-2 work):
 """
 
 from .normalize import normalize_text
-from .segment import segment_sentences
 from .numbers import number_to_turkish
+from .segment import segment_sentences
 
 __all__ = ["normalize_text", "segment_sentences", "number_to_turkish"]

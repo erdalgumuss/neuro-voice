@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
-
 from frontend.segment import MAX_CHARS_PER_SEGMENT, MIN_CHARS_PER_SEGMENT, segment_sentences
 
 

@@ -7,9 +7,6 @@ plus the audit log invariants (D-04).
 
 from __future__ import annotations
 
-import os
-from datetime import datetime, timezone
-
 import fakeredis.aioredis
 import pytest
 from fastapi import HTTPException

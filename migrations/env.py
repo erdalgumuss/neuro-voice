@@ -11,8 +11,10 @@ from sqlalchemy import pool
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
-from db import Base
-from db import models  # noqa: F401 — register models on Base.metadata
+from db import (
+    Base,
+    models,  # noqa: F401 — register models on Base.metadata
+)
 
 config = context.config
 

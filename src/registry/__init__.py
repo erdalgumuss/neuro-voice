@@ -5,6 +5,6 @@ At runtime the registry hydrates manifests, normalizes reference audio
 to a target sample rate, and serves them to the synth engine.
 """
 
-from .catalog import Voice, VoiceRegistry, VoiceNotFound, VoiceAlreadyExists
+from .catalog import Voice, VoiceAlreadyExists, VoiceNotFound, VoiceRegistry
 
 __all__ = ["Voice", "VoiceRegistry", "VoiceNotFound", "VoiceAlreadyExists"]

@@ -20,10 +20,9 @@ from .config import settings
 
 def _constant_time_match(presented: str, allowed: list[str]) -> bool:
     presented_bytes = presented.encode("utf-8")
-    for key in allowed:
-        if hmac.compare_digest(presented_bytes, key.encode("utf-8")):
-            return True
-    return False
+    return any(
+        hmac.compare_digest(presented_bytes, key.encode("utf-8")) for key in allowed
+    )
 
 
 async def require_api_key(authorization: str | None = Header(default=None)) -> str:

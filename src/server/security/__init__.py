@@ -12,10 +12,9 @@ Public surface:
     decode_operator_jwt(...)       verify + decode access token
 """
 
-from .passwords import hash_secret, needs_rehash, verify_secret
 from .api_keys import (
-    APIKeyFormatError,
     KEY_PREFIX_REGEX,
+    APIKeyFormatError,
     ParsedApiKey,
     generate_api_key,
     parse_api_key,
@@ -26,6 +25,7 @@ from .jwt_tokens import (
     decode_operator_jwt,
     issue_operator_jwt,
 )
+from .passwords import hash_secret, needs_rehash, verify_secret
 
 __all__ = [
     "hash_secret",

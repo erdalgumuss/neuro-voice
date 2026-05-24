@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import os
 import threading
-from typing import AsyncIterator
+from collections.abc import AsyncIterator
 
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -65,20 +65,24 @@ def get_engine(database_url: str | None = None) -> AsyncEngine:
     return _engine
 
 
-AsyncSessionLocal: async_sessionmaker[AsyncSession]
-"""Module-level alias for the configured sessionmaker. Lazy."""
-
-
 def _ensure_sessionmaker() -> async_sessionmaker[AsyncSession]:
     global _sessionmaker
     if _sessionmaker is None:
-        get_engine()  # initializes both
+        get_engine()  # initializes both engine + sessionmaker
     assert _sessionmaker is not None
     return _sessionmaker
 
 
-# Module-level callable that returns a session — usage: `async with AsyncSessionLocal() as s: ...`
-def AsyncSessionLocal(**kw):  # noqa: N802 — matches conventional name
+def AsyncSessionLocal(**kw) -> AsyncSession:  # noqa: N802 — keeps SQLAlchemy convention
+    """Open a new async session from the process-wide sessionmaker.
+
+    Usage:
+        async with AsyncSessionLocal() as session:
+            ...
+
+    Prefer the FastAPI `get_session` dependency in request paths so the
+    session is bound to the request's transactional scope.
+    """
     return _ensure_sessionmaker()(**kw)
 
 

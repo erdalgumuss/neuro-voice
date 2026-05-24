@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 import re
 import threading
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any

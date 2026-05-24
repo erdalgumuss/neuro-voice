@@ -9,9 +9,8 @@ import uuid
 import pytest
 
 from server.security import (
-    APIKeyFormatError,
-    JWTError,
     KEY_PREFIX_REGEX,
+    APIKeyFormatError,
     decode_operator_jwt,
     generate_api_key,
     hash_secret,

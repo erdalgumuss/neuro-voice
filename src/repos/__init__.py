@@ -9,13 +9,13 @@ The system tables (tenants, operators) have their own admin-scoped repos
 called only from operator endpoints (JWT-authenticated).
 """
 
-from .tenant import TenantRepo
 from .api_key import ApiKeyRepo
-from .voice import VoiceRepo
-from .usage import UsageRepo
 from .audit import AuditRepo
-from .operator import OperatorRepo
 from .idempotency import IdempotencyRepo
+from .operator import OperatorRepo
+from .tenant import TenantRepo
+from .usage import UsageRepo
+from .voice import VoiceRepo
 
 __all__ = [
     "TenantRepo",

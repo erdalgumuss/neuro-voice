@@ -7,6 +7,7 @@ Run with:
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated
@@ -29,7 +30,7 @@ from registry.catalog import InvalidVoiceId
 
 from . import streaming
 from .admin import admin_router
-from .auth_legacy import require_api_key  # noqa: F401 — BC shim, see module docstring
+from .auth_legacy import require_api_key  # legacy gateway auth — Faz A.6 cutover removes
 from .config import settings
 from .engine import (
     BaseSynthEngine,
@@ -102,9 +103,10 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="NQAI Voice — Türkçe TTS Platform",
     description=(
-        "Türkçe + voice-cloning + streaming TTS API on Chatterbox Multilingual. "
+        "Türkçe + voice-cloning + streaming TTS API on VoxCPM2 (Apache 2.0). "
         "Catalog-based voices (`/v1/voices`), HTTP synthesis (`/v1/tts`), and "
-        "sentence-chunked streaming (`/v1/tts/stream`)."
+        "sentence-chunked streaming (`/v1/tts/stream`). "
+        "Admin surface (DB-backed JWT) lives under `/admin`."
     ),
     version=VERSION,
     lifespan=lifespan,
@@ -325,7 +327,7 @@ def run() -> None:
     uvicorn.run(
         "server.main:app",
         host="0.0.0.0",
-        port=int(__import__("os").environ.get("NQAI_PORT", "8000")),
+        port=int(os.environ.get("NQAI_PORT", "8000")),
         log_level="info",
     )
 
