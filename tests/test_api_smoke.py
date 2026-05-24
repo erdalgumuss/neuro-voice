@@ -192,6 +192,41 @@ def test_tts_voice_404(client):
     assert r.status_code == 404
 
 
+def test_loads_manifest_with_unquoted_iso_datetime(client, tmp_path: Path):
+    """YAML auto-parses ISO 8601 timestamps as `datetime`; the registry must
+    still hand the API layer a plain string, or `GET /v1/voices/{id}` 500s."""
+    import yaml
+    from registry.catalog import VoiceRegistry
+
+    voices_dir = tmp_path / "vdir"
+    ref_dir = tmp_path / "rdir"
+    voices_dir.mkdir()
+    ref_dir.mkdir()
+    (ref_dir / "ref.wav").write_bytes(_make_wav_bytes())
+    (voices_dir / "yaml-ts.yaml").write_text(
+        yaml.safe_dump({
+            "voice_id": "yaml-ts",
+            "display_name": "YAML timestamp test",
+            "language": "tr",
+            "gender": "neutral",
+            "style_tags": ["a", "b"],
+            "reference_audio": "ref.wav",
+            "reference_seconds": 1.0,
+            "source": "test",
+            "license": "internal-bridge",
+            "created_at": "2026-05-19T20:17:18+00:00",
+            "created_by": "system",
+        }),
+        encoding="utf-8",
+    )
+    reg = VoiceRegistry(voices_dir=voices_dir, reference_dir=ref_dir)
+    v = reg.get("yaml-ts")
+    assert isinstance(v.created_at, str)
+    # Round-trip the public dict (this is what the API endpoint does)
+    public = v.to_public()
+    assert isinstance(public["created_at"], str)
+
+
 def test_tts_stream(client):
     wav = _make_wav_bytes()
     client.post(

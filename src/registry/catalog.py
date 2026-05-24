@@ -24,11 +24,36 @@ import json
 import re
 import threading
 from dataclasses import dataclass, asdict
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import yaml
+
+
+def _normalize_manifest_dict(raw: dict[str, Any]) -> dict[str, Any]:
+    """Coerce types that PyYAML auto-parses (datetime, date, int) into the
+    string / list forms the `Voice` dataclass expects.
+
+    Manifests are edited by humans in YAML, where `2026-05-19T20:17:18+00:00`
+    parses as a `datetime` and an unquoted `2.4` parses as a float. The
+    catalog layer keeps everything as JSON-friendly primitives so the public
+    Pydantic schema is straightforward and so round-tripping through
+    yaml.safe_dump produces the same file.
+    """
+    if not isinstance(raw, dict):
+        raise TypeError(f"manifest root must be a mapping, got {type(raw).__name__}")
+    out = dict(raw)
+    for key in ("created_at",):
+        v = out.get(key)
+        if isinstance(v, (datetime, date)):
+            out[key] = v.isoformat()
+    tags = out.get("style_tags")
+    if tags is None:
+        out["style_tags"] = []
+    elif isinstance(tags, str):
+        out["style_tags"] = [t.strip() for t in tags.split(",") if t.strip()]
+    return out
 
 
 VOICE_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$")
@@ -97,6 +122,7 @@ class VoiceRegistry:
             for manifest_path in sorted(self.voices_dir.glob("*.yaml")):
                 try:
                     raw = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+                    raw = _normalize_manifest_dict(raw)
                     voice = Voice(**raw)
                     self._cache[voice.voice_id] = voice
                 except (yaml.YAMLError, TypeError, ValueError) as e:
