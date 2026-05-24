@@ -292,6 +292,46 @@ async def test_ensure_consumer_group_is_idempotent(setup):
     # No exception = success. fakeredis BUSYGROUP error is caught.
 
 
+async def test_xautoclaim_runs_periodically_under_busy_traffic(setup):
+    """Codex audit 2026-05-24: XAUTOCLAIM must run even when the queue
+    is never idle. Otherwise a fast producer can keep tick handling
+    busy and a crashed worker's PEL message strands indefinitely.
+
+    We simulate sustained traffic by enqueuing many jobs and asserting
+    that XAUTOCLAIM is invoked at least once within `xautoclaim_period_s`
+    even though `not handled` never fires."""
+    from server.queue import DEFAULT_STREAM, TtsJobQueue
+    from worker.consumer import WorkerConsumer
+
+    redis = fakeredis.aioredis.FakeRedis()
+    queue = TtsJobQueue(redis, stream=DEFAULT_STREAM)
+    # 10 jobs in the queue — consumer will be busy for several ticks.
+    for _ in range(10):
+        await _enqueue_job(redis, queue, setup)
+
+    consumer = WorkerConsumer(
+        redis=redis, engine=_StubEngine(),
+        resolve_reference=_resolver(setup),
+        archive_to_r2=_local_archiver(setup),
+        xautoclaim_period_s=0.0,  # sweep on every iteration
+    )
+
+    sweeps: list[int] = []
+    real_sweep = consumer._xautoclaim_sweep
+
+    async def spy_sweep() -> None:
+        sweeps.append(1)
+        await real_sweep()
+
+    consumer._xautoclaim_sweep = spy_sweep
+    await consumer.run(max_iterations=3)
+
+    # Under busy traffic (10 jobs, handled=True every tick), we still
+    # see ≥1 periodic sweep. With period_s=0 every iter triggers.
+    assert len(sweeps) >= 1
+    assert consumer.acked >= 1  # at least one job processed
+
+
 async def test_default_consumer_name_is_unique_per_pid():
     from worker.consumer import _default_consumer_name
 

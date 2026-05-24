@@ -117,6 +117,7 @@ class WorkerConsumer:
         consumer_name: str | None = None,
         block_ms: int = 5_000,
         xautoclaim_min_idle_ms: int = 30_000,
+        xautoclaim_period_s: float = 5.0,
         resolve_reference: ReferenceResolver | None = None,
         archive_to_r2: _ArchiveCallable | None = None,
         stop_event: asyncio.Event | None = None,
@@ -128,6 +129,12 @@ class WorkerConsumer:
         self._consumer_name = consumer_name or _default_consumer_name()
         self._block_ms = block_ms
         self._xautoclaim_idle_ms = xautoclaim_min_idle_ms
+        # Periodic sweep cadence — XAUTOCLAIM also runs under sustained
+        # traffic, not just when the queue is idle (Codex audit 2026-05-24).
+        # Under busy traffic, idle ticks rarely fire, so a worker crash
+        # could otherwise strand a message for ages.
+        self._xautoclaim_period_s = xautoclaim_period_s
+        self._last_xautoclaim_at = 0.0
         self._resolve_reference = resolve_reference
         self._archive_to_r2 = archive_to_r2
         self._stop = stop_event or asyncio.Event()
@@ -163,6 +170,8 @@ class WorkerConsumer:
         )
         iters = 0
         idle_yield_s = max(self._block_ms, 1) / 1000.0
+        loop = asyncio.get_running_loop()
+        self._last_xautoclaim_at = loop.time()
         while not self._stop.is_set():
             if max_iterations is not None and iters >= max_iterations:
                 return
@@ -176,10 +185,19 @@ class WorkerConsumer:
                 handled = False
             if self._stop.is_set():
                 return
-            if not handled:
-                # Idle slice — XAUTOCLAIM stale work, then yield so the
-                # stop event (or any other task) gets scheduled.
+
+            # XAUTOCLAIM strategy (Codex audit 2026-05-24): sweep on
+            # *every* idle tick AND periodically under sustained traffic.
+            # Idle alone misses crashed-worker recovery when the queue
+            # never drains (a fast producer can keep us busy forever).
+            now = loop.time()
+            elapsed_since_sweep = now - self._last_xautoclaim_at
+            if not handled or elapsed_since_sweep >= self._xautoclaim_period_s:
                 await self._xautoclaim_sweep()
+                self._last_xautoclaim_at = loop.time()
+
+            if not handled:
+                # Yield to other tasks (stop_event, etc.) — see docstring.
                 await asyncio.sleep(idle_yield_s)
 
     async def _tick(self) -> bool:
