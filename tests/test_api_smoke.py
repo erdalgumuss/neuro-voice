@@ -1,0 +1,212 @@
+"""End-to-end API smoke — registry CRUD + auth, model stubbed.
+
+This test runs without GPU / Chatterbox by injecting a fake engine that
+returns a fixed PCM blob, so the FastAPI dependency graph and the
+streaming/wav code paths get exercised on CI-class machines.
+"""
+
+from __future__ import annotations
+
+import io
+import os
+import sys
+import wave
+from pathlib import Path
+
+import numpy as np
+import pytest
+import soundfile as sf
+
+# Stub chatterbox before importing the server, so loading does not pull torch.
+fake_module = type(sys)("chatterbox")
+fake_mtl = type(sys)("chatterbox.mtl_tts")
+
+
+class _StubModel:
+    sr = 24000
+
+    def generate(self, text, *, language_id, audio_prompt_path):
+        import torch
+
+        duration = 0.5 + 0.05 * len(text)
+        samples = int(duration * self.sr)
+        wav = torch.zeros(1, samples)
+        return wav
+
+
+class _StubFactory:
+    @staticmethod
+    def from_pretrained(device):
+        return _StubModel()
+
+
+fake_mtl.ChatterboxMultilingualTTS = _StubFactory
+fake_module.mtl_tts = fake_mtl
+sys.modules["chatterbox"] = fake_module
+sys.modules["chatterbox.mtl_tts"] = fake_mtl
+
+
+@pytest.fixture()
+def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    voices_dir = tmp_path / "voices"
+    ref_dir = tmp_path / "ref"
+    voices_dir.mkdir()
+    ref_dir.mkdir()
+
+    sr = 24000
+    seed = np.zeros(sr, dtype=np.float32)
+    sf.write(ref_dir / "seed.wav", seed, sr)
+
+    monkeypatch.setenv("NQAI_VOICES_DIR", str(voices_dir))
+    monkeypatch.setenv("NQAI_REFERENCE_DIR", str(ref_dir))
+    monkeypatch.setenv("NQAI_API_KEYS", "test-key-1,test-key-2")
+    monkeypatch.setenv("NQAI_REQUIRE_AUTH", "true")
+
+    # Force reload to pick up env
+    for mod_name in list(sys.modules):
+        if mod_name.startswith(("server", "registry", "frontend")):
+            del sys.modules[mod_name]
+
+    from fastapi.testclient import TestClient
+    from server.main import app
+
+    with TestClient(app) as c:
+        yield c
+
+
+HEADERS = {"Authorization": "Bearer test-key-1"}
+
+
+def _make_wav_bytes(duration_s: float = 2.0, sr: int = 24000) -> bytes:
+    audio = (np.random.randn(int(duration_s * sr)) * 0.1).astype(np.float32)
+    buf = io.BytesIO()
+    sf.write(buf, audio, sr, format="WAV", subtype="PCM_16")
+    return buf.getvalue()
+
+
+def test_health(client):
+    r = client.get("/health")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] in {"ok", "warming"}
+    assert body["version"] == "0.1.0"
+
+
+def test_auth_rejects_missing_key(client):
+    r = client.get("/v1/voices")
+    assert r.status_code == 401
+
+
+def test_auth_rejects_bad_key(client):
+    r = client.get("/v1/voices", headers={"Authorization": "Bearer bogus"})
+    assert r.status_code == 401
+
+
+def test_list_voices_empty(client):
+    r = client.get("/v1/voices", headers=HEADERS)
+    assert r.status_code == 200
+    assert r.json() == {"voices": [], "count": 0}
+
+
+def test_enroll_and_list_and_delete(client):
+    wav = _make_wav_bytes()
+    r = client.post(
+        "/v1/voices",
+        headers=HEADERS,
+        data={
+            "voice_id": "alice-warm-01",
+            "display_name": "Alice (warm)",
+            "language": "tr",
+            "gender": "female",
+            "style_tags": "warm,clear",
+        },
+        files={"reference_audio": ("alice.wav", wav, "audio/wav")},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["voice"]["voice_id"] == "alice-warm-01"
+    assert body["voice"]["style_tags"] == ["warm", "clear"]
+
+    listing = client.get("/v1/voices", headers=HEADERS).json()
+    assert listing["count"] == 1
+
+    r2 = client.delete("/v1/voices/alice-warm-01", headers=HEADERS)
+    assert r2.status_code == 200
+
+    listing = client.get("/v1/voices", headers=HEADERS).json()
+    assert listing["count"] == 0
+
+
+def test_enroll_rejects_bad_id(client):
+    wav = _make_wav_bytes()
+    r = client.post(
+        "/v1/voices",
+        headers=HEADERS,
+        data={"voice_id": "Bad Id!", "display_name": "x"},
+        files={"reference_audio": ("x.wav", wav, "audio/wav")},
+    )
+    assert r.status_code == 400
+
+
+def test_enroll_rejects_duplicate(client):
+    wav = _make_wav_bytes()
+    fields = {"voice_id": "dup-01", "display_name": "Dup"}
+    files = lambda: {"reference_audio": ("d.wav", _make_wav_bytes(), "audio/wav")}
+    r1 = client.post("/v1/voices", headers=HEADERS, data=fields, files=files())
+    assert r1.status_code == 200
+    r2 = client.post("/v1/voices", headers=HEADERS, data=fields, files=files())
+    assert r2.status_code == 409
+
+
+def test_tts_with_stub_engine(client):
+    wav = _make_wav_bytes()
+    client.post(
+        "/v1/voices",
+        headers=HEADERS,
+        data={"voice_id": "bob-01", "display_name": "Bob"},
+        files={"reference_audio": ("b.wav", wav, "audio/wav")},
+    )
+    r = client.post(
+        "/v1/tts",
+        headers=HEADERS,
+        json={"text": "Merhaba dünya. Bu bir test cümlesidir.", "voice_id": "bob-01"},
+    )
+    assert r.status_code == 200, r.text
+    assert r.headers["content-type"].startswith("audio/wav")
+    assert int(r.headers["X-NQAI-Sentences"]) >= 1
+    assert int(r.headers["X-NQAI-Sample-Rate"]) == 24000
+    # Parse it as WAV to confirm the bytes are valid
+    with wave.open(io.BytesIO(r.content), "rb") as w:
+        assert w.getnchannels() == 1
+        assert w.getsampwidth() == 2
+        assert w.getframerate() == 24000
+        assert w.getnframes() > 0
+
+
+def test_tts_voice_404(client):
+    r = client.post(
+        "/v1/tts",
+        headers=HEADERS,
+        json={"text": "merhaba", "voice_id": "nobody-here"},
+    )
+    assert r.status_code == 404
+
+
+def test_tts_stream(client):
+    wav = _make_wav_bytes()
+    client.post(
+        "/v1/voices",
+        headers=HEADERS,
+        data={"voice_id": "carol-01", "display_name": "Carol"},
+        files={"reference_audio": ("c.wav", wav, "audio/wav")},
+    )
+    with client.stream(
+        "POST",
+        "/v1/tts/stream",
+        headers=HEADERS,
+        json={"text": "Birinci cümle. İkinci cümle burada.", "voice_id": "carol-01"},
+    ) as r:
+        chunks = b"".join(r.iter_bytes())
+    assert chunks.startswith(b"RIFF")
+    assert b"WAVE" in chunks[:20]
+    assert len(chunks) > 44  # header + at least some PCM

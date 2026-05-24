@@ -1,0 +1,56 @@
+# 5-slot launch catalog:
+#   - 1 NEEKO character voice
+#   - 2 NIVA application voices
+#   - 2 NeuroCourse instructor voices
+#
+# Slot 1 is the NEEKO bridge voice; the rest are placeholders that should be
+# replaced with real, legally clean reference recordings before launch.
+#
+# Until then they can be populated either by (a) calling POST /v1/voices with a
+# real reference audio file, or (b) running `bootstrap_voices.py` which uploads
+# whatever sits in data/reference-audio/ under the matching filename below.
+voices:
+  - voice_id: neeko-v01
+    display_name: "NEEKO v0.1 (köprü)"
+    language: tr
+    gender: neutral
+    style_tags: [warm, child-directed, storyteller, androgynous]
+    source: elevenlabs
+    license: internal-bridge
+    reference_audio: neeko-v0.1-reference.mp3
+
+  - voice_id: niva-agent-f01
+    display_name: "NIVA Agent Female v0.1"
+    language: tr
+    gender: female
+    style_tags: [professional, clear, warm, call-center]
+    source: placeholder
+    license: internal-placeholder
+    reference_audio: niva-agent-f01-reference.wav
+
+  - voice_id: niva-agent-m01
+    display_name: "NIVA Agent Male v0.1"
+    language: tr
+    gender: male
+    style_tags: [professional, clear, neutral, call-center]
+    source: placeholder
+    license: internal-placeholder
+    reference_audio: niva-agent-m01-reference.wav
+
+  - voice_id: neurocourse-tutor-f01
+    display_name: "NeuroCourse Tutor Female v0.1"
+    language: tr
+    gender: female
+    style_tags: [didactic, engaging, paced, instructor]
+    source: placeholder
+    license: internal-placeholder
+    reference_audio: neurocourse-tutor-f01-reference.wav
+
+  - voice_id: neurocourse-tutor-m01
+    display_name: "NeuroCourse Tutor Male v0.1"
+    language: tr
+    gender: male
+    style_tags: [didactic, calm, paced, instructor]
+    source: placeholder
+    license: internal-placeholder
+    reference_audio: neurocourse-tutor-m01-reference.wav

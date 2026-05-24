@@ -52,3 +52,19 @@ secrets/
 *.pem
 *.key
 credentials.*
+
+# Build artefacts
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Server runtime
+server.log
+cloudflared.log
+
+# Test outputs (per-session experiment directories under experiments/
+# are kept by design; only ephemeral platform-smoke runs are excluded)
+experiments/platform-smoke/
