@@ -47,7 +47,7 @@ class _StubModel:
 
 class _StubFactory:
     @staticmethod
-    def from_pretrained(model_id, load_denoiser=False):
+    def from_pretrained(model_id, **_kwargs):
         return _StubModel()
 
 
@@ -238,6 +238,43 @@ def test_loads_manifest_with_unquoted_iso_datetime(client, tmp_path: Path):
     # Round-trip the public dict (this is what the API endpoint does)
     public = v.to_public()
     assert isinstance(public["created_at"], str)
+
+
+def test_manifest_accepts_private_lora_adapter_fields(client, tmp_path: Path):
+    import yaml
+
+    from registry.catalog import VoiceRegistry
+
+    voices_dir = tmp_path / "vdir"
+    ref_dir = tmp_path / "rdir"
+    voices_dir.mkdir()
+    ref_dir.mkdir()
+    (ref_dir / "ref.wav").write_bytes(_make_wav_bytes())
+    (voices_dir / "neeko-proto.yaml").write_text(
+        yaml.safe_dump({
+            "voice_id": "neeko-proto",
+            "display_name": "NEEKO proto",
+            "language": "tr",
+            "gender": "neutral",
+            "style_tags": ["warm", "child-directed"],
+            "reference_audio": "ref.wav",
+            "reference_seconds": 1.0,
+            "source": "voice-talent",
+            "license": "internal-owned",
+            "created_at": "2026-05-24T00:00:00+00:00",
+            "created_by": "system",
+            "adapter": {"type": "lora", "path": "/models/neeko/lora/latest"},
+            "engine_params": {"cfg_value": 1.5, "inference_timesteps": 20},
+        }),
+        encoding="utf-8",
+    )
+
+    voice = VoiceRegistry(voices_dir=voices_dir, reference_dir=ref_dir).get("neeko-proto")
+    assert voice.adapter == {"type": "lora", "path": "/models/neeko/lora/latest"}
+    assert voice.engine_params == {"cfg_value": 1.5, "inference_timesteps": 20}
+    public = voice.to_public()
+    assert "adapter" not in public
+    assert "engine_params" not in public
 
 
 def test_tts_stream(client):

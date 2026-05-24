@@ -70,7 +70,15 @@ def get_registry() -> VoiceRegistry:
 def get_engine_dep() -> BaseSynthEngine:
     global _engine
     if _engine is None:
-        _engine = get_engine(model_id=settings.model_id, device=settings.device)
+        _engine = get_engine(
+            model_id=settings.model_id,
+            device=settings.device,
+            lora_path=settings.lora_path,
+            lora_config_path=settings.lora_config_path,
+            cfg_value=settings.cfg_value,
+            inference_timesteps=settings.inference_timesteps,
+            optimize=settings.optimize,
+        )
     return _engine
 
 

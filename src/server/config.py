@@ -20,7 +20,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 def _env_path(name: str, default: Path) -> Path:
     raw = os.environ.get(name)
-    return Path(raw).expanduser().resolve() if raw else default
+    return Path(os.path.expandvars(raw)).expanduser().resolve() if raw else default
 
 
 def _env_list(name: str, default: list[str]) -> list[str]:
@@ -42,7 +42,20 @@ class Settings:
     model_id: str = field(default_factory=lambda: os.environ.get(
         "NQAI_MODEL_ID", "openbmb/VoxCPM2"
     ))
+    lora_path: Path | None = field(default_factory=lambda: _env_path(
+        "NQAI_LORA_PATH", Path(os.environ["NQAI_LORA_PATH"])
+    ) if os.environ.get("NQAI_LORA_PATH") else None)
+    lora_config_path: Path | None = field(default_factory=lambda: _env_path(
+        "NQAI_LORA_CONFIG_PATH", Path(os.environ["NQAI_LORA_CONFIG_PATH"])
+    ) if os.environ.get("NQAI_LORA_CONFIG_PATH") else None)
     device: str = field(default_factory=lambda: os.environ.get("NQAI_DEVICE", "auto"))
+    optimize: bool = field(default_factory=lambda: _env_bool("NQAI_OPTIMIZE", False))
+    cfg_value: float = field(default_factory=lambda: float(
+        os.environ.get("NQAI_CFG_VALUE", "2.0")
+    ))
+    inference_timesteps: int = field(default_factory=lambda: int(
+        os.environ.get("NQAI_INFERENCE_TIMESTEPS", "10")
+    ))
     max_chars_per_request: int = field(default_factory=lambda: int(
         os.environ.get("NQAI_MAX_CHARS", "4000")
     ))

@@ -16,6 +16,8 @@ Manifest schema (v0):
     license: str            # "internal-bridge" | "talent-contract:<id>" | "user-owned"
     created_at: str         # ISO-8601 UTC
     created_by: str         # api_key prefix or "system"
+    adapter: dict | None    # optional model adapter, e.g. {"type": "lora", "path": "..."}
+    engine_params: dict | None  # optional per-voice inference knobs
 """
 
 from __future__ import annotations
@@ -85,14 +87,22 @@ class Voice:
     license: str
     created_at: str
     created_by: str
+    adapter: dict[str, Any] | None = None
+    engine_params: dict[str, Any] | None = None
 
     def to_public(self) -> dict[str, Any]:
         d = asdict(self)
         d.pop("reference_audio", None)
+        d.pop("adapter", None)
+        d.pop("engine_params", None)
         return d
 
     def reference_path(self, base: Path) -> Path:
         return base / self.reference_audio
+
+    def to_manifest(self) -> dict[str, Any]:
+        """Full YAML manifest representation, omitting unset optional fields."""
+        return {k: v for k, v in asdict(self).items() if v is not None}
 
 
 def validate_voice_id(voice_id: str) -> str:
@@ -203,7 +213,7 @@ class VoiceRegistry:
             )
             manifest_path = self.voices_dir / f"{voice_id}.yaml"
             manifest_path.write_text(
-                yaml.safe_dump(asdict(voice), sort_keys=False, allow_unicode=True),
+                yaml.safe_dump(voice.to_manifest(), sort_keys=False, allow_unicode=True),
                 encoding="utf-8",
             )
             self._cache[voice_id] = voice

@@ -221,6 +221,48 @@ python lora_ft_webui.py
 
 **Şu an yapılmadı.** `src/finetune/` boş — Faz 3 gelince doldurulur.
 
+### 7.1 LoRA runtime usage
+
+Platform runtime artık iki LoRA kullanım yolunu destekler:
+
+**Hızlı demo / tek adapter:**
+
+```bash
+export NQAI_MODEL_ID=/content/drive/MyDrive/nqai-voice/models/VoxCPM2
+export NQAI_LORA_PATH=/content/drive/MyDrive/nqai-voice/finetune/neeko-proto-v0/checkpoints/lora/latest
+export NQAI_DEVICE=cuda
+export NQAI_CFG_VALUE=1.5
+export NQAI_INFERENCE_TIMESTEPS=20
+```
+
+Bu modda bütün catalog sesleri aynı LoRA ile çalışır; demo ve doğrulama için hızlıdır.
+
+**Kalıcı catalog / per-voice adapter:**
+
+```yaml
+voice_id: neeko-proto-v0
+display_name: NEEKO proto v0
+language: tr
+gender: neutral
+style_tags: [warm, child-directed, storyteller]
+reference_audio: neeko-proto-v0-reference.wav
+reference_seconds: 15.0
+source: voice-talent
+license: internal-owned
+created_at: "2026-05-24T00:00:00+00:00"
+created_by: system
+adapter:
+  type: lora
+  path: /content/drive/MyDrive/nqai-voice/finetune/neeko-proto-v0/checkpoints/lora/latest
+engine_params:
+  cfg_value: 1.5
+  inference_timesteps: 20
+```
+
+Bu modda `voice_id` kendi LoRA adapter'ını seçer. Engine adapter cache kullanır;
+aynı process içinde birden fazla LoRA tutulabilir, fakat gerçek production'da her
+GPU worker'ın sınırlı sayıda hot adapter taşıması gerekir.
+
 ---
 
 ## 8. Kısıtlamalar (OpenBMB resmi)

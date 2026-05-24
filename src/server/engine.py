@@ -18,7 +18,9 @@ Key VoxCPM2 traits we lean on:
 from __future__ import annotations
 
 import io
+import json
 import logging
+import os
 import threading
 import time
 import wave
@@ -112,6 +114,52 @@ DEFAULT_INFERENCE_TIMESTEPS = 10
 DEFAULT_SAMPLE_RATE = 48000
 
 
+@dataclass(frozen=True)
+class LoRAAdapterSpec:
+    """Local VoxCPM2 LoRA adapter loaded alongside the base model."""
+    path: Path
+    config_path: Path | None = None
+
+    @property
+    def cache_key(self) -> tuple[str, str | None]:
+        return (str(self.path), str(self.config_path) if self.config_path else None)
+
+
+def _expand_runtime_path(raw: str | Path) -> Path:
+    return Path(os.path.expandvars(str(raw))).expanduser().resolve()
+
+
+def _lora_from_mapping(raw: dict | None) -> LoRAAdapterSpec | None:
+    if not raw:
+        return None
+    adapter_type = str(raw.get("type", "lora")).lower()
+    if adapter_type != "lora":
+        raise ValueError(f"unsupported adapter type '{adapter_type}'")
+    raw_path = raw.get("path") or raw.get("lora_path") or raw.get("uri")
+    if not raw_path:
+        raise ValueError("lora adapter requires 'path'")
+    raw_config_path = raw.get("config_path") or raw.get("lora_config_path")
+    return LoRAAdapterSpec(
+        path=_expand_runtime_path(raw_path),
+        config_path=_expand_runtime_path(raw_config_path) if raw_config_path else None,
+    )
+
+
+def _read_lora_config(adapter: LoRAAdapterSpec):
+    config_path = adapter.config_path or adapter.path / "lora_config.json"
+    if not config_path.is_file():
+        raise FileNotFoundError(f"LoRA config missing: {config_path}")
+
+    try:
+        from voxcpm.model.voxcpm import LoRAConfig
+    except Exception:
+        from voxcpm.model.voxcpm2 import LoRAConfig
+
+    raw = json.loads(config_path.read_text(encoding="utf-8"))
+    payload = raw.get("lora_config", raw)
+    return LoRAConfig(**payload)
+
+
 class VoxCPM2Engine:
     """VoxCPM2 adapter.
 
@@ -132,57 +180,107 @@ class VoxCPM2Engine:
         cfg_value: float = DEFAULT_CFG_VALUE,
         inference_timesteps: int = DEFAULT_INFERENCE_TIMESTEPS,
         load_denoiser: bool = False,
+        lora_path: Path | None = None,
+        lora_config_path: Path | None = None,
+        optimize: bool = False,
     ) -> None:
         self._model_id = model_id
         self._device = _resolve_device(device)
         self._cfg_value = cfg_value
         self._inference_timesteps = inference_timesteps
         self._load_denoiser = load_denoiser
-        self._model = None
+        self._optimize = optimize
+        self._default_adapter = (
+            LoRAAdapterSpec(path=lora_path, config_path=lora_config_path)
+            if lora_path
+            else None
+        )
+        self._models: dict[tuple[str, tuple[str, str | None] | None], object] = {}
+        self._model = None  # compatibility hook used by /health and old tests
         self._load_lock = threading.Lock()
         self._inference_lock = threading.Lock()
         self.sample_rate = DEFAULT_SAMPLE_RATE
 
     def _load(self) -> None:
-        if self._model is not None:
+        if self._models:
             return
-        with self._load_lock:
-            if self._model is not None:
-                return
-            from voxcpm import VoxCPM
-
-            logger.info("loading %s on %s", self._model_id, self._device)
-            t0 = time.time()
-            self._model = VoxCPM.from_pretrained(
-                self._model_id,
-                load_denoiser=self._load_denoiser,
-            )
-            # VoxCPM2 advertises sample rate on the inner tts_model
-            inner_sr = getattr(getattr(self._model, "tts_model", None), "sample_rate", None)
-            if inner_sr:
-                self.sample_rate = int(inner_sr)
-            logger.info(
-                "model ready in %.1fs (sr=%d Hz, device=%s, cfg=%.2f, steps=%d)",
-                time.time() - t0,
-                self.sample_rate,
-                self._device,
-                self._cfg_value,
-                self._inference_timesteps,
-            )
+        self._model_for_adapter(self._default_adapter)
 
     def warmup(self) -> None:
         self._load()
 
     # ----- internals ----------------------------------------------------
 
-    def _generate_one(self, text: str, reference_path: Path) -> np.ndarray:
+    def _adapter_for_voice(self, voice: Voice) -> LoRAAdapterSpec | None:
+        return _lora_from_mapping(voice.adapter) or self._default_adapter
+
+    def _model_for_adapter(self, adapter: LoRAAdapterSpec | None):
+        key = (self._model_id, adapter.cache_key if adapter else None)
+        cached = self._models.get(key)
+        if cached is not None:
+            return cached
+        with self._load_lock:
+            cached = self._models.get(key)
+            if cached is not None:
+                return cached
+
+            from voxcpm import VoxCPM
+
+            kwargs = {
+                "load_denoiser": self._load_denoiser,
+                "optimize": self._optimize,
+                "device": self._device,
+            }
+            adapter_label = "base"
+            if adapter is not None:
+                if not adapter.path.exists():
+                    raise FileNotFoundError(f"LoRA adapter path missing: {adapter.path}")
+                kwargs["lora_config"] = _read_lora_config(adapter)
+                kwargs["lora_weights_path"] = str(adapter.path)
+                adapter_label = str(adapter.path)
+
+            logger.info(
+                "loading %s on %s (adapter=%s)",
+                self._model_id,
+                self._device,
+                adapter_label,
+            )
+            t0 = time.time()
+            model = VoxCPM.from_pretrained(self._model_id, **kwargs)
+            inner_sr = getattr(getattr(model, "tts_model", None), "sample_rate", None)
+            if inner_sr:
+                self.sample_rate = int(inner_sr)
+            self._models[key] = model
+            self._model = model
+            logger.info(
+                "model ready in %.1fs (sr=%d Hz, device=%s, cfg=%.2f, steps=%d, adapter=%s)",
+                time.time() - t0,
+                self.sample_rate,
+                self._device,
+                self._cfg_value,
+                self._inference_timesteps,
+                adapter_label,
+            )
+            return model
+
+    def _engine_params_for_voice(self, voice: Voice) -> tuple[float, int]:
+        params = voice.engine_params or {}
+        cfg_value = float(params.get("cfg_value", self._cfg_value))
+        inference_timesteps = int(
+            params.get("inference_timesteps", params.get("timesteps", self._inference_timesteps))
+        )
+        return cfg_value, inference_timesteps
+
+    def _generate_one(self, text: str, voice: Voice, reference_path: Path) -> np.ndarray:
         """Single synthesis call. Returns float32 mono numpy at self.sample_rate."""
+        model = self._model_for_adapter(self._adapter_for_voice(voice))
+        cfg_value, inference_timesteps = self._engine_params_for_voice(voice)
         with self._inference_lock:
-            wav = self._model.generate(
+            wav = model.generate(
                 text=text,
                 reference_wav_path=str(reference_path),
-                cfg_value=self._cfg_value,
-                inference_timesteps=self._inference_timesteps,
+                cfg_value=cfg_value,
+                inference_timesteps=inference_timesteps,
                 # Our Turkish frontend already normalized the text — keep VoxCPM2's
                 # built-in TN off so it doesn't double-rewrite numerals/abbrs.
                 normalize=False,
@@ -228,7 +326,7 @@ class VoxCPM2Engine:
 
         for idx, segment in enumerate(segments):
             t0 = time.time()
-            wav_np = self._generate_one(segment, reference_path)
+            wav_np = self._generate_one(segment, voice, reference_path)
             elapsed_ms = (time.time() - t0) * 1000.0
             yield SynthChunk(
                 pcm_int16=_float_to_pcm16(wav_np),
@@ -276,11 +374,28 @@ _engine_singleton: BaseSynthEngine | None = None
 _engine_singleton_lock = threading.Lock()
 
 
-def get_engine(model_id: str, device: str = "auto") -> BaseSynthEngine:
+def get_engine(
+    model_id: str,
+    device: str = "auto",
+    *,
+    lora_path: Path | None = None,
+    lora_config_path: Path | None = None,
+    cfg_value: float = DEFAULT_CFG_VALUE,
+    inference_timesteps: int = DEFAULT_INFERENCE_TIMESTEPS,
+    optimize: bool = False,
+) -> BaseSynthEngine:
     global _engine_singleton
     if _engine_singleton is not None:
         return _engine_singleton
     with _engine_singleton_lock:
         if _engine_singleton is None:
-            _engine_singleton = VoxCPM2Engine(model_id=model_id, device=device)
+            _engine_singleton = VoxCPM2Engine(
+                model_id=model_id,
+                device=device,
+                lora_path=lora_path,
+                lora_config_path=lora_config_path,
+                cfg_value=cfg_value,
+                inference_timesteps=inference_timesteps,
+                optimize=optimize,
+            )
         return _engine_singleton
