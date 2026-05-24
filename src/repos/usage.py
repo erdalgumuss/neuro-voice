@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from db.models import UsageRecord
@@ -35,6 +35,7 @@ class UsageRepo:
         reference_resolve_ms: int | None = None,
         first_pcm_ms: int | None = None,
         first_audio_ms: int | None = None,
+        gateway_first_byte_ms: int | None = None,
         rtf: float | None = None,
         status: str = "ok",
         error_code: str | None = None,
@@ -58,6 +59,7 @@ class UsageRepo:
             reference_resolve_ms=reference_resolve_ms,
             first_pcm_ms=first_pcm_ms,
             first_audio_ms=first_audio_ms,
+            gateway_first_byte_ms=gateway_first_byte_ms,
             rtf=rtf,
             status=status,
             error_code=error_code,
@@ -68,6 +70,38 @@ class UsageRepo:
         self.session.add(rec)
         await self.session.flush()
         return rec
+
+    async def update_gateway_first_byte_ms(
+        self, request_id: uuid.UUID, gateway_first_byte_ms: int,
+    ) -> int:
+        """Gateway-side waterfall stitching (Faz C v1 item 1).
+
+        The worker writes the usage row when its pipeline completes. The
+        gateway then UPDATEs the `gateway_first_byte_ms` column on the
+        SAME row, keyed on (tenant_id, request_id). Two-phase pattern
+        because the gateway can't measure first-byte until AFTER the
+        worker has already produced the chunk, and the worker can't
+        measure the gateway's TTFB.
+
+        Returns the number of rows updated:
+          0 — usage row hasn't been written yet (worker still mid-pipeline
+              or crashed before commit). Caller decides whether to retry.
+          1 — happy path.
+        """
+        if gateway_first_byte_ms < 0:
+            raise ValueError(
+                f"gateway_first_byte_ms must be non-negative, got "
+                f"{gateway_first_byte_ms}"
+            )
+        result = await self.session.execute(
+            update(UsageRecord)
+            .where(
+                UsageRecord.tenant_id == self.tenant_id,
+                UsageRecord.request_id == request_id,
+            )
+            .values(gateway_first_byte_ms=gateway_first_byte_ms)
+        )
+        return result.rowcount or 0
 
     async def recent(self, limit: int = 100) -> list[UsageRecord]:
         return list((await self.session.execute(

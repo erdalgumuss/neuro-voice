@@ -43,9 +43,10 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from audio.wav import pcm16_to_wav_bytes
-from db.session import get_session
+from db.session import AsyncSessionLocal, get_session
 from observability import (
     QUEUE_DEPTH,
+    TTS_GATEWAY_FIRST_BYTE_SECONDS,
     TTS_REQUESTS,
     WORKER_CAPACITY,
     WORKER_COUNT,
@@ -676,11 +677,25 @@ async def synthesize_stream(
 
     sample_rate = settings.target_sample_rate
     headers = {
+        # NOTE: /v1/tts/stream is the PRIMARY streaming endpoint — these
+        # deprecation headers shouldn't be here. Keep for one release to
+        # avoid breaking existing parsers; remove once clients confirm.
         **_SYNC_DEPRECATION_HEADERS,
         "X-NQAI-Request-Id": str(rid),
         "X-NQAI-Sample-Rate": str(sample_rate),
         "X-NQAI-Voice-Id": db_voice.voice_id,
     }
+
+    # Faz C v1 item 1 — gateway-side TTFB measurement.
+    # Captured at the start of request handling; the streaming generator
+    # records the first-byte timestamp and a background task UPDATEs the
+    # usage row (worker writes the row first when its pipeline commits;
+    # gateway just stitches its own column in). request_received_ms
+    # uses time.monotonic_ns rather than wall clock so a system clock
+    # jump can't produce a negative delta and trip the CHECK constraint.
+    import time as _time
+    request_received_ns = _time.monotonic_ns()
+    gateway_first_byte_ms_holder: dict[str, int] = {}
 
     async def _yield_pcm():
         try:
@@ -699,6 +714,11 @@ async def synthesize_stream(
                     break
                 if chunk.final:
                     break
+                # First PCM chunk reaching the gateway — this is the
+                # moment immediately before the byte goes onto the wire.
+                if "ms" not in gateway_first_byte_ms_holder:
+                    elapsed_ns = _time.monotonic_ns() - request_received_ns
+                    gateway_first_byte_ms_holder["ms"] = max(0, elapsed_ns // 1_000_000)
                 yield chunk.pcm_bytes
         except ResultStreamTimeout:
             logger.warning("sync-stream proxy timed out for rid=%s", rid)
@@ -718,14 +738,63 @@ async def synthesize_stream(
         async for pcm in _yield_pcm():
             yield pcm
 
+    async def _instrumented(inner):
+        """Forward `inner` and stitch gateway_first_byte_ms into the
+        usage row + Prometheus histogram after the stream completes
+        (success OR client disconnect). The worker writes the usage row
+        when its pipeline commits; the gateway updates only the column
+        it can measure. Failures are best-effort — observability MUST
+        NOT break the stream itself."""
+        try:
+            async for buf in inner:
+                yield buf
+        finally:
+            first_byte_ms = gateway_first_byte_ms_holder.get("ms")
+            if first_byte_ms is not None:
+                # No bytes ever made it out (worker error / timeout) means
+                # `first_byte_ms` is None and we skip persistence — there's
+                # no client TTFB to record.
+                try:
+                    async with AsyncSessionLocal() as s:
+                        repo = UsageRepo(s, ctx.tenant_id)
+                        rowcount = await repo.update_gateway_first_byte_ms(
+                            rid, first_byte_ms,
+                        )
+                        await s.commit()
+                    if rowcount == 0:
+                        # Worker hadn't written the usage row yet when the
+                        # gateway finished streaming. Rare — happens only on
+                        # an abrupt client disconnect before the worker has
+                        # done its DB commit. Log and move on; the row will
+                        # exist eventually but without gateway timing.
+                        logger.info(
+                            "usage row for rid=%s not yet present at stream "
+                            "end — skipping gateway_first_byte_ms stitch", rid,
+                        )
+                except Exception:
+                    logger.exception(
+                        "gateway_first_byte_ms persistence failed for rid=%s "
+                        "— stream succeeded, metric lost", rid,
+                    )
+                try:
+                    TTS_GATEWAY_FIRST_BYTE_SECONDS.labels(
+                        tenant=str(ctx.tenant_id),
+                        voice=db_voice.voice_id,
+                    ).observe(first_byte_ms / 1000.0)
+                except Exception:
+                    logger.exception(
+                        "TTS_GATEWAY_FIRST_BYTE_SECONDS observe failed — "
+                        "ignoring",
+                    )
+
     if body.audio_format == "pcm16":
         return StreamingResponse(
-            _yield_pcm(),
+            _instrumented(_yield_pcm()),
             media_type="application/octet-stream",
             headers=headers,
         )
     return StreamingResponse(
-        _yield_wav(),
+        _instrumented(_yield_wav()),
         media_type="audio/wav",
         headers=headers,
     )

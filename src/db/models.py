@@ -410,6 +410,11 @@ class UsageRecord(Base):
     reference_resolve_ms: Mapped[int | None] = mapped_column(Integer)
     first_pcm_ms: Mapped[int | None] = mapped_column(Integer)
     first_audio_ms: Mapped[int | None] = mapped_column(Integer)
+    # Faz C v1 item 1 — gateway-side TTFB (migration 0005). Only populated
+    # for `/v1/tts/stream`; async jobs and sync `/v1/tts` leave NULL.
+    # The gateway writes this via UPDATE after its streaming generator
+    # emits its first chunk (the worker writes everything else).
+    gateway_first_byte_ms: Mapped[int | None] = mapped_column(Integer)
     rtf: Mapped[float | None] = mapped_column(Float)
     status: Mapped[str] = mapped_column(Text, nullable=False)
     error_code: Mapped[str | None] = mapped_column(Text)
@@ -450,6 +455,10 @@ class UsageRecord(Base):
         CheckConstraint(
             "first_audio_ms IS NULL OR first_audio_ms >= 0",
             name="first_audio_ms_nonneg",
+        ),
+        CheckConstraint(
+            "gateway_first_byte_ms IS NULL OR gateway_first_byte_ms >= 0",
+            name="gateway_first_byte_ms_nonneg",
         ),
         CheckConstraint(
             "status IN ('ok','error','timeout','partial')",

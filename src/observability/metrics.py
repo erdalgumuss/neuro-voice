@@ -142,8 +142,19 @@ TTS_FIRST_AUDIO_SECONDS: Histogram = Histogram(
     "nqai_tts_first_audio_seconds",
     "Worker-side latency: inference start to first publish_chunk XADD "
     "(when the gateway can first read a byte off the result stream). "
-    "Proxy for client TTFB; true gateway → wire timing requires a "
-    "separate gateway_first_byte_ms column (Faz C v1).",
+    "Compare with nqai_tts_gateway_first_byte_seconds to isolate "
+    "worker vs. gateway/transport contribution to client TTFB.",
+    labelnames=_WATERFALL_LABELS,
+    buckets=WATERFALL_BUCKETS,
+    registry=REGISTRY,
+)
+
+TTS_GATEWAY_FIRST_BYTE_SECONDS: Histogram = Histogram(
+    "nqai_tts_gateway_first_byte_seconds",
+    "Client-facing TTFB on /v1/tts/stream: time from gateway receiving "
+    "the HTTP request to writing the first audio byte on the "
+    "StreamingResponse. Subtract `nqai_tts_first_audio_seconds` to get "
+    "the gateway+transport overhead alone.",
     labelnames=_WATERFALL_LABELS,
     buckets=WATERFALL_BUCKETS,
     registry=REGISTRY,
@@ -225,6 +236,7 @@ def record_waterfall(
     reference_resolve_ms: int | None = None,
     first_pcm_ms: int | None = None,
     first_audio_ms: int | None = None,
+    gateway_first_byte_ms: int | None = None,
     inference_ms: int | None = None,
     total_ms: int | None = None,
 ) -> None:
@@ -245,6 +257,7 @@ def record_waterfall(
         (TTS_REFERENCE_RESOLVE_SECONDS, reference_resolve_ms),
         (TTS_FIRST_PCM_SECONDS, first_pcm_ms),
         (TTS_FIRST_AUDIO_SECONDS, first_audio_ms),
+        (TTS_GATEWAY_FIRST_BYTE_SECONDS, gateway_first_byte_ms),
         (TTS_INFERENCE_SECONDS, inference_ms),
         (TTS_TOTAL_SECONDS, total_ms),
     )
@@ -262,6 +275,7 @@ __all__ = [
     "TTS_ERRORS",
     "TTS_FIRST_AUDIO_SECONDS",
     "TTS_FIRST_PCM_SECONDS",
+    "TTS_GATEWAY_FIRST_BYTE_SECONDS",
     "TTS_INFERENCE_SECONDS",
     "TTS_QUEUE_WAIT_SECONDS",
     "TTS_REFERENCE_RESOLVE_SECONDS",

@@ -510,6 +510,91 @@ async def test_sync_tts_stream_proxy_yields_riff_wav(setup):
         app.dependency_overrides.clear()
 
 
+async def test_stream_persists_gateway_first_byte_ms_on_usage_row(setup):
+    """Faz C v1 item 1 — gateway-side TTFB makes it into usage_records.
+
+    The worker writes the usage row when its pipeline commits; the
+    gateway then UPDATEs the `gateway_first_byte_ms` column with the
+    time between request-received and first-chunk-yielded. After the
+    stream ends, the column must be populated and non-negative.
+    """
+    import httpx
+    from sqlalchemy import select
+
+    from db import AsyncSessionLocal
+    from db.models import UsageRecord
+    from server.auth import get_redis
+    from server.main import app
+    from server.queue import DEFAULT_STREAM, TtsJobQueue, get_queue
+    from worker.consumer import WorkerConsumer
+
+    fake_redis = fakeredis.aioredis.FakeRedis()
+    queue = TtsJobQueue(fake_redis, stream=DEFAULT_STREAM)
+    app.dependency_overrides[get_redis] = lambda: fake_redis
+    app.dependency_overrides[get_queue] = lambda: queue
+
+    stop = asyncio.Event()
+    consumer = WorkerConsumer(
+        redis=fake_redis, engine=_StubEngine(),
+        archive_to_r2=setup["archive"],
+        stop_event=stop, block_ms=10,
+    )
+    worker_task = asyncio.create_task(consumer.run())
+
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test",
+            headers={"Authorization": f"Bearer {setup['bearer']}"},
+            timeout=10.0,
+        ) as client:
+            wav = _make_wav_bytes()
+            await client.post(
+                "/v1/voices",
+                data={"voice_id": "tfb-voice", "display_name": "TFB"},
+                files={"reference_audio": ("s.wav", wav, "audio/wav")},
+            )
+            async with client.stream(
+                "POST",
+                "/v1/tts/stream",
+                json={"text": "Merhaba.", "voice_id": "tfb-voice"},
+            ) as r:
+                request_id = r.headers["X-NQAI-Request-Id"]
+                async for _ in r.aiter_bytes():
+                    pass
+
+        # Streaming generator's finally block runs the UPDATE before the
+        # response truly closes, but the ASGI shutdown ordering is loose
+        # enough that we poll briefly for the column to appear.
+        gateway_ms = None
+        for _ in range(20):
+            async with AsyncSessionLocal() as s:
+                row = (await s.execute(
+                    select(UsageRecord).where(
+                        UsageRecord.request_id == uuid.UUID(request_id)
+                    )
+                )).scalar_one_or_none()
+            if row is not None and row.gateway_first_byte_ms is not None:
+                gateway_ms = row.gateway_first_byte_ms
+                break
+            await asyncio.sleep(0.05)
+
+        assert gateway_ms is not None, (
+            "gateway_first_byte_ms never persisted on usage row "
+            f"(request_id={request_id})"
+        )
+        assert gateway_ms >= 0
+        # Sanity ceiling: 10 s is way above any conceivable test latency.
+        assert gateway_ms < 10_000
+    finally:
+        stop.set()
+        try:
+            await asyncio.wait_for(worker_task, timeout=2.0)
+        except asyncio.TimeoutError:
+            worker_task.cancel()
+        app.dependency_overrides.clear()
+
+
 async def test_xautoclaim_recovers_job_after_transient_failure(setup):
     """D-06 at-least-once chaos path: engine crashes on the first
     attempt (TransientFailure → no XACK), then the consumer's periodic

@@ -17,6 +17,7 @@ from observability import (
     TTS_ERRORS,
     TTS_FIRST_AUDIO_SECONDS,
     TTS_FIRST_PCM_SECONDS,
+    TTS_GATEWAY_FIRST_BYTE_SECONDS,
     TTS_INFERENCE_SECONDS,
     TTS_QUEUE_WAIT_SECONDS,
     TTS_REFERENCE_RESOLVE_SECONDS,
@@ -66,6 +67,10 @@ EXPECTED_METRICS: dict[str, dict[str, object]] = {
         "labels": {"tenant", "voice"},
     },
     "nqai_tts_first_audio_seconds": {
+        "type": "histogram",
+        "labels": {"tenant", "voice"},
+    },
+    "nqai_tts_gateway_first_byte_seconds": {
         "type": "histogram",
         "labels": {"tenant", "voice"},
     },
@@ -222,7 +227,7 @@ def _count_value(histogram, *, tenant: str, voice: str) -> float:
     return sum(b.get() for b in child._buckets)
 
 
-def test_record_waterfall_observes_all_seven_histograms_when_fully_populated() -> None:
+def test_record_waterfall_observes_all_eight_histograms_when_fully_populated() -> None:
     tenant = "test-tenant-full"
     voice = "test-voice-full"
 
@@ -234,6 +239,7 @@ def test_record_waterfall_observes_all_seven_histograms_when_fully_populated() -
         reference_resolve_ms=80,
         first_pcm_ms=240,
         first_audio_ms=310,
+        gateway_first_byte_ms=370,
         inference_ms=1_500,
         total_ms=1_900,
     )
@@ -244,6 +250,7 @@ def test_record_waterfall_observes_all_seven_histograms_when_fully_populated() -
         TTS_REFERENCE_RESOLVE_SECONDS,
         TTS_FIRST_PCM_SECONDS,
         TTS_FIRST_AUDIO_SECONDS,
+        TTS_GATEWAY_FIRST_BYTE_SECONDS,
         TTS_INFERENCE_SECONDS,
         TTS_TOTAL_SECONDS,
     ):
@@ -271,6 +278,7 @@ def test_record_waterfall_skips_none_values_silently() -> None:
         TTS_WORKER_PICKUP_SECONDS,
         TTS_REFERENCE_RESOLVE_SECONDS,
         TTS_FIRST_PCM_SECONDS,
+        TTS_GATEWAY_FIRST_BYTE_SECONDS,
         TTS_INFERENCE_SECONDS,
         TTS_TOTAL_SECONDS,
     ):
@@ -293,6 +301,7 @@ def test_record_waterfall_with_all_none_is_noop() -> None:
         TTS_REFERENCE_RESOLVE_SECONDS,
         TTS_FIRST_PCM_SECONDS,
         TTS_FIRST_AUDIO_SECONDS,
+        TTS_GATEWAY_FIRST_BYTE_SECONDS,
         TTS_INFERENCE_SECONDS,
         TTS_TOTAL_SECONDS,
     ):
