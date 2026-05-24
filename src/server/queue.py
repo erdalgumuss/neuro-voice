@@ -7,19 +7,29 @@ This module is the gateway-side surface — no consumer logic lives here.
 Stream layout:
     nqai.tts.jobs               primary job queue
     nqai.tts.jobs.dlq           Faz B+: poisoned messages after N retries
+    nqai.tts.results.<rid>      per-request result chunk channel (TTL 600s)
 
-Each XADD entry carries a JSON-encoded TtsJobPayload. Workers parse and
-write back via IdempotencyRepo + R2 storage; the gateway polls
-IdempotencyRepo for status (DB is the source of truth, the stream is
-just the work distribution).
+Each XADD entry on the job stream carries a JSON-encoded TtsJobPayload.
+Workers parse, run inference, and XADD chunks back onto the per-request
+results stream as TtsResult entries. The gateway XREAD-loops the
+results stream and forwards chunks to the client (WebSocket or HTTP
+chunked). Final chunk → gateway DEL the stream; worker also sets
+EXPIRE 600 as a safety net in case the gateway crashes mid-read.
+
+Result channel design rationale (decision log 2026-05-24):
+  * Per-request stream chosen over shared+filter — no read amplification
+    in multi-gateway pods, clean isolation, scale-roadmap §3 diagram
+  * Per-request stream chosen over pub/sub — at-least-once (D-06) needs
+    persistence; pub/sub drops on momentary gateway disconnect
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from redis.asyncio import Redis
@@ -28,6 +38,19 @@ logger = logging.getLogger("nqai_voice.queue")
 
 DEFAULT_STREAM = "nqai.tts.jobs"
 DEFAULT_MAXLEN = 10_000  # XADD MAXLEN ~ trims the stream to this approx size
+
+RESULTS_STREAM_PREFIX = "nqai.tts.results."
+DEFAULT_RESULTS_TTL_SECONDS = 600  # safety net if gateway never DELs
+
+
+def result_stream_name(request_id: str | uuid.UUID) -> str:
+    """Per-request result channel name. Stable across worker/gateway.
+
+    Accepts string or UUID — string path is the wire format the worker
+    sees on TtsJobPayload.request_id, the UUID path is the gateway's
+    parsed Idempotency-Key.
+    """
+    return f"{RESULTS_STREAM_PREFIX}{request_id}"
 
 
 @dataclass(frozen=True)
@@ -61,6 +84,89 @@ class TtsJobPayload:
 
         raw = _s(fields[b"payload"] if b"payload" in fields else fields["payload"])
         return cls(**json.loads(raw))
+
+
+# --------------------------------------------------------------------------- #
+# Result chunks — worker → gateway per-request stream
+# --------------------------------------------------------------------------- #
+@dataclass(frozen=True)
+class TtsResult:
+    """One audio chunk on the per-request result stream.
+
+    Field-level XADD (not JSON-wrapped) keeps each chunk small and lets
+    `redis-cli XRANGE` show sane field names. PCM is base64-encoded so
+    XRANGE output stays printable — Redis 7 handles raw bytes fine but
+    the cost is ~33% wire size, irrelevant at our chunk sizes (5-30 KB
+    per sentence at 48 kHz int16).
+
+    `final=True` carries no PCM; it signals end-of-stream so the gateway
+    can DEL the stream and close the client connection. `error` set
+    means this chunk is a terminal error — pcm is empty, gateway sends
+    error frame and DELs.
+    """
+
+    request_id: str         # UUID string; matches TtsJobPayload.request_id
+    seq: int                # 0-indexed chunk number
+    pcm_bytes: bytes        # int16 PCM at engine.sample_rate (48 kHz)
+    sentence_text: str | None = None  # None for final/error chunks
+    final: bool = False
+    error: str | None = None
+
+    def encode(self) -> dict[str, str]:
+        """Render to Redis-friendly field/value pairs. All values are
+        strings since XADD canonical types are bytes/str — base64 for
+        PCM, JSON-style booleans, UTF-8 for text."""
+        out: dict[str, str] = {
+            "request_id": self.request_id,
+            "seq": str(self.seq),
+            "pcm_b64": base64.b64encode(self.pcm_bytes).decode("ascii"),
+            "final": "true" if self.final else "false",
+        }
+        if self.sentence_text is not None:
+            out["sentence_text"] = self.sentence_text
+        if self.error is not None:
+            out["error"] = self.error
+        return out
+
+    @classmethod
+    def decode(cls, fields: dict[bytes | str, bytes | str]) -> TtsResult:
+        def _s(v: bytes | str) -> str:
+            return v.decode("utf-8") if isinstance(v, (bytes, bytearray)) else v
+
+        def _get(key: str) -> str | None:
+            # Redis returns either bytes or str keys depending on client config;
+            # accept both at decode time so workers and gateway tests interop.
+            if isinstance(next(iter(fields), None), (bytes, bytearray)):
+                k = key.encode()
+                return _s(fields[k]) if k in fields else None
+            return _s(fields[key]) if key in fields else None
+
+        request_id = _get("request_id") or ""
+        seq = int(_get("seq") or "0")
+        pcm_b64 = _get("pcm_b64") or ""
+        pcm_bytes = base64.b64decode(pcm_b64) if pcm_b64 else b""
+        final = (_get("final") or "false") == "true"
+        sentence_text = _get("sentence_text")
+        error = _get("error")
+        return cls(
+            request_id=request_id,
+            seq=seq,
+            pcm_bytes=pcm_bytes,
+            sentence_text=sentence_text,
+            final=final,
+            error=error,
+        )
+
+
+@dataclass(frozen=True)
+class TtsResultStreamConfig:
+    """Tuning knobs for the per-request result stream — kept in one place
+    so worker and gateway agree on TTL + maxlen without env-string parsing
+    duplicated at each call site."""
+
+    ttl_seconds: int = DEFAULT_RESULTS_TTL_SECONDS
+    maxlen: int = 1024  # ~1024 sentences max per request; long-form caps here
+    extra_fields: dict[str, str] = field(default_factory=dict)
 
 
 class TtsJobQueue:

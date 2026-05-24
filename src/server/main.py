@@ -48,7 +48,13 @@ from registry.catalog import (
     InvalidVoiceId,
     validate_voice_id,
 )
-from repos import AuditRepo, IdempotencyRepo, UsageRepo, VoiceRepo
+from repos import (
+    AuditRepo,
+    IdempotencyConflict,
+    IdempotencyRepo,
+    UsageRepo,
+    VoiceRepo,
+)
 
 from . import streaming
 from .admin import admin_router
@@ -633,47 +639,77 @@ async def create_tts_job(
         body.voice_id, ctx.tenant_id, session
     )
 
-    # Stripe-style replay: same Idempotency-Key in the 24h window returns
-    # the cached row without re-enqueueing.
+    # Stripe-style guarded reserve: same key + same body → replay; same
+    # key + different body → 409. The body_hash check is critical —
+    # without it a typo-fix POST under the same key silently no-ops.
     idem = IdempotencyRepo(session, ctx.tenant_id)
-    existing = await idem.get(idempotency_key)
-    if existing is not None:
-        existing_status = (
-            "complete" if existing.status == "complete" else "queued"
-        )
-        return TTSJobAccepted(
-            job_id=str(idempotency_key),
-            status=existing_status,
-            created_at=existing.created_at.isoformat(),
-            deduplicated=True,
-        )
-
-    # Backpressure check before reserving — we don't want to leave half-
-    # baked rows behind when the queue is saturated.
-    depth = await queue.depth()
-    if depth > QUEUE_DEPTH_BACKPRESSURE:
-        await AuditRepo(session).record(
-            actor_type="api_key",
-            actor_id=ctx.api_key_id,
-            actor_label=ctx.api_key.prefix,
-            action="tts.backpressure",
-            result="denied",
-            tenant_id=ctx.tenant_id,
-            payload={"queue_depth": depth, "limit": QUEUE_DEPTH_BACKPRESSURE},
-        )
-        await session.commit()
-        raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="queue is saturated; retry shortly",
-            headers={"Retry-After": "5"},
-        )
-
     request_hash = _hash_job_body(body)
-    await idem.reserve(
-        request_id=idempotency_key,
-        api_key_id=ctx.api_key_id,
-        request_hash=request_hash,
-    )
+
+    try:
+        existing = await idem.get(idempotency_key)
+        if existing is not None:
+            if existing.request_hash != request_hash:
+                # Surface the prior row's metadata so the client can debug.
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    detail={
+                        "error": "idempotency_conflict",
+                        "message": (
+                            "Idempotency-Key reused with a different request body"
+                        ),
+                        "original_created_at": existing.created_at.isoformat(),
+                        "original_status": existing.status,
+                    },
+                )
+            existing_status = (
+                "complete" if existing.status == "complete" else "queued"
+            )
+            return TTSJobAccepted(
+                job_id=str(idempotency_key),
+                status=existing_status,
+                created_at=existing.created_at.isoformat(),
+                deduplicated=True,
+            )
+
+        # Backpressure check before reserving — we don't want to leave
+        # half-baked rows behind when the queue is saturated.
+        depth = await queue.depth()
+        if depth > QUEUE_DEPTH_BACKPRESSURE:
+            await AuditRepo(session).record(
+                actor_type="api_key",
+                actor_id=ctx.api_key_id,
+                actor_label=ctx.api_key.prefix,
+                action="tts.backpressure",
+                result="denied",
+                tenant_id=ctx.tenant_id,
+                payload={"queue_depth": depth, "limit": QUEUE_DEPTH_BACKPRESSURE},
+            )
+            await session.commit()
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="queue is saturated; retry shortly",
+                headers={"Retry-After": "5"},
+            )
+
+        reserved, _is_new = await idem.reserve_or_get(
+            request_id=idempotency_key,
+            api_key_id=ctx.api_key_id,
+            request_hash=request_hash,
+        )
+    except IdempotencyConflict as e:
+        # Race: another concurrent request reserved between our get() and
+        # reserve_or_get(). Translate to the same 409 the upfront check
+        # would have returned.
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail={
+                "error": "idempotency_conflict",
+                "message": str(e),
+                "original_created_at": e.existing.created_at.isoformat(),
+                "original_status": e.existing.status,
+            },
+        ) from e
+
     await session.commit()
 
     payload = TtsJobPayload(
@@ -701,7 +737,7 @@ async def create_tts_job(
     return TTSJobAccepted(
         job_id=str(idempotency_key),
         status="queued",
-        created_at=existing.created_at.isoformat() if existing else _now_iso(),
+        created_at=reserved.created_at.isoformat(),
         deduplicated=False,
     )
 

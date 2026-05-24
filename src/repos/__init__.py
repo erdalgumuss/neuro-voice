@@ -11,7 +11,7 @@ called only from operator endpoints (JWT-authenticated).
 
 from .api_key import ApiKeyRepo
 from .audit import AuditRepo
-from .idempotency import IdempotencyRepo
+from .idempotency import IdempotencyConflict, IdempotencyRepo
 from .operator import OperatorRepo
 from .tenant import TenantRepo
 from .usage import UsageRepo
@@ -25,4 +25,5 @@ __all__ = [
     "AuditRepo",
     "OperatorRepo",
     "IdempotencyRepo",
+    "IdempotencyConflict",
 ]

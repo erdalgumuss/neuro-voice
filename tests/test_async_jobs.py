@@ -202,6 +202,44 @@ def test_duplicate_idempotency_key_returns_same_job_without_re_enqueue(client):
     assert asyncio.run(_xlen()) == 1
 
 
+def test_same_idempotency_key_different_body_returns_409(client):
+    """Stripe-style guard (D-05 + Ö4): reusing an Idempotency-Key with
+    a different request body must surface 409 Conflict — silent replay
+    would mask a typo-fix POST under the same key."""
+    _enroll_voice(client)
+    rid = str(uuid.uuid4())
+
+    r1 = _create_job(client, idempotency_key=rid, text="Merhaba dünya.")
+    assert r1.status_code == 202, r1.text
+
+    r2 = _create_job(client, idempotency_key=rid, text="Tamamen farklı içerik.")
+    assert r2.status_code == 409, r2.text
+    body = r2.json()["detail"]
+    assert body["error"] == "idempotency_conflict"
+    assert "original_created_at" in body
+    assert body["original_status"] in {"processing", "complete", "failed"}
+
+    # Critical: the second request did NOT enqueue.
+    import asyncio
+
+    async def _xlen():
+        return int(await client.fake_redis.xlen("nqai.tts.jobs.test"))
+
+    assert asyncio.run(_xlen()) == 1
+
+
+def test_same_idempotency_key_different_voice_returns_409(client):
+    """Voice swap under the same Idempotency-Key counts as body mismatch."""
+    _enroll_voice(client, voice_id="demo-01")
+    _enroll_voice(client, voice_id="demo-02")
+    rid = str(uuid.uuid4())
+
+    r1 = _create_job(client, idempotency_key=rid, voice_id="demo-01")
+    assert r1.status_code == 202
+    r2 = _create_job(client, idempotency_key=rid, voice_id="demo-02")
+    assert r2.status_code == 409
+
+
 # --------------------------------------------------------------------------- #
 # Validation
 # --------------------------------------------------------------------------- #

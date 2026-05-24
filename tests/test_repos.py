@@ -10,6 +10,7 @@ from db import AsyncSessionLocal, init_models_for_tests
 from repos import (
     ApiKeyRepo,
     AuditRepo,
+    IdempotencyConflict,
     IdempotencyRepo,
     OperatorRepo,
     TenantRepo,
@@ -307,3 +308,67 @@ async def test_idempotency_cross_tenant_isolation():
         assert await idr_b.get(rid) is None
         # Tenant A sees its own
         assert await idr_a.get(rid) is not None
+
+
+# --------------------------------------------------------------------------- #
+# IdempotencyRepo.reserve_or_get — Stripe-style guarded reserve (Ö4)
+# --------------------------------------------------------------------------- #
+async def test_reserve_or_get_first_call_inserts():
+    tid, _ = await _bootstrap_two_tenants()
+    async with AsyncSessionLocal() as s:
+        kr = ApiKeyRepo(s)
+        k = await kr.create(tenant_id=tid, prefix="nqai_dev_iiiiiiiiiiiiii",
+                            secret_hash="x")
+        await s.commit()
+        idr = IdempotencyRepo(s, tid)
+        rid = uuid.uuid4()
+        row, is_new = await idr.reserve_or_get(
+            request_id=rid, api_key_id=k.id, request_hash="hash-a",
+        )
+        await s.commit()
+        assert is_new is True
+        assert row.request_hash == "hash-a"
+
+
+async def test_reserve_or_get_same_body_replay_returns_existing():
+    tid, _ = await _bootstrap_two_tenants()
+    async with AsyncSessionLocal() as s:
+        kr = ApiKeyRepo(s)
+        k = await kr.create(tenant_id=tid, prefix="nqai_dev_jjjjjjjjjjjjjj",
+                            secret_hash="x")
+        await s.commit()
+        idr = IdempotencyRepo(s, tid)
+        rid = uuid.uuid4()
+        first, is_new1 = await idr.reserve_or_get(
+            request_id=rid, api_key_id=k.id, request_hash="same-hash",
+        )
+        await s.commit()
+        second, is_new2 = await idr.reserve_or_get(
+            request_id=rid, api_key_id=k.id, request_hash="same-hash",
+        )
+        await s.commit()
+        assert is_new1 is True and is_new2 is False
+        assert first.request_id == second.request_id
+
+
+async def test_reserve_or_get_different_body_raises_conflict():
+    """The whole point of body_hash enforcement (D-05 / Ö4)."""
+    tid, _ = await _bootstrap_two_tenants()
+    async with AsyncSessionLocal() as s:
+        kr = ApiKeyRepo(s)
+        k = await kr.create(tenant_id=tid, prefix="nqai_dev_kkkkkkkkkkkkkk",
+                            secret_hash="x")
+        await s.commit()
+        idr = IdempotencyRepo(s, tid)
+        rid = uuid.uuid4()
+        await idr.reserve_or_get(
+            request_id=rid, api_key_id=k.id, request_hash="original",
+        )
+        await s.commit()
+        with pytest.raises(IdempotencyConflict) as exc_info:
+            await idr.reserve_or_get(
+                request_id=rid, api_key_id=k.id, request_hash="tampered",
+            )
+        # The exception carries the original row so the HTTP layer can
+        # echo created_at + status to help the client debug.
+        assert exc_info.value.existing.request_hash == "original"
