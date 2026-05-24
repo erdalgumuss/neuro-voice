@@ -6,8 +6,13 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-AudioFormat = Literal["wav", "pcm16"]
-StreamFormat = Literal["wav", "pcm16"]
+# Faz B.5 Dalga 1 — codec layer (audit 2026-05-25): mp3 + opus added
+# alongside the existing wav/pcm16. mp3 (~3-5x smaller than wav) and
+# opus (~10x smaller, voice-tuned) are the formats real product
+# clients want; wav stays for download/debug, pcm16 stays for
+# low-level / benchmark use.
+AudioFormat = Literal["wav", "pcm16", "mp3", "opus"]
+StreamFormat = Literal["wav", "pcm16", "mp3", "opus"]
 
 
 class TTSRequest(BaseModel):

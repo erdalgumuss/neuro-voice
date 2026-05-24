@@ -449,6 +449,153 @@ async def test_first_chunk_in_result_stream_before_engine_finishes(setup):
         app.dependency_overrides.clear()
 
 
+async def test_sync_tts_stream_yields_opus_ogg(setup):
+    """Faz B.5 Dalga 1 — codec layer E2E. Request audio_format=opus,
+    assert the response body is a valid OGG/opus stream end-to-end:
+    starts with `OggS` capture pattern, contains an `OpusHead` packet,
+    and finishes with the OGG end-of-stream page (ffmpeg flushes on
+    stdin close inside encoder.close())."""
+    import shutil
+
+    import httpx
+
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg not on PATH — codec E2E requires it")
+
+    from server.auth import get_redis
+    from server.main import app
+    from server.queue import DEFAULT_STREAM, TtsJobQueue, get_queue
+    from worker.consumer import WorkerConsumer
+
+    fake_redis = fakeredis.aioredis.FakeRedis()
+    queue = TtsJobQueue(fake_redis, stream=DEFAULT_STREAM)
+    app.dependency_overrides[get_redis] = lambda: fake_redis
+    app.dependency_overrides[get_queue] = lambda: queue
+
+    stop = asyncio.Event()
+    consumer = WorkerConsumer(
+        redis=fake_redis, engine=_StubEngine(),
+        archive_to_r2=setup["archive"],
+        stop_event=stop, block_ms=10,
+    )
+    worker_task = asyncio.create_task(consumer.run())
+
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test",
+            headers={"Authorization": f"Bearer {setup['bearer']}"},
+            timeout=15.0,
+        ) as client:
+            wav = _make_wav_bytes()
+            await client.post(
+                "/v1/voices",
+                data={"voice_id": "opus-voice", "display_name": "Opus"},
+                files={"reference_audio": ("o.wav", wav, "audio/wav")},
+            )
+            async with client.stream(
+                "POST",
+                "/v1/tts/stream",
+                json={
+                    "text": "Birinci. İkinci.",
+                    "voice_id": "opus-voice",
+                    "audio_format": "opus",
+                },
+            ) as r:
+                assert r.status_code == 200
+                assert r.headers["content-type"].startswith("audio/ogg")
+                body = b""
+                async for piece in r.aiter_bytes():
+                    body += piece
+            assert body[:4] == b"OggS", (
+                f"expected OGG capture pattern, got {body[:8]!r}"
+            )
+            assert b"OpusHead" in body[:128], (
+                "OpusHead identification packet missing from first OGG page"
+            )
+            # Sanity: a 2-sentence stub produces multiple OGG pages.
+            assert body.count(b"OggS") >= 2, (
+                "expected multiple OGG pages — encoder may have closed early"
+            )
+    finally:
+        stop.set()
+        try:
+            await asyncio.wait_for(worker_task, timeout=2.0)
+        except asyncio.TimeoutError:
+            worker_task.cancel()
+        app.dependency_overrides.clear()
+
+
+async def test_sync_tts_stream_yields_mp3(setup):
+    """Faz B.5 Dalga 1 — mp3 codec via /v1/tts/stream. Body must start
+    with either an ID3v2 tag (default ffmpeg writes one) or an mp3
+    frame sync word."""
+    import shutil
+
+    import httpx
+
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg not on PATH — codec E2E requires it")
+
+    from server.auth import get_redis
+    from server.main import app
+    from server.queue import DEFAULT_STREAM, TtsJobQueue, get_queue
+    from worker.consumer import WorkerConsumer
+
+    fake_redis = fakeredis.aioredis.FakeRedis()
+    queue = TtsJobQueue(fake_redis, stream=DEFAULT_STREAM)
+    app.dependency_overrides[get_redis] = lambda: fake_redis
+    app.dependency_overrides[get_queue] = lambda: queue
+
+    stop = asyncio.Event()
+    consumer = WorkerConsumer(
+        redis=fake_redis, engine=_StubEngine(),
+        archive_to_r2=setup["archive"],
+        stop_event=stop, block_ms=10,
+    )
+    worker_task = asyncio.create_task(consumer.run())
+
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test",
+            headers={"Authorization": f"Bearer {setup['bearer']}"},
+            timeout=15.0,
+        ) as client:
+            wav = _make_wav_bytes()
+            await client.post(
+                "/v1/voices",
+                data={"voice_id": "mp3-voice", "display_name": "Mp3"},
+                files={"reference_audio": ("m.wav", wav, "audio/wav")},
+            )
+            async with client.stream(
+                "POST",
+                "/v1/tts/stream",
+                json={
+                    "text": "Bir.",
+                    "voice_id": "mp3-voice",
+                    "audio_format": "mp3",
+                },
+            ) as r:
+                assert r.status_code == 200
+                assert r.headers["content-type"].startswith("audio/mpeg")
+                body = b""
+                async for piece in r.aiter_bytes():
+                    body += piece
+            head = body[:256]
+            assert head.startswith(b"ID3") or any(
+                head[i] == 0xFF and (head[i + 1] & 0xE0) == 0xE0
+                for i in range(len(head) - 1)
+            ), f"no ID3 / mp3 sync in head: {head[:32]!r}"
+    finally:
+        stop.set()
+        try:
+            await asyncio.wait_for(worker_task, timeout=2.0)
+        except asyncio.TimeoutError:
+            worker_task.cancel()
+        app.dependency_overrides.clear()
+
+
 async def test_sync_tts_stream_proxy_yields_riff_wav(setup):
     """The /v1/tts/stream variant — same proxy path but chunks
     forwarded as HTTP chunked transfer. Client sees a valid RIFF/WAVE

@@ -18,6 +18,7 @@ time.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import uuid
@@ -652,14 +653,35 @@ async def synthesize(
         "X-NQAI-Elapsed-Seconds": f"{elapsed_ms / 1000.0:.3f}",
         "X-NQAI-RTF": f"{rtf:.3f}" if rtf is not None else "inf",
     }
+    # Faz B.5 Dalga 1 — codec layer dispatch on the sync path too.
+    # Sync /v1/tts buffers all PCM into one body before encoding, so
+    # we run the encoder to completion in one shot. mp3 + opus = real
+    # bandwidth savings (mp3 ~3-5x, opus ~10x) for the deprecated
+    # sync surface until clients migrate to /v1/tts/jobs.
+    if body.audio_format == "wav":
+        wav_bytes = pcm16_to_wav_bytes(pcm, sample_rate)
+        return Response(content=wav_bytes, media_type="audio/wav", headers=headers)
     if body.audio_format == "pcm16":
         return Response(
             content=pcm,
             media_type="application/octet-stream",
             headers=headers,
         )
-    wav_bytes = pcm16_to_wav_bytes(pcm, sample_rate)
-    return Response(content=wav_bytes, media_type="audio/wav", headers=headers)
+
+    from audio.encoders import EncoderError, get_stream_encoder
+    encoder = get_stream_encoder(body.audio_format, sample_rate=sample_rate)
+    try:
+        await encoder.start()
+        encoded = await encoder.encode_chunk(pcm)
+        tail = await encoder.close()
+        body_bytes = encoded + tail
+    except EncoderError:
+        logger.exception("sync /v1/tts encoder failed; falling back to WAV")
+        wav_bytes = pcm16_to_wav_bytes(pcm, sample_rate)
+        return Response(content=wav_bytes, media_type="audio/wav", headers=headers)
+
+    media_type = {"mp3": "audio/mpeg", "opus": "audio/ogg"}[body.audio_format]
+    return Response(content=body_bytes, media_type=media_type, headers=headers)
 
 
 @app.post("/v1/tts/stream", tags=["synthesis"])
@@ -869,15 +891,75 @@ async def synthesize_stream(
                         "ignoring",
                     )
 
-    if body.audio_format == "pcm16":
+    # Faz B.5 Dalga 1 — codec layer dispatch:
+    # * wav  — inline RIFF "infinite size" trick (predates this layer;
+    #          ffmpeg can't write WAV streaming-safely, so the inline
+    #          path is the right answer).
+    # * pcm16 — passthrough; client uses sample-rate header to play.
+    # * mp3 / opus — ffmpeg pipe encoder; bandwidth wins ~3-10x vs WAV.
+    if body.audio_format == "wav":
         return StreamingResponse(
-            _instrumented(_yield_pcm()),
-            media_type="application/octet-stream",
+            _instrumented(_yield_wav()),
+            media_type="audio/wav",
             headers=headers,
         )
+
+    async def _yield_encoded():
+        from audio.encoders import EncoderError, get_stream_encoder
+        try:
+            encoder = get_stream_encoder(
+                body.audio_format, sample_rate=sample_rate,
+            )
+        except KeyError as e:
+            # Pydantic Literal should have caught this before we got
+            # here; defensive.
+            logger.error("unknown audio_format reached encoder dispatch: %s", e)
+            return
+        try:
+            await encoder.start()
+        except EncoderError:
+            logger.exception(
+                "encoder start failed for %s — falling back to PCM",
+                body.audio_format,
+            )
+            async for pcm in _yield_pcm():
+                yield pcm
+            return
+
+        try:
+            async for pcm in _yield_pcm():
+                try:
+                    out = await encoder.encode_chunk(pcm)
+                except EncoderError:
+                    logger.exception(
+                        "encoder.encode_chunk failed mid-stream — "
+                        "breaking stream",
+                    )
+                    return
+                if out:
+                    yield out
+            # Flush the encoder's container trailer (mp3: nothing; opus:
+            # OGG end-of-stream page).
+            tail = await encoder.close()
+            if tail:
+                yield tail
+        finally:
+            # Defensive: if the consumer cancelled mid-stream, make
+            # sure the ffmpeg subprocess is still cleaned up.
+            if not getattr(encoder, "_closed", True):
+                with contextlib.suppress(Exception):
+                    await encoder.close()
+
+    # Content-Type by format. Streaming PCM goes octet-stream so
+    # browsers don't try to autoplay it.
+    media_type = {
+        "pcm16": "application/octet-stream",
+        "mp3": "audio/mpeg",
+        "opus": "audio/ogg",
+    }[body.audio_format]
     return StreamingResponse(
-        _instrumented(_yield_wav()),
-        media_type="audio/wav",
+        _instrumented(_yield_encoded()),
+        media_type=media_type,
         headers=headers,
     )
 
