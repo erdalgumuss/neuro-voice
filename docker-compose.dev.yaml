@@ -1,6 +1,6 @@
 # NQAI Voice — local development stack.
 #
-# Default profile: Postgres 16 + Redis 7 + CPU gateway + local LiveKit.
+# Default profile: Postgres 16 + Redis 7 + CPU gateway.
 # GPU inference runs only in the worker profile.
 #
 #   docker compose -f docker-compose.dev.yaml up --build
@@ -57,15 +57,6 @@ services:
       timeout: 3s
       retries: 10
 
-  livekit:
-    image: livekit/livekit-server:latest
-    restart: unless-stopped
-    command: ["--dev", "--bind", "0.0.0.0"]
-    ports:
-      - "127.0.0.1:7880:7880"      # WebSocket / HTTP API
-      - "127.0.0.1:7881:7881"      # TCP fallback
-      - "7882:7882/udp"            # WebRTC UDP media
-
   gateway:
     build:
       context: .
@@ -87,10 +78,6 @@ services:
       NQAI_VOICES_DIR: "/srv/nqai/configs/voices"
       NQAI_REFERENCE_DIR: "/srv/nqai/data/reference-audio"
       NQAI_QUEUE_DEPTH_LIMIT: "${NQAI_QUEUE_DEPTH_LIMIT:-200}"
-      NQAI_LIVEKIT_URL: "ws://livekit:7880"
-      NQAI_LIVEKIT_PUBLIC_URL: "ws://localhost:7880"
-      NQAI_LIVEKIT_API_KEY: "${NQAI_LIVEKIT_API_KEY:-devkey}"
-      NQAI_LIVEKIT_API_SECRET: "${NQAI_LIVEKIT_API_SECRET:-secret}"
       # R2 (optional in dev — gateway falls back to file:// references):
       NQAI_R2_ACCOUNT_ID: "${NQAI_R2_ACCOUNT_ID:-}"
       NQAI_R2_BUCKET: "${NQAI_R2_BUCKET:-}"
@@ -145,13 +132,6 @@ services:
       NQAI_WARMUP_ON_BOOT: "true"
       NQAI_RESULT_STREAM_TTL_S: "600"
       NQAI_LORA_CACHE_SIZE: "${NQAI_LORA_CACHE_SIZE:-3}"
-      NQAI_LIVEKIT_URL: "ws://livekit:7880"
-      NQAI_LIVEKIT_PUBLIC_URL: "ws://localhost:7880"
-      NQAI_LIVEKIT_API_KEY: "${NQAI_LIVEKIT_API_KEY:-devkey}"
-      NQAI_LIVEKIT_API_SECRET: "${NQAI_LIVEKIT_API_SECRET:-secret}"
-      NQAI_LIVE_WORKER_HEARTBEAT_INTERVAL_S: "1"
-      NQAI_LIVE_WORKER_HEARTBEAT_TTL_S: "3"
-      NQAI_LIVE_WORKER_MAX_SESSIONS: "${NQAI_LIVE_WORKER_MAX_SESSIONS:-1}"
       # Worker fails-loud at boot if R2 env missing — kept as soft
       # defaults here so `docker compose config` works without R2 set.
       NQAI_R2_ACCOUNT_ID: "${NQAI_R2_ACCOUNT_ID:-}"

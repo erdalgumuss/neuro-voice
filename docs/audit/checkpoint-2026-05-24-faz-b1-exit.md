@@ -2,10 +2,15 @@
 
 **Tarih:** 2026-05-24 · **Range:** `99a010d`..`5cd83d0` (6 commit) · **Suite:** 271/271 · **Lint:** clean
 
+> **⚠️ Pre-hardening snapshot.** Bu doc Faz B.1'in **ilk** çıkışını (commit `5cd83d0`) belgeler. Sonradan eklenen **B.1 hardening** turu (commit `6d30a4a`) — DLQ + retry budget + sync/stream/jobs ortak backpressure + result-stream seq dedupe + R2 cache LRU + usage latency kolonları — burada "yapılmadı" işaretli olarak görünür ama bugün **tamam**. Aşağıdaki §6 ("yapmadıklarımız") tablosunda B.1.5 olarak listelenen DLQ/retry/backpressure satırları artık kapatılmış durumda. Güncel resim için: [`checkpoint-2026-05-24-faz-b1.5-exit.md`](checkpoint-2026-05-24-faz-b1.5-exit.md).
+>
+> Ayrıca §7'deki "B.1.5 hedef tanımı" WebSocket'i ima eder; bu yön Faz B.1.5'te HTTP chunked + frame-by-frame bridge'e doğru kaydı (WebRTC scaffold reverted, WS opsiyonel hâle düştü) — bkz. 2026-05-24 decision log üst satırı.
+
 Bu doc Faz B.1'in fiilen tamamlandığını belgeler ve **Faz B.1.5 (latency)** + **B.2 (live transports)** scope ayrımını netleştirir.
 
 > Önceki checkpoint: [`checkpoint-2026-05-24-faz-a-exit.md`](checkpoint-2026-05-24-faz-a-exit.md) (Faz A bitiş + B planı).
 > Faz B.1 spec: [`../architecture/worker-process.md`](../architecture/worker-process.md).
+> Sonraki checkpoint: [`checkpoint-2026-05-24-faz-b1.5-exit.md`](checkpoint-2026-05-24-faz-b1.5-exit.md) (B.1 hardening kapanışı + frame-by-frame bridge + WebRTC reversal).
 
 ---
 

@@ -17,7 +17,7 @@ Tek-process VoxCPM2 prototipinden, **4 tenant × 5 concurrent = 20 user başlang
 Çekirdek varsayımlar:
 - 4 client uygulama (NEEKO toy, NIVA call-center, NeuroCourse instructor, NARO) ortak omurgayı tüketir.
 - Her account (tenant) kendi API key'lerini üretir; ürünler `X-NQAI-App` header ile rollup edilir.
-- Streaming TTS canlı hattı **WebRTC/LiveKit primary**; WebSocket/HTTP chunked compatibility/debug fallback.
+- Streaming TTS canlı hattı **HTTP chunked primary** (`POST /v1/tts/stream`); long-running + presigned artifact için **async jobs** (`POST /v1/tts/jobs`); sync `POST /v1/tts` queue proxy backward-compat (RFC 8594 sunset). Duplex voice-agent (NIVA call-center, gerçek 2-yönlü konuşma) bu yüzeyde değil — gerektiğinde ayrı bir product surface + ayrı transport (WebRTC veya gRPC bidi) ile gelir. Karar dayanağı: ElevenLabs / OpenAI Audio / Cartesia / MiniMax endüstri standardı; WebRTC SFU hop tek-yönlü TTS'e değer katmaz. Bkz. [decisions/README.md](../decisions/README.md) 2026-05-24 "Faz B.1.5 — streaming TTS API (HTTP chunked + async jobs, NO WebRTC)" satırı.
 - Birincil base model: VoxCPM2 (Apache-2.0). Inference runtime: önce direct `voxcpm`, Faz C'de `nano-vllm-voxcpm` (resmi paket, RTX 4090'da RTF 0.13, batched concurrent + FastAPI server).
 - "Premium" tanımı [voxcpm2-integration.md](voxcpm2-integration.md) bölümünde, sayısal hedefler [observability.md](observability.md) SLO'larında.
 
@@ -226,7 +226,7 @@ Hardware sizing 20-user baseline; 200-user için worker sayısı × 4, DB/Redis 
 | **D-09** | Secret'ler ortam değişkeninden okunur — kod, config dosyası, Docker image içinde **yasak** | Secret leak engellenme |
 | **D-10** | Voice reference audio yalnızca object storage'da; DB'de URI + sha256 + size + sample-rate metadata | Postgres performansı, backup boyutu, replication maliyeti |
 | **D-11** | Worker model'i lazy-load eder ama process boyunca canlı tutar; HTTP /admin/warmup ile eager trigger | Cold-start latency kullanıcıya yansımaz |
-| **D-12** | Live TTS için **WebRTC/LiveKit primary**, compatibility için WebSocket/HTTP chunked fallback | Native/mobile/browser media path jitter ve codec yönetimini WebRTC'ye bırakır; legacy/curl path korunur |
+| **D-12** | Streaming TTS API **HTTP chunked primary** (`POST /v1/tts/stream`); long-running + presigned artifact için **async jobs** (`POST /v1/tts/jobs`); sync `POST /v1/tts` deprecated queue proxy (RFC 8594 sunset 2026-09-01). Duplex voice-agent (NIVA) bu yüzeyde değil — ayrı transport (WebRTC/gRPC) ile ayrı product surface olarak gelir | ElevenLabs / OpenAI Audio / Cartesia / MiniMax endüstri standardı; WebRTC SFU hop tek-yönlü TTS'e değer katmaz, vendor + ops kompleksitesi getirir. Önceki "WebRTC primary" karar 2026-05-24 reversed (bkz. [decisions/README.md](../decisions/README.md)) |
 | **D-13** | Rate limit Redis sliding window (Lua atomic) — per-key + per-tenant aggregate; aşan istek 429 + `Retry-After` header | Multi-tenant fairness |
 | **D-14** | Backpressure: Redis Streams queue depth `> N_workers × 4` → gateway 429 + `Retry-After` (queue dolduğunda istek almak `OOM` riskine girer) | Cascading failure önleme |
 | **D-15** | Her metric label seti **bounded** — tenant_id, voice_id, status — sınırsız cardinality'li label yasak (örn. request_id label olarak değil, exemplar olarak) | Prometheus memory blow-up önleme |
@@ -235,63 +235,49 @@ Hardware sizing 20-user baseline; 200-user için worker sayısı × 4, DB/Redis 
 
 ## 7. Streaming protocol (uç nokta detayı)
 
-### 7.1 WebRTC/LiveKit primary path
+### 7.1 HTTP chunked primary path
 
 ```
-Client                             Gateway                       Redis            Worker / LiveKit
-  │  POST /v1/tts/live/sessions
+Client                             Gateway                       Redis            Worker
+  │  POST /v1/tts/stream
   │  Authorization: Bearer <key>
+  │  Accept: audio/wav
   ├──────────────────────────────►│
   │                               │  validate key + tenant + voice access
-  │                               │  read nqai.worker.live.* heartbeat
-  │                               │  mint LiveKit room/token
-  │  ◄── session_id + token + room ┤
-  │
-  │  Join LiveKit room with token │
-  ├─────────────────────────────────────────────────────────────────►│
-  │  DataChannel synthesize       │                 │               │
-  ├─────────────────────────────────────────────────────────────────►│
-  │                               │                 │               │ resolve ref/cache
-  │                               │                 │               │ generate first frame
-  │  ◄════════ WebRTC audio track ════════════════════════════════════│
-  │  ◄── DataChannel done/metrics ════════════════════════════════════│
+  │                               │  XADD nqai.tts.jobs
+  │                               ├───────────────────►│
+  │                               │                    │ XREADGROUP
+  │                               │                    ├──────────────►│
+  │                               │                    │               │ resolve ref/cache + generate
+  │                               │                    │               │ XADD nqai.tts.results.{rid}
+  │                               │                    │ ◄─────────────┤   (per-sentence, frame-by-frame
+  │                               │ XREAD seq=0+        │               │    via iter_engine_chunks)
+  │                               │ ◄──────────────────┤               │
+  │  ◄═══ chunked WAV (audio/wav) ─┤
+  │      RIFF header + PCM frames as they arrive
+  │  ◄── trailer / connection close on `final` chunk
 ```
 
-### 7.2 HTTP/2 chunked WAV fallback
+### 7.2 Async job + presigned artifact
 
-```
-POST /v1/tts/stream
-Authorization: Bearer <key>
-Content-Type: application/json
-Accept: audio/wav
+Long-running iş veya batch flow için `POST /v1/tts/jobs` (Stripe `Idempotency-Key`) → 202 → `GET /v1/tts/jobs/{id}` polling → `audio_url` (presigned R2). Detay: [streaming-protocol.md §2](streaming-protocol.md).
 
-{"text":"...", "voice_id":"...", "mode":"sleep"}
+### 7.3 Sync `/v1/tts` (DEPRECATED queue proxy)
 
-→ 200 OK
-Content-Type: audio/wav
-Transfer-Encoding: chunked
-X-NQAI-Request-Id: 01J...
-X-NQAI-Voice-Id: neeko-v01
+`POST /v1/tts` aynı queue üzerinden çalışır; gateway result stream'i drain edip TEK WAV body döner. RFC 8594 `Deprecation: true` + `Sunset: Mon, 01 Sep 2026 00:00:00 GMT` + `Link: </v1/tts/jobs>; rel="successor-version"` header'ları. Yeni kod kullanmamalı; 2026-09-01'da 410.
 
-[RIFF header with 0xFFFFFFFF placeholder size]
-[PCM cümle 1]
-[200ms silence]
-[PCM cümle 2]
-...
-```
-
-### 7.3 Latency budget (p95 hedefler)
+### 7.4 Latency budget (p95 hedefler)
 
 | Adım | Bütçe | Ölçüm |
 |---|---|---|
-| TLS handshake + WS upgrade | 100 ms | Cloudflare edge logs |
+| TLS handshake | 50 ms | Cloudflare edge logs |
 | Gateway auth + validate + queue submit | 30 ms | `nqai_gateway_submit_seconds` |
 | Redis XADD + XREADGROUP propagation | 5 ms | `nqai_queue_pickup_seconds` |
 | Worker frontend normalize | 10 ms | `nqai_frontend_seconds` |
 | VoxCPM2 ilk cümle generate (warmed) | 1500 ms (T4) / 500 ms (L4/A100) | `nqai_inference_first_sentence_seconds` |
 | Worker XADD result + gateway XREAD | 5 ms | `nqai_result_propagation_seconds` |
-| Gateway WS send first chunk | 10 ms | `nqai_ws_send_seconds` |
-| **TTFB total** | **~1660 ms (T4) / 660 ms (L4)** | `nqai_tts_ttfb_seconds` |
+| Gateway HTTP chunked first byte | 10 ms | `nqai_stream_first_byte_seconds` |
+| **TTFB total** | **~1610 ms (T4) / 610 ms (L4)** | `nqai_tts_ttfb_seconds` |
 | Sonraki cümleler (warm pipeline) | 800-1500 ms her biri | `nqai_inference_per_sentence_seconds` |
 
 Hedef SLO'lar: TTFB p50 ≤ 800 ms (L4 ile), p95 ≤ 1.5 s. Bu Faz C'de Nano-vLLM ile gerçekleşir; Faz B sınırı T4 hardware'inde p95 ~2-3 s.
@@ -584,7 +570,7 @@ Tek satır cevaplar, detay → bileşen matrisi (§4) veya zorunlu kararlar (§6
 | **Inference runtime?** | `voxcpm` (Faz A-B) → `nano-vllm-voxcpm` (Faz C+) | Triton Faz D B2B SDK için |
 | **Auth?** | API key + argon2id + DB scope + Redis rate limit | Yok — bu pattern oturuyor |
 | **Admin UI?** | FastAPI + Jinja2 + HTMX (server-side) | Next.js Faz E ekip büyürse |
-| **Streaming?** | WebRTC/LiveKit primary + WebSocket/HTTP fallback | gRPC eklenebilir Faz D'de |
+| **Streaming?** | HTTP chunked primary (`/v1/tts/stream`) + async jobs (`/v1/tts/jobs`) + sync deprecated proxy | Opsiyonel WS (`/v1/tts/ws`) Faz B.2'de; duplex voice-agent ayrı product surface |
 | **Container?** | Docker Compose (dev) → Kubernetes (prod, Faz D+) | Nomad alternatif (küçük ekip için daha basit) |
 | **GPU cloud?** | RunPod (start) → Modal/Lambda (Faz D karşılaştırma) | self-managed Faz E (>$5000/ay GPU spend'de) |
 | **Observability?** | Prometheus + Grafana + Loki + OTel | Honeycomb traces için Faz D'de değerlendirilir |

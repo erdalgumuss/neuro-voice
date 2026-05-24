@@ -1,4 +1,4 @@
-# NQAI Voice GPU worker image — owns VoxCPM2 inference and live WebRTC agent code.
+# NQAI Voice GPU worker image — owns VoxCPM2 inference and streaming pipeline.
 
 FROM python:3.12-slim
 
@@ -19,6 +19,6 @@ COPY migrations ./migrations
 COPY alembic.ini ./
 COPY scripts ./scripts
 
-RUN pip install -e ".[live]"
+RUN pip install -e "."
 
 CMD ["python", "-m", "worker.main"]
