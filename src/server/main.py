@@ -37,6 +37,7 @@ from fastapi import (
     Request,
     Response,
     UploadFile,
+    WebSocket,
     status,
 )
 
@@ -74,7 +75,7 @@ from repos import (
 )
 
 from .admin import admin_router
-from .auth import AuthContext, require_auth
+from .auth import AuthContext, get_redis, require_auth
 from .config import settings
 from .heartbeat import read_cluster_capacity
 from .models import UnknownModelError, list_models, resolve_model
@@ -1412,6 +1413,38 @@ async def synthesize_stream_alias(
         ) from e
     canonical = TTSStreamRequest(voice_id=voice_id, **body.model_dump())
     return await synthesize_stream(canonical, request, ctx, session, queue)
+
+
+# --------------------------------------------------------------------------- #
+# Faz B.5 Dalga 3.1 — WebSocket input streaming
+# --------------------------------------------------------------------------- #
+@app.websocket("/v1/text-to-speech/{voice_id}/stream-input")
+async def text_to_speech_stream_input(
+    websocket: WebSocket,
+    voice_id: str,
+) -> None:
+    """ElevenLabs-shape WebSocket endpoint for partial-text TTS.
+
+    See `server.ws.stream_input_endpoint` for the wire protocol +
+    flushing strategy. The route lives in `main` so FastAPI's OpenAPI
+    output and the route registration sit next to the HTTP TTS
+    endpoints; the heavy lifting (auth, buffering, queue submit,
+    result-stream forwarding) is in `server.ws`.
+    """
+    from .ws import stream_input_endpoint
+    # Test fixtures override get_redis + get_queue via
+    # app.dependency_overrides; WebSocket dependencies use the same
+    # registry. Calling the override functions directly is the
+    # simplest path that respects the override map.
+    redis_dep = app.dependency_overrides.get(get_redis, get_redis)
+    queue_dep = app.dependency_overrides.get(get_queue, get_queue)
+    await stream_input_endpoint(
+        websocket,
+        voice_id,
+        queue=queue_dep(),
+        session_factory=AsyncSessionLocal,
+        redis=redis_dep(),
+    )
 
 
 def _hash_sync_body(body) -> str:
