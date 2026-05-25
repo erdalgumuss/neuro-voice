@@ -7,6 +7,31 @@ checked in sequence (per-key, per-tenant, per-IP); first that fails wins.
 The Lua script is loaded once and called via SCRIPT EVALSHA; if the
 server hot-reloads the script cache (EVALSHA → NOSCRIPT), we fall back
 to EVAL and re-register.
+
+Upgrade path — sliding window → token bucket
+--------------------------------------------
+The current implementation is a **sliding-window log** (sorted set +
+ZADD per request). It gives strict fairness and exact accounting, which
+is the right v0 default for multi-tenant TTS. The known weakness is
+burst-tolerance: voice-agent traffic patterns (chat turn = 1-3 TTS
+calls in quick succession, then 5 s idle) get refused at the window
+boundary even though the per-minute average is well under quota.
+
+The documented upgrade is a **per-tenant token bucket** (Lua-side
+state: ``{tokens, last_refill_ms}``; refill at ``rate_per_sec`` until
+``capacity``; deduct 1 per admitted request). Swap trigger, per the
+B.3 decision row (2026-05-25):
+
+    * per-tenant 429-rate > 1 % during normal usage, OR
+    * aggregate QPS > 1 k/s (sorted-set write QPS becomes a Redis
+      hotspot beyond that point).
+
+Reference pattern for the swap (AWS multi-tenant token bucket):
+    https://willdady.com/rate-limiting-multi-tenant-environments-with-the-token-bucket-algorithm-on-aws
+
+Not done in v0 because (a) we don't yet have user-facing 429 telemetry
+to know the real burst rate, (b) sliding-window's strict accounting
+makes early SLO reasoning simpler.
 """
 
 from __future__ import annotations
@@ -24,6 +49,9 @@ from redis.exceptions import NoScriptError, ResponseError
 # inline EVAL (which would hide real failures behind a slower retry path).
 _NOSCRIPT_RESPONSE_MARKER = "NOSCRIPT"
 
+# Sliding-window log Lua. See the module docstring "Upgrade path" section
+# for the documented swap to a token-bucket variant; until 429-rate or QPS
+# thresholds trigger that move, this script stays the source of truth.
 SLIDING_WINDOW_LUA = """
 -- KEYS[1] = window-set key (sorted set)
 -- ARGV[1] = now_ms

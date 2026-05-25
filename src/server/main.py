@@ -120,13 +120,25 @@ VERSION = "0.4.0"
 # the async /v1/tts/jobs path uses. Engine + sentence streaming live
 # exclusively in `src/worker/`; the gateway is pure I/O + auth + DB.
 
-# Sunset date for the sync endpoints (RFC 8594). When this passes, the
+# Sunset date for the sync endpoint (RFC 8594). When this passes, the
 # Deprecation header becomes a hard 410 in a follow-up release.
-SYNC_TTS_SUNSET = "Mon, 01 Sep 2026 00:00:00 GMT"
+#
+# Research finding A.9 (2026-05-25) — bringing the formal cliff in from
+# 2026-09-01 to 2026-07-01. SDK clients (Anthropic / OpenAI / Stripe
+# pattern) inspect `Sunset` + `Deprecation` and surface to developers;
+# the earlier cliff gives client teams the same migration runway as the
+# old date because they were given six weeks of the prior surface
+# already. The migration target is the async `/v1/tts/jobs` endpoint,
+# documented at the canonical migration URL below.
+SYNC_TTS_SUNSET = "Wed, 01 Jul 2026 00:00:00 GMT"
+_SYNC_DEPRECATION_LINK = (
+    '<https://docs.nqai.dev/migrations/v1-tts-streaming>; '
+    'rel="deprecation"; type="text/html"'
+)
 _SYNC_DEPRECATION_HEADERS = {
     "Deprecation": "true",
     "Sunset": SYNC_TTS_SUNSET,
-    "Link": '</v1/tts/jobs>; rel="successor-version"',
+    "Link": _SYNC_DEPRECATION_LINK,
 }
 
 
@@ -215,6 +227,27 @@ if "*" in settings.cors_origins:
         "wildcard origin). Set NQAI_CORS_ORIGINS to an explicit "
         "allow-list in production.",
     )
+
+
+@app.middleware("http")
+async def _sync_tts_deprecation_headers(request: Request, call_next):
+    """Research finding A.9 (2026-05-25) — stamp RFC 8594 Sunset +
+    Deprecation + Link on every response from the deprecated sync
+    `/v1/tts` endpoint, including 4xx auth failures and 5xx errors.
+
+    The success path inside `synthesize()` already merges
+    `_SYNC_DEPRECATION_HEADERS` into its 2xx response; this middleware
+    catches the error paths (auth 401/403, validation 4xx, worker 5xx)
+    so SDK clients honouring the Sunset header still see the cliff date
+    even when their request bounces. Scoped to the exact `/v1/tts` path
+    so the async `/v1/tts/jobs` migration target is untouched — that's
+    the path we're sunsetting INTO, not out of."""
+    response = await call_next(request)
+    if request.url.path == "/v1/tts":
+        for key, value in _SYNC_DEPRECATION_HEADERS.items():
+            response.headers[key] = value
+    return response
+
 
 app.add_middleware(
     CORSMiddleware,

@@ -87,6 +87,49 @@ _PRESETS: tuple[ModelPreset, ...] = (
         cfg_value=2.5,
         inference_timesteps=24,
     ),
+    # Research-finding A.3 (2026-05-25): industry-shaped fast / standard /
+    # studio lanes that map onto the same VoxCPM2 base. The `tr-*` triplet
+    # above stays because external clients have already picked them up; the
+    # `voxcpm2-*` triplet below is the new product-shaped surface for
+    # NEEKO live chat (fast) vs NeuroCourse long-form (studio), citing
+    # F5-TTS / EPSS inference-timestep work. cfg+timesteps are the only
+    # difference per preset; the underlying HF weight is identical.
+    ModelPreset(
+        model_id="voxcpm2-fast",
+        display_name="VoxCPM2 — Fast",
+        description=(
+            "Live-chat tier. 7 diffusion steps, cfg=2.0. ~4x faster wall "
+            "time than studio with minimal perceptual quality drop on "
+            "Turkish reference voices (per F5-TTS / EPSS prior art). "
+            "Pick this for NEEKO live conversation and any latency-"
+            "sensitive duplex surface."
+        ),
+        cfg_value=2.0,
+        inference_timesteps=7,
+    ),
+    ModelPreset(
+        model_id="voxcpm2-standard",
+        display_name="VoxCPM2 — Standard",
+        description=(
+            "Balanced default. 10 diffusion steps, cfg=2.0. Matches "
+            "VoxCPM2's upstream default inference_timesteps; production "
+            "target when latency budget is generous but not unbounded."
+        ),
+        cfg_value=2.0,
+        inference_timesteps=10,
+    ),
+    ModelPreset(
+        model_id="voxcpm2-studio",
+        display_name="VoxCPM2 — Studio",
+        description=(
+            "Long-form studio tier. 16 diffusion steps, cfg=2.5. "
+            "Highest fidelity for NeuroCourse instructor reads, audiobook "
+            "narration, and other async jobs where wall time is acceptable "
+            "in exchange for maximum reference adherence."
+        ),
+        cfg_value=2.5,
+        inference_timesteps=16,
+    ),
 )
 
 

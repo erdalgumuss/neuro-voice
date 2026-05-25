@@ -648,3 +648,66 @@ def test_public_voice_hides_owner_api_key_id_from_non_owner(
     # Owner sees the real api_key UUID; non-owner sees "system".
     assert owner_view["created_by"] != "system"
     assert other_view["created_by"] == "system"
+
+
+# --------------------------------------------------------------------------- #
+# Research-finding A.9 (2026-05-25) — RFC 8594 Sunset + Deprecation +
+# Link headers on the deprecated sync /v1/tts endpoint. Must surface on
+# BOTH success-shaped and auth-failed responses so SDK clients honouring
+# the headers see the cliff regardless of which code path they hit.
+# --------------------------------------------------------------------------- #
+_SUNSET_DATE = "Wed, 01 Jul 2026 00:00:00 GMT"
+_SUNSET_LINK_FRAGMENT = "rel=\"deprecation\""
+_SUNSET_LINK_URL = "https://docs.nqai.dev/migrations/v1-tts-streaming"
+
+
+def test_sync_tts_carries_sunset_headers_on_error_path(client):
+    """A.9 — hitting the deprecated sync endpoint with a valid bearer
+    but a bogus voice_id returns 404 AND carries the Sunset trio.
+    Confirms the middleware fires on error paths inside the handler."""
+    r = client.post(
+        "/v1/tts",
+        json={"text": "merhaba", "voice_id": "nobody-here"},
+    )
+    assert r.status_code == 404
+    assert r.headers.get("Deprecation") == "true"
+    assert r.headers.get("Sunset") == _SUNSET_DATE
+    link = r.headers.get("Link", "")
+    assert _SUNSET_LINK_URL in link
+    assert _SUNSET_LINK_FRAGMENT in link
+
+
+def test_sync_tts_carries_sunset_headers_on_auth_failure(client):
+    """A.9 — auth-failed (401) requests to the sync endpoint also see
+    the headers. Without this, an SDK whose bearer is misconfigured
+    has no programmatic signal that the surface it's targeting is
+    sunsetting. Stripe / Anthropic / OpenAI SDKs all honour Sunset on
+    4xx responses for migration UX."""
+    r = client.post(
+        "/v1/tts",
+        json={"text": "merhaba", "voice_id": "x"},
+        headers={"Authorization": "Bearer bogus-key"},
+    )
+    assert r.status_code == 401
+    assert r.headers.get("Deprecation") == "true"
+    assert r.headers.get("Sunset") == _SUNSET_DATE
+    assert _SUNSET_LINK_URL in r.headers.get("Link", "")
+
+
+def test_async_tts_jobs_does_NOT_carry_sunset_headers(client):
+    """A.9 — the async `/v1/tts/jobs` endpoint is the migration target.
+    Stamping Sunset on it would tell SDKs the path they're migrating TO
+    is also going away, which is wrong. The middleware is scoped to
+    exact path `/v1/tts`, so `/v1/tts/jobs` is unaffected."""
+    # We don't need a valid job — any response from the path proves the
+    # middleware leaves the path alone. Missing Idempotency-Key + bogus
+    # voice gives us a deterministic non-2xx without engine wiring.
+    r = client.post(
+        "/v1/tts/jobs",
+        json={"text": "merhaba", "voice_id": "nobody-here"},
+        headers={"Idempotency-Key": "00000000-0000-4000-8000-000000000001"},
+    )
+    # 4xx is fine — content here is incidental, the assertion is about
+    # the absence of Sunset headers on this path.
+    assert r.headers.get("Deprecation") is None
+    assert r.headers.get("Sunset") is None

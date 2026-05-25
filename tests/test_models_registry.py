@@ -99,3 +99,63 @@ def test_turbo_is_faster_than_hd_is_faster_than_character() -> None:
         < by_id["nqai-voxcpm2-tr-hd"].inference_timesteps
         < by_id["nqai-voxcpm2-tr-character"].inference_timesteps
     )
+
+
+# --------------------------------------------------------------------------- #
+# Research-finding A.3 (2026-05-25): `voxcpm2-fast / -standard / -studio`
+# product-shaped triplet on top of the same VoxCPM2 base. Pins exact
+# `cfg_value` + `inference_timesteps` per the decision row so a future
+# refactor can't drift them silently.
+# --------------------------------------------------------------------------- #
+def test_voxcpm2_fast_standard_studio_triplet_registered() -> None:
+    """All three product-shaped lanes must be discoverable via the
+    same registry that backs `GET /v1/models`."""
+    ids = {p.model_id for p in list_models()}
+    assert "voxcpm2-fast" in ids
+    assert "voxcpm2-standard" in ids
+    assert "voxcpm2-studio" in ids
+
+
+def test_voxcpm2_fast_preset_params() -> None:
+    """A.3 contract: live-chat tier is cfg=2.0, timesteps=7."""
+    preset = resolve_model("voxcpm2-fast")
+    assert preset.cfg_value == 2.0
+    assert preset.inference_timesteps == 7
+
+
+def test_voxcpm2_standard_preset_params() -> None:
+    """A.3 contract: standard tier is cfg=2.0, timesteps=10 (matches
+    VoxCPM2's upstream default)."""
+    preset = resolve_model("voxcpm2-standard")
+    assert preset.cfg_value == 2.0
+    assert preset.inference_timesteps == 10
+
+
+def test_voxcpm2_studio_preset_params() -> None:
+    """A.3 contract: studio tier is cfg=2.5, timesteps=16."""
+    preset = resolve_model("voxcpm2-studio")
+    assert preset.cfg_value == 2.5
+    assert preset.inference_timesteps == 16
+
+
+def test_voxcpm2_lanes_have_distinct_timesteps() -> None:
+    """Live-chat / standard / studio must resolve to *different*
+    `inference_timesteps` — otherwise the "lane" is just rebranding
+    and gives operators no real latency knob."""
+    fast = resolve_model("voxcpm2-fast").inference_timesteps
+    standard = resolve_model("voxcpm2-standard").inference_timesteps
+    studio = resolve_model("voxcpm2-studio").inference_timesteps
+    assert fast == 7
+    assert standard == 10
+    assert studio == 16
+    # Ordering invariant: fewer steps → faster.
+    assert fast < standard < studio
+
+
+def test_voxcpm2_lanes_cfg_values_match_spec() -> None:
+    """Pin the cfg trio so a future "let's bump fast to 1.5" PR is
+    forced through a decision row instead of slipping silently."""
+    fast = resolve_model("voxcpm2-fast").cfg_value
+    standard = resolve_model("voxcpm2-standard").cfg_value
+    studio = resolve_model("voxcpm2-studio").cfg_value
+    assert (fast, standard, studio) == (2.0, 2.0, 2.5)
