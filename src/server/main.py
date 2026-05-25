@@ -952,6 +952,10 @@ async def synthesize(
                 body.voice_settings.model_dump(exclude_none=True)
                 if body.voice_settings is not None else None
             ),
+            seed=body.seed,
+            previous_text=body.previous_text,
+            next_text=body.next_text,
+            pronunciation_dict=body.pronunciation_dict,
             app_label=_app_label_from(request),
             enqueued_at_ms=int(time() * 1000),
         )
@@ -1124,6 +1128,10 @@ async def synthesize_stream(
                 body.voice_settings.model_dump(exclude_none=True)
                 if body.voice_settings is not None else None
             ),
+            seed=body.seed,
+            previous_text=body.previous_text,
+            next_text=body.next_text,
+            pronunciation_dict=body.pronunciation_dict,
             app_label=_app_label_from(request),
             enqueued_at_ms=int(time() * 1000),
         )
@@ -1636,6 +1644,10 @@ async def create_tts_job(
             if body.voice_settings is not None else None
         ),
         params=body.params.model_dump(exclude_none=True) if body.params else None,
+        seed=body.seed,
+        previous_text=body.previous_text,
+        next_text=body.next_text,
+        pronunciation_dict=body.pronunciation_dict,
         app_label=_app_label_from(request),
         enqueued_at_ms=int(time() * 1000),
     )

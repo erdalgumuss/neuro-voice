@@ -435,6 +435,21 @@ async def process_one_job(
     # is voice-grade for the 0.7–1.2x range the schema bounds.
     from audio.postprocess import apply_voice_settings as _apply_vs
 
+    # Faz B.5 Dalga 2.6 — bundle vendor-parity per-request hints into
+    # `request_meta`. The engine cherry-picks the fields it acts on
+    # (`seed`, `pronunciation_dict`); `previous_text`/`next_text` are
+    # forward-compat (validated + persisted on the payload, no-op in
+    # the engine today).
+    request_meta: dict[str, object] = {}
+    if job.seed is not None:
+        request_meta["seed"] = job.seed
+    if job.pronunciation_dict:
+        request_meta["pronunciation_dict"] = job.pronunciation_dict
+    if job.previous_text is not None:
+        request_meta["previous_text"] = job.previous_text
+    if job.next_text is not None:
+        request_meta["next_text"] = job.next_text
+
     try:
         async for chunk in iter_engine_chunks(
             engine,
@@ -443,6 +458,7 @@ async def process_one_job(
             reference_path=ref_path,
             language_id=job.language,
             engine_overrides=engine_overrides,
+            request_meta=request_meta or None,
         ):
             if first_pcm_ms is None:
                 first_pcm_ms = int(

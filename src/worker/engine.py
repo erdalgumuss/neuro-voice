@@ -67,6 +67,7 @@ class BaseSynthEngine(Protocol):
         reference_path: Path,
         language_id: str = "tr",
         engine_overrides: dict[str, float | int] | None = None,
+        request_meta: dict[str, object] | None = None,
     ) -> Iterator[SynthChunk]: ...
     def synthesize(
         self,
@@ -76,6 +77,7 @@ class BaseSynthEngine(Protocol):
         reference_path: Path,
         language_id: str = "tr",
         engine_overrides: dict[str, float | int] | None = None,
+        request_meta: dict[str, object] | None = None,
     ) -> SynthResult: ...
 
 
@@ -415,6 +417,7 @@ class VoxCPM2Engine:
         reference_path: Path,
         language_id: str = "tr",
         engine_overrides: dict[str, float | int] | None = None,
+        request_meta: dict[str, object] | None = None,
     ) -> Iterator[SynthChunk]:
         """Yield one `SynthChunk` per logical sentence.
 
@@ -430,6 +433,14 @@ class VoxCPM2Engine:
         `inference_timesteps` overrides (e.g. resolved from a `model_id`
         preset at the worker pipeline). See `server.models` for the
         registry.
+
+        `request_meta` (Faz B.5 Dalga 2.6) bundles vendor-parity per-
+        request hints that aren't engine knobs:
+          * `seed`              — best-effort torch RNG seed
+          * `pronunciation_dict`— per-request Turkish-frontend overrides
+          * `previous_text`     — forward-compat prosody hint (no-op today)
+          * `next_text`         — forward-compat prosody hint (no-op today)
+        Unknown keys are ignored so the wire format can evolve forward.
         """
         self._load()
         if not reference_path.is_file():
@@ -437,7 +448,23 @@ class VoxCPM2Engine:
                 f"reference audio for {voice.voice_id} missing: {reference_path}"
             )
 
-        normalized = normalize_text(text)
+        meta = request_meta or {}
+        pron_dict = meta.get("pronunciation_dict")
+        if pron_dict is not None and not isinstance(pron_dict, dict):
+            pron_dict = None  # defensive — wire-format drift shouldn't crash
+        seed_val = meta.get("seed")
+        if seed_val is not None:
+            try:
+                import torch
+                torch.manual_seed(int(seed_val))
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(int(seed_val))
+            except Exception:  # noqa: BLE001 — best-effort only
+                logger.exception(
+                    "torch seed=%s could not be applied; continuing", seed_val,
+                )
+
+        normalized = normalize_text(text, pronunciation_dict=pron_dict)
         segments = segment_sentences(normalized)
         if not segments:
             return
@@ -465,6 +492,7 @@ class VoxCPM2Engine:
         reference_path: Path,
         language_id: str = "tr",
         engine_overrides: dict[str, float | int] | None = None,
+        request_meta: dict[str, object] | None = None,
     ) -> SynthResult:
         t0 = time.time()
         pcm_parts: list[bytes] = []
@@ -475,6 +503,7 @@ class VoxCPM2Engine:
             self.synthesize_stream(
                 text=text, voice=voice, reference_path=reference_path,
                 language_id=language_id, engine_overrides=engine_overrides,
+                request_meta=request_meta,
             )
         ):
             if i > 0:

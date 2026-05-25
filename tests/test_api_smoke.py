@@ -506,6 +506,76 @@ def test_tts_voice_404(client):
 
 
 # --------------------------------------------------------------------------- #
+# Faz B.5 Dalga 2.6 — seed / pronunciation / context fields on the wire
+# --------------------------------------------------------------------------- #
+def test_tts_rejects_oversized_pronunciation_dict(client):
+    """Wire-level guard: 65-entry dict tripped by the field validator
+    before the request reaches the queue."""
+    r = client.post(
+        "/v1/tts",
+        json={
+            "text": "merhaba",
+            "voice_id": "demo-01",
+            "pronunciation_dict": {f"k{i}": "v" for i in range(65)},
+        },
+    )
+    assert r.status_code == 422, r.text
+
+
+def test_tts_rejects_pronunciation_dict_long_key(client):
+    r = client.post(
+        "/v1/tts",
+        json={
+            "text": "merhaba",
+            "voice_id": "demo-01",
+            "pronunciation_dict": {"k" * 65: "v"},
+        },
+    )
+    assert r.status_code == 422, r.text
+
+
+def test_tts_rejects_seed_out_of_range(client):
+    """Seed is bounded to signed-31-bit to round-trip safely on every SDK."""
+    r = client.post(
+        "/v1/tts",
+        json={
+            "text": "merhaba",
+            "voice_id": "demo-01",
+            "seed": -1,
+        },
+    )
+    assert r.status_code == 422, r.text
+
+
+def test_tts_job_accepts_dalga_26_fields(client):
+    """POST /v1/tts/jobs accepts seed + previous_text + next_text +
+    pronunciation_dict and returns 202 (voice resolution still fails
+    if the voice isn't enrolled, but accept-side validation passes)."""
+    import uuid as _uuid
+    wav = _make_wav_bytes()
+    client.post(
+        "/v1/voices",
+        data={"voice_id": "dalga26-vc", "display_name": "D26"},
+        files={"reference_audio": ("d.wav", wav, "audio/wav")},
+    )
+    r = client.post(
+        "/v1/tts/jobs",
+        headers={"Idempotency-Key": str(_uuid.uuid4())},
+        json={
+            "text": "Merhaba dünya.",
+            "voice_id": "dalga26-vc",
+            "seed": 42,
+            "previous_text": "Önceki cümle.",
+            "next_text": "Sonraki cümle.",
+            "pronunciation_dict": {"NQAI": "en-ku-a-ay"},
+        },
+    )
+    # Without a worker, the job is queued (202) — accept-side is what we
+    # care about here; engine-side flow is covered in test_worker_pipeline.
+    assert r.status_code == 202, r.text
+
+
+# --------------------------------------------------------------------------- #
 # Cross-tenant isolation — second tenant cannot see first tenant's voices
 # --------------------------------------------------------------------------- #
 @pytest.fixture

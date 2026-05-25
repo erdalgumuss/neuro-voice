@@ -32,3 +32,37 @@ def test_idempotent_on_normalized_input() -> None:
 def test_empty_input() -> None:
     assert normalize_text("") == ""
     assert normalize_text("   ") == ""
+
+
+# --------------------------------------------------------------------------- #
+# Faz B.5 Dalga 2.6 — per-request pronunciation overrides
+# --------------------------------------------------------------------------- #
+def test_pronunciation_dict_overrides_global_lexicon() -> None:
+    """User override fires BEFORE the built-in code-mix lexicon —
+    tenant can shadow the global pronunciation for one request."""
+    raw = "iPhone yeni geldi"
+    default = normalize_text(raw).lower()
+    assert "aypın" in default
+
+    overridden = normalize_text(
+        raw, pronunciation_dict={"iPhone": "ai-fon"}
+    ).lower()
+    assert "ai-fon" in overridden
+    assert "aypın" not in overridden
+
+
+def test_pronunciation_dict_case_insensitive() -> None:
+    """Whole-word case-insensitive — `\\b` boundaries handle punctuation."""
+    out = normalize_text(
+        "NQAI projesi başladı, nqai harika!",
+        pronunciation_dict={"NQAI": "en-ku-a-ay"},
+    )
+    # Both occurrences (NQAI + nqai) replaced.
+    assert out.count("en-ku-a-ay") == 2
+
+
+def test_pronunciation_dict_none_is_noop() -> None:
+    """No dict → behaviour identical to the legacy single-arg call."""
+    raw = "Bluetooth'u açmayı unutma."
+    assert normalize_text(raw) == normalize_text(raw, pronunciation_dict=None)
+    assert normalize_text(raw) == normalize_text(raw, pronunciation_dict={})

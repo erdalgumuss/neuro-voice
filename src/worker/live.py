@@ -49,6 +49,7 @@ async def iter_engine_chunks(
     language_id: str = "tr",
     cancel_event: asyncio.Event | None = None,
     engine_overrides: dict[str, float | int] | None = None,
+    request_meta: dict[str, object] | None = None,
 ) -> AsyncIterator[object]:
     """Bridge the blocking sync engine generator into async.
 
@@ -106,6 +107,7 @@ async def iter_engine_chunks(
                 reference_path=reference_path,
                 language_id=language_id,
                 engine_overrides=engine_overrides,
+                request_meta=request_meta,
             ):
                 if cancel_event is not None and cancel_event.is_set():
                     return

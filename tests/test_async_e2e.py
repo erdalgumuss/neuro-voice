@@ -63,7 +63,7 @@ class _StubEngine:
     def warmup(self) -> None:
         pass
 
-    def synthesize_stream(self, *, text, voice, reference_path, language_id="tr", engine_overrides=None):
+    def synthesize_stream(self, *, text, voice, reference_path, language_id="tr", engine_overrides=None, request_meta=None):
         # 2 sentences of silence.
         for i, s in enumerate(("İlk cümle.", "İkinci cümle.")):
             yield _FakeChunk(

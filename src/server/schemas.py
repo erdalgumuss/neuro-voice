@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 # Faz B.5 Dalga 1 — codec layer (audit 2026-05-25): mp3 + opus added
 # alongside the existing wav/pcm16. mp3 (~3-5x smaller than wav) and
@@ -59,6 +59,54 @@ class VoiceSettings(BaseModel):
     pitch: float | None = Field(default=None, ge=-12.0, le=12.0)
 
 
+# --------------------------------------------------------------------------- #
+# Faz B.5 Dalga 2.6 — context + pronunciation + seed (vendor parity)
+# --------------------------------------------------------------------------- #
+# Shared pronunciation_dict bounds. Centralised so every request shape
+# enforces the same envelope and the worker never has to defend against
+# unbounded text-frontend work.
+_PRON_DICT_MAX_ENTRIES = 64
+_PRON_DICT_MAX_KEY_LEN = 64
+_PRON_DICT_MAX_VAL_LEN = 64
+
+
+def _validate_pronunciation_dict(
+    value: dict[str, str] | None,
+) -> dict[str, str] | None:
+    if value is None:
+        return None
+    if len(value) > _PRON_DICT_MAX_ENTRIES:
+        raise ValueError(
+            f"pronunciation_dict has {len(value)} entries; "
+            f"max {_PRON_DICT_MAX_ENTRIES}"
+        )
+    for k, v in value.items():
+        if not isinstance(k, str) or not isinstance(v, str):
+            raise ValueError("pronunciation_dict keys and values must be strings")
+        if not k.strip():
+            raise ValueError("pronunciation_dict keys must be non-empty")
+        if len(k) > _PRON_DICT_MAX_KEY_LEN:
+            raise ValueError(
+                f"pronunciation_dict key '{k[:16]}…' exceeds "
+                f"{_PRON_DICT_MAX_KEY_LEN} chars"
+            )
+        if len(v) > _PRON_DICT_MAX_VAL_LEN:
+            raise ValueError(
+                f"pronunciation_dict value for '{k}' exceeds "
+                f"{_PRON_DICT_MAX_VAL_LEN} chars"
+            )
+    return value
+
+
+
+# ElevenLabs ships `seed`, `previous_text`, `next_text`,
+# `pronunciation_dictionary_locators`; MiniMax ships `seed` + inline
+# pronunciation. We accept the union so SDKs that already pass these
+# fields keep working. Where the engine doesn't act on a field yet, it
+# is forward-compatible (validated + persisted in audit log, no engine
+# action) and the docstring says so explicitly.
+
+
 class TTSRequest(BaseModel):
     # `model_id` collides with pydantic v2's protected namespace; silence
     # the warning — this is intentional vendor parity (ElevenLabs and
@@ -76,6 +124,36 @@ class TTSRequest(BaseModel):
     # Faz B.5 Dalga 2.1 — per-request voice tuning. See VoiceSettings
     # docstring for the field-by-field NQAI mapping.
     voice_settings: VoiceSettings | None = None
+    # Faz B.5 Dalga 2.6 — best-effort determinism. Seeded torch RNG
+    # at the worker just before `model.generate()`. Same seed +
+    # same text + same voice + same engine knobs → same waveform
+    # within a model build; cross-build replays are not guaranteed.
+    # Constrained to signed 31-bit so it round-trips through JSON
+    # safely on every SDK.
+    seed: int | None = Field(default=None, ge=0, le=2147483647)
+    # Faz B.5 Dalga 2.6 — surrounding-context hints (ElevenLabs-style).
+    # Today they are forward-compat: validated, persisted on the job
+    # payload, surfaced in the audit log for downstream learning,
+    # but the worker does not yet thread them into the model context
+    # window. Wires into a prosody-continuity pass when the engine
+    # exposes a sliding text buffer; clients can already start
+    # sending them so audiobook / long-doc flows light up
+    # automatically when that ships.
+    previous_text: str | None = Field(default=None, max_length=4000)
+    next_text: str | None = Field(default=None, max_length=4000)
+    # Faz B.5 Dalga 2.6 — per-request pronunciation override map.
+    # Concrete behavior: every key is treated as a whole-word case-
+    # insensitive substitution applied in the Turkish frontend
+    # BEFORE the built-in code-mix lexicon, so a tenant can correct
+    # brand pronunciations on a per-request basis without touching
+    # the global lexicon. Capped at 64 entries × 64 chars each to
+    # bound text-frontend work.
+    pronunciation_dict: dict[str, str] | None = Field(default=None)
+
+    @field_validator("pronunciation_dict")
+    @classmethod
+    def _validate_pron(cls, v: dict[str, str] | None) -> dict[str, str] | None:
+        return _validate_pronunciation_dict(v)
 
 
 class TTSStreamRequest(TTSRequest):
@@ -103,6 +181,16 @@ class TTSAliasRequest(BaseModel):
     audio_format: AudioFormat = "wav"
     model_id: str | None = Field(default=None, max_length=64)
     voice_settings: VoiceSettings | None = None
+    # Dalga 2.6 fields — same semantics as TTSRequest.
+    seed: int | None = Field(default=None, ge=0, le=2147483647)
+    previous_text: str | None = Field(default=None, max_length=4000)
+    next_text: str | None = Field(default=None, max_length=4000)
+    pronunciation_dict: dict[str, str] | None = Field(default=None)
+
+    @field_validator("pronunciation_dict")
+    @classmethod
+    def _validate_pron(cls, v: dict[str, str] | None) -> dict[str, str] | None:
+        return _validate_pronunciation_dict(v)
 
 
 class TTSStreamAliasRequest(TTSAliasRequest):
@@ -238,6 +326,16 @@ class TTSJobCreate(BaseModel):
     model_id: str | None = Field(default=None, max_length=64)
     voice_settings: VoiceSettings | None = None
     params: TTSJobParams | None = None
+    # Dalga 2.6 fields — same semantics as TTSRequest.
+    seed: int | None = Field(default=None, ge=0, le=2147483647)
+    previous_text: str | None = Field(default=None, max_length=4000)
+    next_text: str | None = Field(default=None, max_length=4000)
+    pronunciation_dict: dict[str, str] | None = Field(default=None)
+
+    @field_validator("pronunciation_dict")
+    @classmethod
+    def _validate_pron(cls, v: dict[str, str] | None) -> dict[str, str] | None:
+        return _validate_pronunciation_dict(v)
 
 
 JobStatus = Literal["queued", "running", "complete", "failed"]

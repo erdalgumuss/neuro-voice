@@ -57,7 +57,7 @@ class _StubEngine:
     def warmup(self) -> None:
         pass
 
-    def synthesize_stream(self, *, text, voice, reference_path, language_id="tr", engine_overrides=None):
+    def synthesize_stream(self, *, text, voice, reference_path, language_id="tr", engine_overrides=None, request_meta=None):
         if self._raise:
             raise RuntimeError("synthetic crash")
         for i, s in enumerate(self._sentences):

@@ -84,6 +84,30 @@ def _expand_code_mix(text: str) -> str:
     return text
 
 
+def _expand_user_pronunciation(text: str, mapping: dict[str, str]) -> str:
+    """Faz B.5 Dalga 2.6 — per-request pronunciation override.
+
+    Applied BEFORE the built-in code-mix lexicon so a tenant can shadow
+    "iPhone" → vendor-specific spelling, override a brand the global
+    lexicon hasn't learned yet, or fix a one-off mispronunciation
+    surfaced from QA without a global lexicon change. Case-insensitive
+    whole-word match; punctuation around the token is preserved by the
+    `\\b` boundaries.
+    """
+    if not mapping:
+        return text
+    for token, pron in mapping.items():
+        if not token:
+            continue
+        text = re.sub(
+            rf"\b{re.escape(token)}\b",
+            pron,
+            text,
+            flags=re.IGNORECASE,
+        )
+    return text
+
+
 def _expand_time(match: re.Match[str]) -> str:
     hh, mm = match.group(1), match.group(2)
     h_words = number_to_turkish(int(hh))
@@ -119,13 +143,24 @@ def _expand_integer(match: re.Match[str]) -> str:
     return f"{sign}{number_to_turkish(int(raw))}"
 
 
-def normalize_text(text: str) -> str:
-    """Run the v0 normalization pipeline. Idempotent for normalized input."""
+def normalize_text(
+    text: str,
+    *,
+    pronunciation_dict: dict[str, str] | None = None,
+) -> str:
+    """Run the v0 normalization pipeline. Idempotent for normalized input.
+
+    `pronunciation_dict` (Faz B.5 Dalga 2.6) is an optional per-request
+    override map applied BEFORE the built-in code-mix lexicon, so the
+    caller's override always wins for a given token.
+    """
     if not text:
         return ""
     text = unicodedata.normalize("NFKC", text)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = _expand_abbreviations(text)
+    if pronunciation_dict:
+        text = _expand_user_pronunciation(text, pronunciation_dict)
     text = _expand_code_mix(text)
     text = _TIME_RE.sub(_expand_time, text)
     text = _THOUSAND_GROUPED_RE.sub(_expand_thousand_grouped, text)

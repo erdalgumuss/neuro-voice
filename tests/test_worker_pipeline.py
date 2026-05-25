@@ -77,7 +77,7 @@ class _StubEngine:
     def warmup(self) -> None:
         pass
 
-    def synthesize_stream(self, *, text, voice, reference_path, language_id="tr", engine_overrides=None):
+    def synthesize_stream(self, *, text, voice, reference_path, language_id="tr", engine_overrides=None, request_meta=None):
         if self._raise:
             raise RuntimeError("synthetic engine failure")
         if self._empty:
@@ -704,3 +704,78 @@ async def test_pipeline_publishes_all_chunks_before_slow_archive_runs(
         f"archive delay too short ({archive_finished - archive_started}ms) "
         "— test is no longer exercising the slow path"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Faz B.5 Dalga 2.6 — seed + pronunciation_dict + context fields flow
+# --------------------------------------------------------------------------- #
+async def test_pipeline_threads_request_meta_to_engine(setup_db):
+    """Dalga 2.6: seed / pronunciation_dict / previous_text / next_text
+    on the TtsJobPayload must reach the engine's `request_meta` kwarg.
+
+    Uses a capture-stub engine so the assertion is on the actual
+    argument the engine received, not a side-effect."""
+    setup = setup_db
+    from server.queue import TtsJobPayload
+    from worker.pipeline import process_one_job
+
+    captured: dict[str, object] = {}
+
+    class _CaptureEngine(_StubEngine):
+        def synthesize_stream(self, **kw):
+            captured["request_meta"] = kw.get("request_meta")
+            yield from super().synthesize_stream(**kw)
+
+    redis = fakeredis.aioredis.FakeRedis()
+    engine = _CaptureEngine()
+    job = TtsJobPayload(
+        request_id=str(uuid.uuid4()),
+        tenant_id=str(setup["tenant_id"]),
+        api_key_id=str(setup["api_key_id"]),
+        voice_id=setup["voice_id"],
+        text="merhaba",
+        seed=12345,
+        previous_text="önceki cümle",
+        next_text="sonraki cümle",
+        pronunciation_dict={"NQAI": "en-ku-a-ay"},
+    )
+    await _reserve(setup, job)
+    await process_one_job(
+        job, redis=redis, engine=engine,
+        resolve_reference=_stub_resolver(setup),
+        archive_to_r2=_local_archiver(setup),
+    )
+
+    meta = captured["request_meta"]
+    assert meta is not None
+    assert meta["seed"] == 12345
+    assert meta["previous_text"] == "önceki cümle"
+    assert meta["next_text"] == "sonraki cümle"
+    assert meta["pronunciation_dict"] == {"NQAI": "en-ku-a-ay"}
+
+
+async def test_pipeline_omits_request_meta_when_no_dalga_26_fields(setup_db):
+    """Bare job (no Dalga 2.6 fields) must pass request_meta=None so
+    a zero-cost fast path stays available; we don't push an empty
+    dict that triggers seed/pron-dict branches inside the engine."""
+    setup = setup_db
+    from worker.pipeline import process_one_job
+
+    captured: dict[str, object] = {}
+
+    class _CaptureEngine(_StubEngine):
+        def synthesize_stream(self, **kw):
+            captured["request_meta"] = kw.get("request_meta")
+            yield from super().synthesize_stream(**kw)
+
+    redis = fakeredis.aioredis.FakeRedis()
+    engine = _CaptureEngine()
+    job = _job(setup)
+    await _reserve(setup, job)
+    await process_one_job(
+        job, redis=redis, engine=engine,
+        resolve_reference=_stub_resolver(setup),
+        archive_to_r2=_local_archiver(setup),
+    )
+
+    assert captured["request_meta"] is None

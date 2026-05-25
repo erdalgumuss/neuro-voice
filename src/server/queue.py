@@ -79,6 +79,14 @@ class TtsJobPayload:
     # validated by pydantic on the gateway before reaching here.
     voice_settings: dict[str, Any] | None = None
     params: dict[str, Any] | None = None  # cfg_value, inference_timesteps overrides
+    # Faz B.5 Dalga 2.6 — vendor-parity context / determinism / pronunciation
+    # surface. See `src/server/schemas.py:TTSRequest` docstring for the field
+    # semantics; the wire format keeps them as plain JSON-friendly types so
+    # decode is symmetric with the gateway request body shape.
+    seed: int | None = None
+    previous_text: str | None = None
+    next_text: str | None = None
+    pronunciation_dict: dict[str, str] | None = None
     app_label: str | None = None  # product attribution from X-NQAI-App header
     callback_url: str | None = None  # Faz B+: server-to-server completion hook
     # `attempt` previously lived here as a job-level field but was never
