@@ -72,6 +72,27 @@ def test_unknown_test_set_slug_raises():
         load_test_set("does-not-exist")
 
 
+def test_v0_2_medium_loads_sixty_sentences():
+    """A.8 — 60-sentence medium test set. 6 sentences × 10 categories;
+    used as the eval regression gate once landed."""
+    assert "v0.2-medium" in list_test_sets()
+    ts = load_test_set("v0.2-medium")
+    assert ts.slug == "v0.2-medium"
+    assert len(ts.sentences) == 60, (
+        f"v0.2-medium is supposed to be 60 sentences; got "
+        f"{len(ts.sentences)}. Markdown table shape drift?"
+    )
+    # 10 categories, each with at least 4 sentences (slack for re-balance).
+    categories: dict[str, int] = {}
+    for s in ts.sentences:
+        categories[s.category] = categories.get(s.category, 0) + 1
+    assert len(categories) == 10, (
+        f"Expected 10 categories, got {len(categories)}: {sorted(categories)}"
+    )
+    for cat, n in categories.items():
+        assert n >= 4, f"Category {cat!r} has only {n} sentences (expected ~6)"
+
+
 # --------------------------------------------------------------------------- #
 # Metric protocol + registry
 # --------------------------------------------------------------------------- #
@@ -306,3 +327,39 @@ def test_metric_crash_is_isolated_to_one_row(tmp_path: Path):
     assert len(nan_rows) == 1
     assert "iPhone" in nan_rows[0]["sentence_text"]
     assert nan_rows[0]["detail"]["error"] == "ValueError"
+
+
+# --------------------------------------------------------------------------- #
+# A.7 — WhisperCERMetric class is importable + shape-correct without
+# actually loading the 3 GB Whisper weights. Real-backend tests live in
+# a gated integration suite per CLAUDE.md.
+# --------------------------------------------------------------------------- #
+def test_whisper_cer_metric_class_shape():
+    """The new sibling class is constructable, has the protocol-required
+    attributes, and inherits model_size when given a shared_metric."""
+    from eval.metrics.whisper_wer import WhisperCERMetric, WhisperWERMetric
+
+    standalone = WhisperCERMetric()
+    assert standalone.name == "whisper_cer"
+    assert standalone.model_size == "large-v3"
+    assert standalone.shared_metric is None
+
+    wer_metric = WhisperWERMetric(model_size="medium")
+    shared = WhisperCERMetric(shared_metric=wer_metric)
+    # Inherits model_size from the shared instance.
+    assert shared.model_size == "medium"
+    assert shared.shared_metric is wer_metric
+
+
+def test_whisper_wer_detail_contract_includes_cer_key():
+    """WER score's detail dict must carry `cer` so reports / raw.jsonl
+    surface both metrics from a single decode pass."""
+    # We don't decode — just verify the *contract* (key presence) via a
+    # source-level grep against the score() method body. Cheap, no model
+    # load, catches a regression that drops the dual-emit.
+    from pathlib import Path
+    src = Path("src/eval/metrics/whisper_wer.py").read_text("utf-8")
+    assert '"cer":' in src, (
+        "WhisperWERMetric.score() must include `cer` in its detail dict "
+        "(A.7 contract — Turkish-friendly intelligibility alongside WER)"
+    )

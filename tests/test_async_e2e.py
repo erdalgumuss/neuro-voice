@@ -631,10 +631,13 @@ async def test_sync_tts_proxy_returns_wav_via_worker(setup):
             assert r.status_code == 200, r.text
             assert r.headers["content-type"].startswith("audio/wav")
             # Deprecation contract (RFC 8594) — clients see the sunset
-            # signal so they know to migrate to /v1/tts/jobs.
+            # signal so they know to migrate. As of finding A.9
+            # (2026-05-25) the Link now points to the canonical
+            # migration doc rather than the bare endpoint path; both
+            # are valid Link semantics.
             assert r.headers["deprecation"] == "true"
             assert "sunset" in r.headers
-            assert "/v1/tts/jobs" in r.headers["link"]
+            assert "migrations/v1-tts-streaming" in r.headers["link"]
             # WAV body is a valid RIFF.
             with wave.open(io.BytesIO(r.content), "rb") as w:
                 assert w.getnchannels() == 1

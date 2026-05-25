@@ -59,7 +59,12 @@ def _register_default_sets() -> None:
     in a config file — drift discipline."""
     root = _repo_root()
     candidates = {
-        "v0.1-mini": root / "data" / "test-sets" / "v0.1-mini.md",
+        "v0.1-mini":   root / "data" / "test-sets" / "v0.1-mini.md",
+        # Research finding A.8 (2026-05-25) — 60 sentences across 10
+        # categories, with deliberate edge-case distribution (currency,
+        # abbrev, code-mix, long-form, homograph). Bridges from the
+        # 10-sentence mini to the eventual 120-sentence full set.
+        "v0.2-medium": root / "data" / "test-sets" / "v0.2-medium.md",
     }
     for slug, path in candidates.items():
         if path.exists():

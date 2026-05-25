@@ -49,3 +49,68 @@ def test_max_chars_splits_long_runon() -> None:
     assert len(segs) >= 2
     for s in segs:
         assert len(s) <= MAX_CHARS_PER_SEGMENT + 50  # soft cap, see _split_long
+
+
+# --------------------------------------------------------------------------- #
+# B.2 — protect Turkish abbreviation periods (Dr., M.Ö., T.C., ...) from
+# the sentence splitter. Real-world TR text contains these heavily;
+# false-positive splits put a pause mid-name on a child-directed product.
+# --------------------------------------------------------------------------- #
+def test_segment_dr_title_not_split_mid_name() -> None:
+    """`Dr. Ayşe Yılmaz geldi. Ben de gittim.` → exactly 2 segments,
+    first contains the full `Dr. Ayşe Yılmaz geldi.`"""
+    text = "Dr. Ayşe Yılmaz geldi. Ben de gittim."
+    segs = segment_sentences(text)
+    assert len(segs) == 2
+    assert "Dr. Ayşe Yılmaz" in segs[0]
+    assert segs[1].startswith("Ben")
+
+
+def test_segment_mo_historical_era_not_split() -> None:
+    """`M.Ö. 500'de yaşadı. Sümerler bunu yazdı.` → 2 segments."""
+    text = "M.Ö. 500'de yaşadı. Sümerler bunu yazdı."
+    segs = segment_sentences(text)
+    assert len(segs) == 2
+    assert "M.Ö." in segs[0] or "M.Ö" in segs[0]
+    assert segs[1].startswith("Sümerler")
+
+
+def test_segment_tc_state_abbreviation_not_split() -> None:
+    """`T.C. Sağlık Bakanlığı duyurdu. Yeni karar var.` → 2 segments."""
+    text = "T.C. Sağlık Bakanlığı duyurdu. Yeni karar var."
+    segs = segment_sentences(text)
+    assert len(segs) == 2
+    assert "T.C." in segs[0]
+    assert segs[1].startswith("Yeni")
+
+
+def test_segment_time_apostrophe_suffix_not_split() -> None:
+    """`Saat 14:00'da buluşalım. Yarın da yine görüşelim mi?` → 2
+    segments. The colon in 14:00 already doesn't trigger the splitter;
+    this test pins the contract so a future regex tweak can't regress
+    it. Second clause needs to be ≥ MIN_CHARS_PER_SEGMENT so the
+    short-segment merger doesn't fold it back into segment 1."""
+    text = "Saat 14:00'da buluşalım. Yarın da yine görüşelim mi?"
+    segs = segment_sentences(text)
+    assert len(segs) == 2
+    assert "14:00" in segs[0]
+    assert segs[1].startswith("Yarın")
+
+
+def test_segment_prof_doc_titles_not_split() -> None:
+    """Sn., Prof., Doç. all protected."""
+    text = "Prof. Dr. Mehmet konuştu. Sn. Başkan dinledi. Doç. Ayşe yorum yaptı."
+    segs = segment_sentences(text)
+    assert len(segs) == 3
+    assert "Prof." in segs[0]
+    assert "Sn." in segs[1]
+    assert "Doç." in segs[2]
+
+
+def test_segment_no_cad_address_abbrev_not_split() -> None:
+    """`Cad. No. 12, Mah. Çamlık` shouldn't be cut into 4 sentences."""
+    text = "Çamlık Mah. Atatürk Cad. No. 12'de buluşalım. Yarın görüşürüz."
+    segs = segment_sentences(text)
+    assert len(segs) == 2
+    assert "No. 12" in segs[0]
+    assert segs[1].startswith("Yarın")

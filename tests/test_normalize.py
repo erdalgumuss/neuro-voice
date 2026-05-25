@@ -66,3 +66,35 @@ def test_pronunciation_dict_none_is_noop() -> None:
     raw = "Bluetooth'u açmayı unutma."
     assert normalize_text(raw) == normalize_text(raw, pronunciation_dict=None)
     assert normalize_text(raw) == normalize_text(raw, pronunciation_dict={})
+
+
+# --------------------------------------------------------------------------- #
+# A.10 — strip invisible Unicode marks (ZWJ / ZWNJ / RTL / BOM) BEFORE
+# NFKC so messaging-app paste pollution does not cause unreproducible
+# TTS glitches.
+# --------------------------------------------------------------------------- #
+def test_zwj_inside_brand_name_is_stripped() -> None:
+    """`Goo<ZWJ>gle'a` → the ZWJ is dropped so the code-mix lexicon's
+    `Google` entry matches and produces the same phonetic output as
+    a clean paste."""
+    raw_zwj = "Goo‍gle'a"
+    raw_clean = "Google'a"
+    assert normalize_text(raw_zwj) == normalize_text(raw_clean)
+
+
+def test_zwnj_is_stripped() -> None:
+    raw = "selam‌kardes"
+    assert "‌" not in normalize_text(raw)
+
+
+def test_bidi_wrap_is_stripped() -> None:
+    """Left-to-right embedding + pop-directional-formatting around a
+    word must not survive into the output."""
+    raw = "‪selam‬"
+    assert normalize_text(raw) == "selam"
+
+
+def test_zero_width_no_break_space_is_stripped() -> None:
+    """ZWNBSP (also used as BOM) is dropped."""
+    raw = "﻿merhaba"
+    assert normalize_text(raw) == "merhaba"

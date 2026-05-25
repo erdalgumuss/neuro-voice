@@ -7,6 +7,18 @@ import unicodedata
 
 from .numbers import decimal_to_turkish, number_to_turkish
 
+# Research finding A.10 (2026-05-25) — strip Unicode "default ignorable"
+# code points that messaging apps + chat surfaces sprinkle into pasted
+# text. NFKC preserves them; VoxCPM2 is tokeniser-free so an invisible
+# ZWJ inside a brand name produces an unreproducible pause or glitch
+# that no operator can diagnose by ear. Standard remedy across Coqui /
+# Piper / espeak-ng frontends: drop these before normalisation.
+_INVISIBLE_MARKS_RE = re.compile(
+    # ZWSP (200B), ZWNJ (200C), ZWJ (200D), LRM (200E), RLM (200F),
+    # LRE..PDF..RLO (202A-202E), WJ (2060), BOM/ZWNBSP (FEFF).
+    "[​-‏‪-‮⁠﻿]"
+)
+
 # Order matters: longer keys first to avoid prefix collisions.
 _ABBREVIATIONS: list[tuple[str, str]] = [
     ("TBMM", "Türkiye Büyük Millet Meclisi"),
@@ -156,6 +168,10 @@ def normalize_text(
     """
     if not text:
         return ""
+    # A.10 — drop default-ignorable invisibles BEFORE NFKC. Done first
+    # so a `Goo<ZWJ>gle` paste collapses to `Google` and the lexicon
+    # lookup downstream actually fires.
+    text = _INVISIBLE_MARKS_RE.sub("", text)
     text = unicodedata.normalize("NFKC", text)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = _expand_abbreviations(text)

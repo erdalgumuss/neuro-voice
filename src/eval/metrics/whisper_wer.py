@@ -1,8 +1,21 @@
-"""Whisper-TR-WER metric — intelligibility score for Turkish TTS output.
+"""Whisper-TR-WER + CER metric — intelligibility score for Turkish TTS output.
 
 Uses OpenAI's open-weights Whisper (large-v3) as the ASR front-end:
-synthesized clip → text → Turkish-normalized WER vs the expected
-reference sentence. The lower the WER, the more intelligible the TTS.
+synthesized clip → text → Turkish-normalized WER (or CER) vs the
+expected reference sentence. The lower the score, the more intelligible
+the TTS.
+
+Why both WER and CER:
+  * WER is the standard intelligibility metric in English-heavy
+    benchmarks (Seed-TTS, F5-TTS, ElevenLabs voice clone).
+  * CER is the preferred metric for agglutinative languages like
+    Turkish — a single-character suffix divergence inflates WER to
+    100 % on a word but only ~10 % on the characters of that word.
+    See: "Advocating Character Error Rate for Multilingual ASR
+    Evaluation" (Liang et al., 2024) — https://arxiv.org/pdf/2410.07400
+  * Whisper transcription is the expensive step; emitting BOTH from
+    one decode is essentially free. `WhisperCERMetric` accepts a
+    `shared_metric=` to reuse the loaded model across both passes.
 
 Why Whisper specifically:
   * Strong Turkish (the original training set covers TR at meaningful
@@ -115,7 +128,7 @@ class WhisperWERMetric:
         # no-GPU dev box.
         import numpy as np
         import soundfile as sf
-        from jiwer import compose, wer
+        from jiwer import cer, compose, wer
         from jiwer.transforms import (
             ReduceToListOfListOfWords,
             RemoveMultipleSpaces,
@@ -167,17 +180,168 @@ class WhisperWERMetric:
             truth_transform=transform,
             hypothesis_transform=transform,
         )
+        # CER is computed from the same transcript — pure win on cost.
+        # The standalone `WhisperCERMetric` reuses the same Whisper
+        # decode via `shared_metric=`, but operators that only register
+        # `whisper_wer` still get the CER number in `detail` for
+        # ad-hoc inspection (and the report writer surfaces it).
+        cer_score = cer(
+            ref, hyp,
+            truth_transform=transform,
+            hypothesis_transform=transform,
+        )
         return MetricResult(
             metric_name=self.name,
             score=float(score),
             direction="lower",
-            detail={"hypothesis": hyp, "reference": ref,
-                    "model_size": self.model_size},
+            detail={
+                "cer": float(cer_score),
+                "hypothesis": hyp,
+                "reference": ref,
+                "model_size": self.model_size,
+            },
         )
 
 
-# Don't register the real metric at import time — the operator opts in
+@dataclass
+class WhisperCERMetric:
+    """Sibling of `WhisperWERMetric` that reports CER as the primary
+    score. CER is the preferred intelligibility metric for Turkish
+    (agglutinative morphology — see module docstring).
+
+    Set `shared_metric=` to an already-instantiated `WhisperWERMetric`
+    to avoid loading the ~3 GB model twice; the two metrics will share
+    a single decode pipeline. Default = independent load (useful when
+    you only want CER and not WER).
+    """
+
+    name: str = "whisper_cer"
+    model_size: str = "large-v3"
+    device: str = "auto"
+    shared_metric: WhisperWERMetric | None = None
+
+    _model: object | None = None
+    _lock: threading.Lock = threading.Lock()  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "_lock", threading.Lock())
+        if self.shared_metric is not None:
+            # Reuse the WER metric's already-loaded model — avoids a
+            # second whisper.load_model call (~3 GB download / VRAM).
+            # We deliberately bind to the WER metric's `_model` slot:
+            # if it hasn't loaded yet, the first `score()` call here
+            # will trigger its loader, and subsequent calls share state.
+            object.__setattr__(self, "_model", self.shared_metric._model)
+            # Inherit model_size from the shared metric so reports
+            # render consistent "model_size" detail across both.
+            object.__setattr__(self, "model_size", self.shared_metric.model_size)
+            object.__setattr__(self, "device", self.shared_metric.device)
+
+    def _load(self) -> object:
+        # If we have a shared WER metric, delegate to its loader so the
+        # cached model lives in one place. This keeps the second decode
+        # of a (WER + CER) pair from hitting whisper.load_model again.
+        if self.shared_metric is not None:
+            model = self.shared_metric._load()
+            object.__setattr__(self, "_model", model)
+            return model
+        if self._model is not None:
+            return self._model
+        with self._lock:
+            if self._model is None:
+                import whisper  # lazy import — see WhisperWERMetric
+                logger.info("loading whisper model=%s", self.model_size)
+                self._model = whisper.load_model(
+                    self.model_size,
+                    device=None if self.device == "auto" else self.device,
+                )
+        return self._model
+
+    def score(
+        self,
+        pcm_int16: bytes,
+        sample_rate: int,
+        *,
+        reference_text: str,
+    ) -> MetricResult:
+        if not pcm_int16:
+            return MetricResult(
+                metric_name=self.name,
+                score=float("nan"),
+                direction="lower",
+                detail={"error": "empty_pcm"},
+            )
+
+        import numpy as np
+        import soundfile as sf
+        from jiwer import cer, compose, wer
+        from jiwer.transforms import (
+            ReduceToListOfListOfWords,
+            RemoveMultipleSpaces,
+            RemovePunctuation,
+            Strip,
+            ToLowerCase,
+        )
+
+        arr = np.frombuffer(pcm_int16, dtype=np.int16).astype(np.float32) / 32768.0
+        if sample_rate != 16000:
+            ratio = 16000 / sample_rate
+            target_len = max(1, int(round(arr.size * ratio)))
+            xp = np.linspace(0, arr.size - 1, arr.size, dtype=np.float64)
+            x = np.linspace(0, arr.size - 1, target_len, dtype=np.float64)
+            arr = np.interp(x, xp, arr).astype(np.float32)
+
+        model = self._load()
+        buf = io.BytesIO()
+        sf.write(buf, arr, 16000, format="WAV", subtype="PCM_16")
+        buf.seek(0)
+
+        transcript = model.transcribe(  # type: ignore[attr-defined]
+            buf,
+            language="tr",
+            temperature=0.0,
+            condition_on_previous_text=False,
+            no_speech_threshold=0.6,
+        )
+        raw_text = transcript.get("text", "") if isinstance(transcript, dict) else ""
+        hyp = _clean_transcript(raw_text)
+        ref = reference_text.strip()
+
+        transform = compose([
+            ToLowerCase(),
+            RemovePunctuation(),
+            RemoveMultipleSpaces(),
+            Strip(),
+            ReduceToListOfListOfWords(),
+        ])
+        cer_score = cer(
+            ref, hyp,
+            truth_transform=transform,
+            hypothesis_transform=transform,
+        )
+        # WER computed alongside for the symmetric "both numbers in
+        # detail" pattern — same rationale as WhisperWERMetric.score().
+        wer_score = wer(
+            ref, hyp,
+            truth_transform=transform,
+            hypothesis_transform=transform,
+        )
+        return MetricResult(
+            metric_name=self.name,
+            score=float(cer_score),
+            direction="lower",
+            detail={
+                "wer": float(wer_score),
+                "hypothesis": hyp,
+                "reference": ref,
+                "model_size": self.model_size,
+            },
+        )
+
+
+# Don't register the real metrics at import time — the operator opts in
 # via `scripts/eval_run.py --enable-real-metrics` or by calling
-# `register_metric("whisper_wer", WhisperWERMetric())` from their
-# notebook / script. That way `import eval.metrics.whisper_wer` is
-# safe on a no-GPU box and tests can register a stub.
+# `register_metric("whisper_wer", WhisperWERMetric())` (and / or
+# `whisper_cer`) from their notebook / script. That way
+# `import eval.metrics.whisper_wer` is safe on a no-GPU box and tests
+# can register a stub.
