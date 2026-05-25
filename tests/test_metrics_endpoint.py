@@ -295,6 +295,41 @@ def test_backpressure_denies_at_capacity_when_backlog_exceeds_one_cluster_pass(c
     assert r.status_code == 503, r.text
 
 
+def test_backpressure_ignores_acked_stream_history(client):
+    """Redis Streams retain ACKed entries, so XLEN is not live backlog.
+    Sequential smoke calls used to get stuck after a few successes:
+    xlen=history, pending=0, lag=0. Admission must use pending+lag once
+    the worker consumer group exists.
+    """
+    _enroll_voice(client)
+    _seed_heartbeat(client.fake_redis, worker_id="w1", capacity=1, in_flight=1)
+
+    async def _seed_acked_history():
+        stream = "nqai.tts.jobs.test"
+        group = "tts-workers"
+        ids = []
+        try:
+            await client.fake_redis.xgroup_create(stream, group, id="0", mkstream=True)
+        except Exception:
+            pass
+        for i in range(2):
+            ids.append(await client.fake_redis.xadd(stream, {"payload": f"done-{i}"}))
+        await client.fake_redis.xreadgroup(group, "c1", {stream: ">"}, count=2)
+        await client.fake_redis.xack(stream, group, *ids)
+
+    asyncio.run(_seed_acked_history())
+
+    assert asyncio.run(client.fake_queue.depth()) == 2
+    assert asyncio.run(client.fake_queue.backlog_depth()) == 0
+
+    r = client.post(
+        "/v1/tts/jobs",
+        headers={"Idempotency-Key": str(uuid.uuid4())},
+        json={"text": "Merhaba.", "voice_id": "demo-01"},
+    )
+    assert r.status_code == 202, r.text
+
+
 def test_backpressure_xlen_fallback_still_denies_when_queue_full(client):
     """No heartbeats AND queue past the XLEN ceiling → 503 via the
     fallback path. Confirms the XLEN-only branch isn't dead."""

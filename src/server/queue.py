@@ -39,6 +39,7 @@ logger = logging.getLogger("nqai_voice.queue")
 
 DEFAULT_STREAM = "nqai.tts.jobs"
 DEFAULT_DLQ_STREAM = "nqai.tts.jobs.dlq"
+DEFAULT_CONSUMER_GROUP = "tts-workers"
 DEFAULT_MAXLEN = 10_000  # XADD MAXLEN ~ trims the stream to this approx size
 
 RESULTS_STREAM_PREFIX = "nqai.tts.results."
@@ -267,8 +268,58 @@ class TtsJobQueue:
 
     async def depth(self) -> int:
         """XLEN — number of un-trimmed messages currently on the stream.
-        Used for backpressure decisions (D-14 in scale-roadmap)."""
+        This includes ACKed entries retained by Redis Streams, so it is
+        useful as storage size, not as live backlog."""
         return int(await self._redis.xlen(self._stream))
+
+    async def backlog_depth(self, *, group: str = DEFAULT_CONSUMER_GROUP) -> int:
+        """Live backlog for admission control.
+
+        Redis Streams keep acknowledged messages until explicit trimming,
+        so XLEN grows with history and will falsely trigger backpressure
+        after a few successful sequential calls. For an active consumer
+        group, the live work is:
+
+            pending entries + lag entries
+
+        where ``pending`` is delivered-but-unacked PEL size and ``lag`` is
+        not-yet-delivered entries for the group. If the group doesn't
+        exist yet (cold gateway before worker boot, tests stuffing the
+        stream directly, Redis version without group metadata), fall back
+        to XLEN so admission remains conservative.
+        """
+        xlen = await self.depth()
+        try:
+            groups = await self._redis.xinfo_groups(self._stream)
+        except Exception:
+            return xlen
+        if not groups:
+            return xlen
+
+        def _get(row: dict, key: str):
+            return row.get(key) if key in row else row.get(key.encode())
+
+        def _s(value) -> str:
+            if isinstance(value, (bytes, bytearray)):
+                return value.decode("utf-8", errors="replace")
+            return str(value)
+
+        for row in groups:
+            if _s(_get(row, "name")) != group:
+                continue
+            try:
+                pending = int(_get(row, "pending") or 0)
+            except (TypeError, ValueError):
+                return xlen
+            lag_raw = _get(row, "lag")
+            if lag_raw is None:
+                return xlen
+            try:
+                lag = max(0, int(lag_raw))
+            except (TypeError, ValueError):
+                return xlen
+            return pending + lag
+        return xlen
 
 
 # --------------------------------------------------------------------------- #

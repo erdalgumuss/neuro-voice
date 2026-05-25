@@ -313,7 +313,7 @@ async def metrics(
         WORKER_COUNT.set(cap.worker_count)
         WORKER_CAPACITY.set(cap.total_capacity)
         WORKER_INFLIGHT.set(cap.total_inflight)
-        QUEUE_DEPTH.labels(stream="jobs").set(await queue.depth())
+        QUEUE_DEPTH.labels(stream="jobs").set(await queue.backlog_depth())
         # DLQ depth (audit L4 H1 2026-05-25): metric was declared with a
         # `stream` enum of {jobs, dlq} but only `jobs` was being set,
         # making a jammed DLQ invisible to the dashboard.
@@ -1507,10 +1507,9 @@ def _hash_sync_body(body) -> str:
 # --------------------------------------------------------------------------- #
 # Async TTS jobs — Stripe-pattern idempotent job model.
 # --------------------------------------------------------------------------- #
-# Hard ceiling on queue depth — when XLEN exceeds this multiple of the
-# (unknown) worker count, gateway returns 503 instead of accepting new
-# work. We err on the conservative side (high), so Faz B benchmarks tune
-# this down once the actual GPU throughput is known.
+# Hard ceiling on live queue backlog. With a consumer group available this
+# is Redis Streams pending + lag, not XLEN; XLEN includes ACKed historical
+# messages and would falsely 503 sequential smoke calls.
 QUEUE_DEPTH_BACKPRESSURE = int(os.environ.get("NQAI_QUEUE_DEPTH_LIMIT", "200"))
 
 
@@ -1528,7 +1527,7 @@ async def _compute_backpressure_decision(
          (``depth ≤ headroom + total_capacity``).
       2. XLEN-only fallback when the heartbeat plane is degraded.
     """
-    depth = await queue.depth()
+    depth = await queue.backlog_depth()
     capacity_known = False
     try:
         cluster = await read_cluster_capacity(queue.redis)
