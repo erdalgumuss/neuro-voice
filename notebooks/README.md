@@ -8,6 +8,7 @@ Kaggle / Colab / lokal üzerinde koşturulan keşif + deployment notebook'ları.
 | --- | --- | --- | --- |
 | [`01-voxcpm2-tr-demo.ipynb`](01-voxcpm2-tr-demo.ipynb) | Türkçe baseline — VoxCPM2 (Apache 2.0, 2B param, 30 dil) ile 10 cümle sentezleme | Kaggle T4 x2 (16 GB VRAM) | ~15 dk |
 | [`03-platform-server-colab.ipynb`](03-platform-server-colab.ipynb) | NQAI Voice API server'ı Colab'da kaldır + cloudflared tunnel ile public URL | Colab T4 / A100 | ~6-8 dk cold start |
+| [`05-current-architecture-colab-smoke.ipynb`](05-current-architecture-colab-smoke.ipynb) | Güncel gateway + Redis + Postgres + GPU worker mimarisini tek Colab runtime içinde kaldırıp `/v1/tts/stream` smoke testi | Colab L4 / A100 / T4 | ~10-15 dk cold start |
 
 ## Planlanan
 
