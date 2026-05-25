@@ -142,6 +142,10 @@ class VoiceRepo:
         visibility: str = "private",
         engine_params: dict[str, Any] | None = None,
         created_by_key_id: uuid.UUID | None = None,
+        description: str | None = None,
+        labels: list[str] | None = None,
+        preview_url: str | None = None,
+        voice_settings_defaults: dict[str, Any] | None = None,
     ) -> Voice:
         v = Voice(
             owner_tenant_id=self.tenant_id,
@@ -159,6 +163,10 @@ class VoiceRepo:
             visibility=visibility,
             engine_params=engine_params or {},
             created_by_key_id=created_by_key_id,
+            description=description,
+            labels=labels,
+            preview_url=preview_url,
+            voice_settings_defaults=voice_settings_defaults,
         )
         self.session.add(v)
         await self.session.flush()

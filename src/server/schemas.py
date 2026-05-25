@@ -158,7 +158,19 @@ class VoiceUpdateRequest(BaseModel):
 
 
 class EnrollResponse(BaseModel):
+    """Faz B.5 Dalga 2.5 — first-class voice clone response.
+
+    `requires_verification` mirrors ElevenLabs IVC: when True, the
+    voice is enrolled but the platform expects the operator to confirm
+    talent consent + KVKK / FSEK rider before the voice flows into
+    production synthesis. Today this is purely an audit flag the
+    catalog stores alongside the row; in Faz 3 (governance layer) it
+    gates `release_status='production'` transitions. Defaults to False
+    when the caller passes `voice_talent_consent=true` on enroll —
+    same shape vendors use.
+    """
     voice: VoicePublic
+    requires_verification: bool = False
     detail: str = "voice enrolled"
 
 

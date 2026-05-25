@@ -296,6 +296,31 @@ async def metrics(
 # --------------------------------------------------------------------------- #
 # Voice catalog (tenant-scoped, DB-backed)
 # --------------------------------------------------------------------------- #
+def _slugify_voice_id(display_name: str) -> str:
+    """Faz B.5 Dalga 2.5 — derive a voice_id slug from a display name.
+
+    ElevenLabs `POST /v1/voices/add` lets callers omit the requested
+    voice_id and returns the platform-assigned one. We mirror that by
+    slugifying `name`: lowercase, ASCII alphanumerics + hyphen, no
+    leading/trailing hyphen, then padded with a short random suffix
+    so distinct enrolls with the same name don't 409 against each
+    other on the alias surface.
+    """
+    import re
+    import secrets
+
+    cleaned = re.sub(r"[^a-z0-9]+", "-", display_name.lower()).strip("-")
+    if not cleaned:
+        cleaned = "voice"
+    # Truncate before the suffix so the final length stays ≤ 64 chars.
+    base = cleaned[:55].rstrip("-") or "voice"
+    suffix = secrets.token_hex(3)  # 6 hex chars
+    candidate = f"{base}-{suffix}"
+    # `validate_voice_id` enforces ≥3 chars + alphanumeric edges; the
+    # suffix guarantees both, so no extra padding needed.
+    return candidate
+
+
 def _voice_to_public(v) -> VoicePublic:
     # Faz B.5 Dalga 2.4 — vendor-parity fields surfaced. Settings
     # defaults are stored as a plain dict (JSONB) on the row; pydantic
@@ -410,23 +435,56 @@ async def get_voice(
     return _voice_to_public(db_voice)
 
 
-@app.post("/v1/voices", response_model=EnrollResponse, tags=["voices"])
-async def enroll_voice(
-    ctx: Annotated[AuthContext, Depends(require_auth("voice:write"))],
-    session: Annotated[AsyncSession, Depends(get_session)],
-    voice_id: Annotated[str, Form(min_length=3, max_length=64)],
-    display_name: Annotated[str, Form(min_length=1, max_length=120)],
-    reference_audio: Annotated[UploadFile, File()],
-    language: Annotated[str, Form()] = "tr",
-    gender: Annotated[str, Form()] = "neutral",
-    style_tags: Annotated[str, Form()] = "",
-    source: Annotated[str, Form()] = "user-enroll",
-    license: Annotated[str, Form()] = "user-owned",  # noqa: A002 — DB column name
+async def _enroll_voice_impl(
+    *,
+    ctx: AuthContext,
+    session: AsyncSession,
+    voice_id: str,
+    display_name: str,
+    reference_audio: UploadFile,
+    language: str,
+    gender: str,
+    style_tags: str,
+    source: str,
+    license: str,  # noqa: A002 — DB column name
+    description: str | None,
+    labels: str | None,
+    visibility: str,
+    remove_background_noise: bool,
+    voice_talent_consent: bool,
 ) -> EnrollResponse:
+    """Faz B.5 Dalga 2.5 — shared clone/enroll implementation.
+
+    Backs both `POST /v1/voices` and the ElevenLabs-style alias
+    `POST /v1/voices/add`. Multipart fields mirror ElevenLabs IVC plus
+    NQAI extras: explicit `voice_talent_consent` (KVKK/FSEK gate),
+    `visibility` (private/shared/public), and `description`/`labels`
+    that the vendor docs treat as core voice metadata.
+
+    Sample validation (vendor-parity envelope):
+      * format suffix in ALLOWED_AUDIO_SUFFIXES (wav/mp3/m4a/ogg/flac)
+      * size 1 KB .. NQAI_ENROLL_MAX_MB (default 20 MB)
+      * trimmed duration ≥ NQAI_ENROLL_MIN_SECONDS (default 1.0 s in tests;
+        production deployments set it to 3-10 s per FSEK rider)
+
+    `remove_background_noise` is captured today (stored in
+    `engine_params.remove_background_noise` for audit + future preprocess
+    pass) but the active denoise step is deferred to a follow-up — we
+    don't ship a half-measure that degrades premium audio. The flag
+    surfaces in the audit log so adoption can be measured before the
+    real RNNoise/DeepFilterNet hookup lands.
+    """
     try:
         validate_voice_id(voice_id)
     except InvalidVoiceId as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+
+    if visibility not in {"private", "shared", "public"}:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail=f"invalid visibility '{visibility}'; "
+                   "use private/shared/public",
+        )
 
     data = await reference_audio.read()
     max_bytes = settings.enroll_max_upload_mb * 1024 * 1024
@@ -462,6 +520,14 @@ async def enroll_voice(
     except ValueError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
 
+    if duration_seconds < settings.enroll_min_seconds:
+        target.unlink(missing_ok=True)
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail=f"reference audio too short: {duration_seconds:.2f}s "
+                   f"< minimum {settings.enroll_min_seconds:.2f}s",
+        )
+
     import hashlib
 
     sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
@@ -475,6 +541,22 @@ async def enroll_voice(
         )
 
     tags = [t.strip() for t in style_tags.split(",") if t.strip()]
+    parsed_labels = (
+        [t.strip() for t in labels.split(",") if t.strip()]
+        if labels else None
+    )
+    # Vendor parity: ElevenLabs returns `requires_verification=true`
+    # when the caller has NOT attached a consent signal. We model that
+    # explicitly via the `voice_talent_consent` form field; absence
+    # flips the catalog row into a state the future governance layer
+    # will gate on.
+    requires_verification = not voice_talent_consent
+
+    engine_params: dict[str, Any] = {
+        "remove_background_noise": remove_background_noise,
+        "requires_verification": requires_verification,
+    }
+
     voice = await repo.create(
         voice_id=voice_id,
         display_name=display_name,
@@ -487,7 +569,11 @@ async def enroll_voice(
         style_tags=tags,
         source=source,
         license=license,
+        visibility=visibility,
+        engine_params=engine_params,
         created_by_key_id=ctx.api_key_id,
+        description=description,
+        labels=parsed_labels,
     )
     await AuditRepo(session).record(
         actor_type="api_key",
@@ -498,10 +584,114 @@ async def enroll_voice(
         tenant_id=ctx.tenant_id,
         target_type="voice",
         target_id=str(voice.id),
-        payload={"voice_id": voice_id, "reference_sha256": sha256},
+        payload={
+            "voice_id": voice_id,
+            "reference_sha256": sha256,
+            "duration_seconds": round(duration_seconds, 3),
+            "remove_background_noise": remove_background_noise,
+            "requires_verification": requires_verification,
+            "visibility": visibility,
+        },
     )
     await session.commit()
-    return EnrollResponse(voice=_voice_to_public(voice))
+    return EnrollResponse(
+        voice=_voice_to_public(voice),
+        requires_verification=requires_verification,
+    )
+
+
+@app.post("/v1/voices", response_model=EnrollResponse, tags=["voices"])
+async def enroll_voice(
+    ctx: Annotated[AuthContext, Depends(require_auth("voice:write"))],
+    session: Annotated[AsyncSession, Depends(get_session)],
+    voice_id: Annotated[str, Form(min_length=3, max_length=64)],
+    display_name: Annotated[str, Form(min_length=1, max_length=120)],
+    reference_audio: Annotated[UploadFile, File()],
+    language: Annotated[str, Form()] = "tr",
+    gender: Annotated[str, Form()] = "neutral",
+    style_tags: Annotated[str, Form()] = "",
+    source: Annotated[str, Form()] = "user-enroll",
+    license: Annotated[str, Form()] = "user-owned",  # noqa: A002 — DB column name
+    description: Annotated[str | None, Form(max_length=2048)] = None,
+    labels: Annotated[str | None, Form(max_length=2048)] = None,
+    visibility: Annotated[str, Form()] = "private",
+    remove_background_noise: Annotated[bool, Form()] = False,
+    voice_talent_consent: Annotated[bool, Form()] = False,
+) -> EnrollResponse:
+    """Faz B.5 Dalga 2.5 — first-class voice clone API.
+
+    Drop-in target for ElevenLabs/MiniMax SDK shapes. See
+    [_enroll_voice_impl][] for the validation envelope and the consent /
+    governance semantics.
+    """
+    return await _enroll_voice_impl(
+        ctx=ctx,
+        session=session,
+        voice_id=voice_id,
+        display_name=display_name,
+        reference_audio=reference_audio,
+        language=language,
+        gender=gender,
+        style_tags=style_tags,
+        source=source,
+        license=license,
+        description=description,
+        labels=labels,
+        visibility=visibility,
+        remove_background_noise=remove_background_noise,
+        voice_talent_consent=voice_talent_consent,
+    )
+
+
+@app.post(
+    "/v1/voices/add",
+    response_model=EnrollResponse,
+    tags=["voices"],
+    summary="ElevenLabs-compat voice clone alias",
+)
+async def enroll_voice_alias(
+    ctx: Annotated[AuthContext, Depends(require_auth("voice:write"))],
+    session: Annotated[AsyncSession, Depends(get_session)],
+    name: Annotated[str, Form(min_length=1, max_length=120)],
+    files: Annotated[UploadFile, File()],
+    voice_id: Annotated[str | None, Form(min_length=3, max_length=64)] = None,
+    language: Annotated[str, Form()] = "tr",
+    gender: Annotated[str, Form()] = "neutral",
+    style_tags: Annotated[str, Form()] = "",
+    source: Annotated[str, Form()] = "user-enroll",
+    license: Annotated[str, Form()] = "user-owned",  # noqa: A002 — DB column name
+    description: Annotated[str | None, Form(max_length=2048)] = None,
+    labels: Annotated[str | None, Form(max_length=2048)] = None,
+    visibility: Annotated[str, Form()] = "private",
+    remove_background_noise: Annotated[bool, Form()] = False,
+    voice_talent_consent: Annotated[bool, Form()] = False,
+) -> EnrollResponse:
+    """Faz B.5 Dalga 2.5 — ElevenLabs `POST /v1/voices/add` shape alias.
+
+    Field names follow the vendor: `name` → display_name, `files` →
+    reference_audio (single file; multi-file IVC stitches in a follow-up).
+    `voice_id` is optional — when omitted, a slug is derived from `name`
+    so SDKs that don't expose it still work. Same handler as the canonical
+    `POST /v1/voices`.
+    """
+    derived_voice_id = voice_id or _slugify_voice_id(name)
+    return await _enroll_voice_impl(
+        ctx=ctx,
+        session=session,
+        voice_id=derived_voice_id,
+        display_name=name,
+        reference_audio=files,
+        language=language,
+        gender=gender,
+        style_tags=style_tags,
+        source=source,
+        license=license,
+        description=description,
+        labels=labels,
+        visibility=visibility,
+        remove_background_noise=remove_background_noise,
+        voice_talent_consent=voice_talent_consent,
+    )
 
 
 @app.patch(

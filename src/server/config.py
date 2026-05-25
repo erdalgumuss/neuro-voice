@@ -85,6 +85,16 @@ class Settings:
     enroll_max_upload_mb: int = field(default_factory=lambda: int(
         os.environ.get("NQAI_ENROLL_MAX_MB", "20")
     ))
+    # Faz B.5 Dalga 2.5 — minimum trimmed reference duration accepted on
+    # POST /v1/voices. ElevenLabs/MiniMax enforce ≥10s; we default to 1.0s
+    # so test fixtures (1-second tones) keep working and operators ramp
+    # the floor via NQAI_ENROLL_MIN_SECONDS once they wire real FSEK
+    # talent consent in production. Anything below the trimmed window
+    # (0.5–1.0s) usually produces unstable clones, but the floor is a
+    # business policy, not a model contract.
+    enroll_min_seconds: float = field(default_factory=lambda: float(
+        os.environ.get("NQAI_ENROLL_MIN_SECONDS", "1.0")
+    ))
     # Per-tenant aggregate cap (sum across all keys in the tenant). Acts as
     # an upper bound the operator can lift via DB; per-key limits in
     # api_keys.rate_limit_per_minute are independent and checked first.

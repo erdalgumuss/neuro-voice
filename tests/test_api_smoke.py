@@ -377,6 +377,122 @@ def test_enroll_rejects_tiny_audio(client):
 
 
 # --------------------------------------------------------------------------- #
+# Faz B.5 Dalga 2.5 — first-class voice clone API
+# --------------------------------------------------------------------------- #
+def test_enroll_persists_clone_metadata(client):
+    """Dalga 2.5: description / labels / visibility / consent flow
+    through POST /v1/voices and surface back on the list response."""
+    wav = _make_wav_bytes()
+    r = client.post(
+        "/v1/voices",
+        data={
+            "voice_id": "clone-meta-01",
+            "display_name": "Clone Meta",
+            "description": "Warm Turkish narrator, café ambience",
+            "labels": "warm,narrator,turkish",
+            "visibility": "shared",
+            "voice_talent_consent": "true",
+        },
+        files={"reference_audio": ("clone.wav", wav, "audio/wav")},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["voice"]["voice_id"] == "clone-meta-01"
+    assert body["voice"]["description"] == "Warm Turkish narrator, café ambience"
+    assert body["voice"]["labels"] == ["warm", "narrator", "turkish"]
+    assert body["voice"]["visibility"] == "shared"
+    # voice_talent_consent=true → requires_verification flips off
+    assert body["requires_verification"] is False
+
+
+def test_enroll_requires_verification_when_consent_missing(client):
+    """Dalga 2.5: omitting voice_talent_consent sets requires_verification=true
+    (ElevenLabs IVC parity: caller must acknowledge talent rider)."""
+    wav = _make_wav_bytes()
+    r = client.post(
+        "/v1/voices",
+        data={"voice_id": "needs-consent", "display_name": "Needs"},
+        files={"reference_audio": ("n.wav", wav, "audio/wav")},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["requires_verification"] is True
+
+
+def test_enroll_rejects_invalid_visibility(client):
+    """Dalga 2.5: visibility outside private/shared/public → 400."""
+    wav = _make_wav_bytes()
+    r = client.post(
+        "/v1/voices",
+        data={
+            "voice_id": "bad-vis",
+            "display_name": "Bad Vis",
+            "visibility": "internal",  # invalid
+        },
+        files={"reference_audio": ("b.wav", wav, "audio/wav")},
+    )
+    assert r.status_code == 400, r.text
+
+
+def test_voices_add_alias_works_like_enroll(client):
+    """Dalga 2.5: POST /v1/voices/add (ElevenLabs shape, `name` + `files`)
+    enrolls a voice; `voice_id` is server-derived when omitted."""
+    wav = _make_wav_bytes()
+    r = client.post(
+        "/v1/voices/add",
+        data={
+            "name": "Ayşe Soft",
+            "description": "Soft, contemplative",
+            "voice_talent_consent": "true",
+        },
+        files={"files": ("ayse.wav", wav, "audio/wav")},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["voice"]["display_name"] == "Ayşe Soft"
+    # Derived slug should pass voice_id rules
+    assert len(body["voice"]["voice_id"]) >= 3
+    assert body["requires_verification"] is False
+
+
+def test_voices_add_alias_accepts_explicit_voice_id(client):
+    """Dalga 2.5: alias still honors an explicit voice_id when the
+    caller provides one (MiniMax-style)."""
+    wav = _make_wav_bytes()
+    r = client.post(
+        "/v1/voices/add",
+        data={
+            "name": "Mert",
+            "voice_id": "mert-fixed-01",
+            "voice_talent_consent": "true",
+        },
+        files={"files": ("m.wav", wav, "audio/wav")},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["voice"]["voice_id"] == "mert-fixed-01"
+
+
+def test_enroll_rejects_audio_below_min_seconds(client, monkeypatch):
+    """Dalga 2.5: enroll_min_seconds enforced — bumping the floor to
+    5s and posting 2s audio yields 400. Settings is frozen, so we
+    swap the live `settings` reference for a rebuilt instance."""
+    monkeypatch.setenv("NQAI_ENROLL_MIN_SECONDS", "5.0")
+    from server import config as cfg_mod
+    from server import main as main_mod
+    new_settings = cfg_mod.Settings()
+    monkeypatch.setattr(cfg_mod, "settings", new_settings)
+    monkeypatch.setattr(main_mod, "settings", new_settings)
+
+    wav = _make_wav_bytes(duration_s=2.0)
+    r = client.post(
+        "/v1/voices",
+        data={"voice_id": "tooshort", "display_name": "Short"},
+        files={"reference_audio": ("s.wav", wav, "audio/wav")},
+    )
+    assert r.status_code == 400, r.text
+    assert "too short" in r.json()["detail"].lower()
+
+
+# --------------------------------------------------------------------------- #
 # TTS — voice resolution (sync-engine smoke tests moved to test_async_e2e
 # now that /v1/tts proxies through the queue; only static-failure
 # assertions stay here because they don't need a worker)
