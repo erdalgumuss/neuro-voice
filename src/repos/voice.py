@@ -164,6 +164,47 @@ class VoiceRepo:
         await self.session.flush()
         return v
 
+    async def update_metadata(
+        self,
+        voice_id: str,
+        *,
+        display_name: str | None = None,
+        description: str | None = None,
+        labels: list[str] | None = None,
+        preview_url: str | None = None,
+        voice_settings_defaults: dict[str, Any] | None = None,
+        style_tags: list[str] | None = None,
+        visibility: str | None = None,
+    ) -> Voice | None:
+        """Faz B.5 Dalga 2.4 — owner-only metadata edit.
+
+        Returns None if the voice is not owned by this repo's tenant
+        (caller maps to 404 — same existence-leak rule as soft_delete).
+        Only non-None fields are written. Reference audio + voice_id
+        slug are immutable here; re-enroll for those.
+        """
+        v = await self.get_owned(voice_id)
+        if v is None:
+            return None
+        if display_name is not None:
+            v.display_name = display_name
+        if description is not None:
+            v.description = description
+        if labels is not None:
+            v.labels = labels
+        if preview_url is not None:
+            v.preview_url = preview_url
+        if voice_settings_defaults is not None:
+            v.voice_settings_defaults = voice_settings_defaults
+        if style_tags is not None:
+            v.style_tags = style_tags
+        if visibility is not None:
+            if visibility not in {"private", "shared", "public"}:
+                raise ValueError(f"invalid visibility '{visibility}'")
+            v.visibility = visibility
+        await self.session.flush()
+        return v
+
     async def soft_delete(self, voice_id: str) -> Voice | None:
         """Owner-only. Returns None if not owned (so the caller maps to
         404 — a non-owner tenant trying to delete a voice it sees via

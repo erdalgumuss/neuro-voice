@@ -102,6 +102,7 @@ from .schemas import (
     TTSStreamRequest,
     VoiceListResponse,
     VoicePublic,
+    VoiceUpdateRequest,
 )
 
 logger = logging.getLogger("nqai_voice.server")
@@ -296,6 +297,19 @@ async def metrics(
 # Voice catalog (tenant-scoped, DB-backed)
 # --------------------------------------------------------------------------- #
 def _voice_to_public(v) -> VoicePublic:
+    # Faz B.5 Dalga 2.4 — vendor-parity fields surfaced. Settings
+    # defaults are stored as a plain dict (JSONB) on the row; pydantic
+    # parses them into VoiceSettings here, validating bounds.
+    from .schemas import VoiceSettings
+    vsd = None
+    if getattr(v, "voice_settings_defaults", None):
+        try:
+            vsd = VoiceSettings(**v.voice_settings_defaults)
+        except Exception:  # noqa: BLE001 — stale/bad row shouldn't 500 the list
+            logger.exception(
+                "voice_settings_defaults parse failed for voice=%s — skipping",
+                v.voice_id,
+            )
     return VoicePublic(
         voice_id=v.voice_id,
         display_name=v.display_name,
@@ -308,6 +322,10 @@ def _voice_to_public(v) -> VoicePublic:
         visibility=v.visibility,
         created_at=v.created_at.isoformat(),
         created_by=str(v.created_by_key_id) if v.created_by_key_id else "system",
+        description=getattr(v, "description", None),
+        labels=list(v.labels) if getattr(v, "labels", None) else None,
+        preview_url=getattr(v, "preview_url", None),
+        voice_settings_defaults=vsd,
     )
 
 
@@ -347,11 +365,37 @@ async def list_tts_models() -> ModelListResponse:
 async def list_voices(
     ctx: Annotated[AuthContext, Depends(require_auth("voice:read"))],
     session: Annotated[AsyncSession, Depends(get_session)],
+    limit: int = 100,
+    offset: int = 0,
 ) -> VoiceListResponse:
-    """Catalog visible to this tenant: owned + shared-with-me + public."""
+    """Catalog visible to this tenant: owned + shared-with-me + public.
+
+    Faz B.5 Dalga 2.4 — pagination via `limit` (1..200) + `offset`.
+    Default limit 100; caller bumps until they receive < limit rows.
+    Total tenant-visible count returned so clients can render
+    progress / "X of Y" UI without an extra request."""
+    if limit < 1 or limit > 200:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="limit must be in [1, 200]",
+        )
+    if offset < 0:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="offset must be >= 0",
+        )
     repo = VoiceRepo(session, ctx.tenant_id)
-    voices = [_voice_to_public(v) for v in await repo.list_accessible()]
-    return VoiceListResponse(voices=voices, count=len(voices))
+    all_accessible = list(await repo.list_accessible())
+    total = len(all_accessible)
+    page = all_accessible[offset:offset + limit]
+    voices = [_voice_to_public(v) for v in page]
+    return VoiceListResponse(
+        voices=voices,
+        count=len(voices),
+        limit=limit,
+        offset=offset,
+        total=total,
+    )
 
 
 @app.get("/v1/voices/{voice_id}", response_model=VoicePublic, tags=["voices"])
@@ -458,6 +502,65 @@ async def enroll_voice(
     )
     await session.commit()
     return EnrollResponse(voice=_voice_to_public(voice))
+
+
+@app.patch(
+    "/v1/voices/{voice_id}",
+    response_model=VoicePublic,
+    tags=["voices"],
+    summary="Update voice metadata (owner-only)",
+)
+async def update_voice(
+    voice_id: str,
+    body: VoiceUpdateRequest,
+    ctx: Annotated[AuthContext, Depends(require_auth("voice:write"))],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> VoicePublic:
+    """Faz B.5 Dalga 2.4 — vendor-parity voice metadata edit.
+
+    Owner-only (same existence-leak rule as delete): a tenant that
+    can READ a shared/public voice cannot PATCH it; 404 returned.
+    Reference audio + voice_id slug are immutable here — re-enroll
+    via POST /v1/voices for those changes.
+
+    Body fields are all optional; only the provided ones are written.
+    `voice_settings_defaults` (Dalga 2.1 schema) becomes the per-voice
+    baseline that per-request voice_settings layer on top of at
+    synthesis time."""
+    try:
+        validate_voice_id(voice_id)
+    except InvalidVoiceId as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=str(e)) from e
+
+    payload = body.model_dump(exclude_none=True)
+    if not payload:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="patch body is empty — provide at least one field",
+        )
+
+    # voice_settings_defaults arrives as a VoiceSettings model; convert
+    # to plain dict for storage (matches the wire format we already
+    # use on the request side, layered onto job.voice_settings).
+    if "voice_settings_defaults" in payload:
+        payload["voice_settings_defaults"] = (
+            body.voice_settings_defaults.model_dump(exclude_none=True)
+        )
+
+    repo = VoiceRepo(session, ctx.tenant_id)
+    try:
+        updated = await repo.update_metadata(voice_id, **payload)
+    except ValueError as e:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, detail=str(e),
+        ) from e
+    if updated is None:
+        # Same 404-on-no-owner pattern as soft_delete (D-08 existence-leak rule).
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, detail=f"voice '{voice_id}' not found",
+        )
+    await session.commit()
+    return _voice_to_public(updated)
 
 
 @app.delete("/v1/voices/{voice_id}", response_model=DeleteResponse, tags=["voices"])

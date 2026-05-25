@@ -258,6 +258,20 @@ class Voice(Base, TimestampMixin):
         _JSONBPortable, nullable=False, default=dict
     )
 
+    # Faz B.5 Dalga 2.4 — voice catalog enrichment (vendor parity).
+    # All nullable so pre-existing rows stay valid; populated via
+    # POST /v1/voices (enroll) or PATCH /v1/voices/{voice_id} (update).
+    description: Mapped[str | None] = mapped_column(Text)
+    labels: Mapped[list[str] | None] = mapped_column(_StringArrayPortable)
+    preview_url: Mapped[str | None] = mapped_column(Text)
+    # voice_settings_defaults: per-voice baseline that the per-request
+    # voice_settings (Dalga 2.1) layers on top of. Vendor-shape dict —
+    # {stability, similarity_boost, speed, style, ...}. Distinct from
+    # `engine_params` which holds the internal cfg_value/timesteps.
+    voice_settings_defaults: Mapped[dict[str, Any] | None] = mapped_column(
+        _JSONBPortable,
+    )
+
     # Faz 3+ (NULL ile başlar)
     adapter_uri: Mapped[str | None] = mapped_column(Text)
     adapter_sha256: Mapped[str | None] = mapped_column(Text)

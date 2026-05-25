@@ -217,7 +217,105 @@ def test_voices_rejects_bad_key(client):
 def test_voices_listing_starts_empty(client):
     r = client.get("/v1/voices")
     assert r.status_code == 200, r.text
-    assert r.json() == {"voices": [], "count": 0}
+    body = r.json()
+    assert body["voices"] == []
+    assert body["count"] == 0
+    # Faz B.5 Dalga 2.4 — pagination meta on the response.
+    assert body["total"] == 0
+    assert body["limit"] == 100
+    assert body["offset"] == 0
+
+
+def test_voices_listing_pagination_bounds(client):
+    """Faz B.5 Dalga 2.4 — limit must be [1, 200], offset >= 0."""
+    assert client.get("/v1/voices?limit=0").status_code == 400
+    assert client.get("/v1/voices?limit=201").status_code == 400
+    assert client.get("/v1/voices?offset=-1").status_code == 400
+
+
+def test_voice_patch_updates_metadata(client):
+    """Faz B.5 Dalga 2.4 — PATCH /v1/voices/{id} updates owner-supplied
+    fields without re-enrolling. Reference audio + voice_id stay
+    immutable; this is for description / labels / preview_url /
+    voice_settings_defaults."""
+    wav = _make_wav_bytes()
+    r = client.post(
+        "/v1/voices",
+        data={"voice_id": "patch-01", "display_name": "Patch"},
+        files={"reference_audio": ("p.wav", wav, "audio/wav")},
+    )
+    assert r.status_code == 200, r.text
+
+    r = client.patch(
+        "/v1/voices/patch-01",
+        json={
+            "display_name": "Patched Voice",
+            "description": "Calm Turkish narrator for bedtime stories.",
+            "labels": ["calm", "bedtime", "narrator"],
+            "preview_url": "https://example.com/preview/patch-01.mp3",
+            "voice_settings_defaults": {
+                "stability": 0.7,
+                "similarity_boost": 0.8,
+                "speed": 0.95,
+            },
+        },
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["display_name"] == "Patched Voice"
+    assert body["description"].startswith("Calm Turkish")
+    assert body["labels"] == ["calm", "bedtime", "narrator"]
+    assert body["preview_url"].endswith("/preview/patch-01.mp3")
+    assert body["voice_settings_defaults"]["stability"] == 0.7
+    assert body["voice_settings_defaults"]["speed"] == 0.95
+
+    # GET reflects the same fields.
+    g = client.get("/v1/voices/patch-01").json()
+    assert g["display_name"] == "Patched Voice"
+    assert g["voice_settings_defaults"]["similarity_boost"] == 0.8
+
+
+def test_voice_patch_rejects_empty_body(client):
+    """Empty PATCH is meaningless — 400 with a hint, not a no-op
+    success that confuses clients."""
+    wav = _make_wav_bytes()
+    client.post(
+        "/v1/voices",
+        data={"voice_id": "empty-patch-01", "display_name": "EP"},
+        files={"reference_audio": ("e.wav", wav, "audio/wav")},
+    )
+    r = client.patch("/v1/voices/empty-patch-01", json={})
+    assert r.status_code == 400, r.text
+    assert "empty" in r.text.lower()
+
+
+def test_voice_patch_404_when_not_owned(client):
+    """Same existence-leak rule as DELETE: a voice that isn't owned
+    by this tenant returns 404, never 403, never the actual row.
+    (Single-tenant fixture; we just verify 404 for a missing slug.)"""
+    r = client.patch(
+        "/v1/voices/does-not-exist-9999",
+        json={"display_name": "X"},
+    )
+    assert r.status_code == 404, r.text
+
+
+def test_voice_patch_rejects_invalid_speed(client):
+    """voice_settings_defaults uses the same VoiceSettings schema as
+    per-request voice_settings — out-of-range speed must 422 at the
+    pydantic boundary, not silently accept and break inference."""
+    wav = _make_wav_bytes()
+    client.post(
+        "/v1/voices",
+        data={"voice_id": "speed-01", "display_name": "S"},
+        files={"reference_audio": ("s.wav", wav, "audio/wav")},
+    )
+    r = client.patch(
+        "/v1/voices/speed-01",
+        json={"voice_settings_defaults": {"speed": 5.0}},
+    )
+    # Pydantic validation runs at the body layer → 422.
+    assert r.status_code == 422, r.text
 
 
 def test_enroll_then_list_then_delete(client):

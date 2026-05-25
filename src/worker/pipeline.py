@@ -392,11 +392,14 @@ async def process_one_job(
         "inference_timesteps": preset.inference_timesteps,
     }
 
-    # Faz B.5 Dalga 2.1 — voice_settings → engine knob adjustments.
-    # Stability and similarity_boost are vendor-named neutral-0.5 knobs
-    # we map onto our two real engine params; the mapping is bounded
-    # and clamped to the engine's safe ranges (TTSJobParams limits).
-    voice_settings = job.voice_settings or {}
+    # Faz B.5 Dalga 2.1 + 2.4 — layered voice settings:
+    #   1. voice.voice_settings_defaults (catalog-level; Dalga 2.4)
+    #   2. job.voice_settings (per-request; Dalga 2.1) — wins per-field
+    # Both vendor-shape dicts. The per-field override matches the
+    # vendor mental model (ElevenLabs voice.settings defaults + the
+    # request's voice_settings layered on top).
+    voice_defaults = getattr(voice_row, "voice_settings_defaults", None) or {}
+    voice_settings = {**voice_defaults, **(job.voice_settings or {})}
     if voice_settings.get("similarity_boost") is not None:
         # -0.3 at 0.0, +0.5 at 1.0 around the preset baseline.
         engine_overrides["cfg_value"] = float(

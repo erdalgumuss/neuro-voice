@@ -111,6 +111,8 @@ class TTSStreamAliasRequest(TTSAliasRequest):
 
 
 class VoicePublic(BaseModel):
+    """Voice catalog entry. Fields added in Faz B.5 Dalga 2.4 are
+    optional so old enrolled voices stay representable."""
     voice_id: str
     display_name: str
     language: str
@@ -122,11 +124,37 @@ class VoicePublic(BaseModel):
     visibility: Literal["private", "shared", "public"] = "private"
     created_at: str
     created_by: str
+    # Dalga 2.4 — vendor-parity metadata
+    description: str | None = None
+    labels: list[str] | None = None
+    preview_url: str | None = None
+    voice_settings_defaults: VoiceSettings | None = None
 
 
 class VoiceListResponse(BaseModel):
     voices: list[VoicePublic]
     count: int
+    # Faz B.5 Dalga 2.4 — pagination cursors. Cheap to add now so
+    # clients don't have to migrate when catalogs grow past one page.
+    limit: int | None = None
+    offset: int | None = None
+    total: int | None = None
+
+
+class VoiceUpdateRequest(BaseModel):
+    """Body for ``PATCH /v1/voices/{voice_id}`` — owner-only voice
+    metadata edits. All fields optional; only the provided fields
+    are written. Reference audio + voice_id slug are immutable here
+    (re-enroll for those)."""
+    model_config = ConfigDict(protected_namespaces=())
+
+    display_name: str | None = Field(default=None, min_length=1, max_length=128)
+    description: str | None = Field(default=None, max_length=2048)
+    labels: list[str] | None = None
+    preview_url: str | None = Field(default=None, max_length=2048)
+    voice_settings_defaults: VoiceSettings | None = None
+    style_tags: list[str] | None = None
+    visibility: Literal["private", "shared", "public"] | None = None
 
 
 class EnrollResponse(BaseModel):
