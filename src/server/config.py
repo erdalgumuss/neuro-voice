@@ -42,6 +42,20 @@ class Settings:
     model_id: str = field(default_factory=lambda: os.environ.get(
         "NQAI_MODEL_ID", "openbmb/VoxCPM2"
     ))
+    # MLOps PR #1 (2026-05-25) — pin the HuggingFace revision so the
+    # base model weights are reproducible across worker restarts.
+    # Without this, `from_pretrained(model_id)` follows the repo's
+    # default branch (usually `main`); a silent upstream push would
+    # change inference output without any local code change. Operators
+    # MUST set this to a commit SHA in production; we leave `main` as
+    # the default for dev convenience but log a warning when unpinned.
+    # See `usage_records.engine_inputs` for the per-job audit trail
+    # — every inference records the resolved revision so a quality
+    # drift can be traced to "did the model file change underneath us"
+    # rather than guessing.
+    model_hf_revision: str = field(default_factory=lambda: os.environ.get(
+        "NQAI_MODEL_HF_REVISION", "main"
+    ))
     lora_path: Path | None = field(default_factory=lambda: _env_path(
         "NQAI_LORA_PATH", Path(os.environ["NQAI_LORA_PATH"])
     ) if os.environ.get("NQAI_LORA_PATH") else None)

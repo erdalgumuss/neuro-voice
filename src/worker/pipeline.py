@@ -560,6 +560,30 @@ async def process_one_job(
     duration_ms = int(duration_samples / max(sample_rate, 1) * 1000)
     rtf = (elapsed_ms / duration_ms) if duration_ms > 0 else None
 
+    # MLOps PR #1 — reproducibility audit trail. Snapshot every input
+    # the engine actually saw, so a future quality-drift investigation
+    # can answer "what changed between t-1 and t" without guessing.
+    # Forward-compat: readers tolerate missing keys.
+    engine_inputs_snapshot: dict = {
+        "model_id":            getattr(engine, "model_id", None),
+        "hf_revision":         getattr(engine, "hf_revision", None),
+        "preset_id":           preset.model_id,
+        "cfg_value":           engine_overrides.get("cfg_value"),
+        "inference_timesteps": engine_overrides.get("inference_timesteps"),
+        "seed":                job.seed,
+        # Resolved per-request voice settings (catalog defaults +
+        # request override merged). NOT the raw request — the actual
+        # values the engine acted on.
+        "voice_settings":      voice_settings or None,
+        # Sizes only — the full dicts can be PII / large.
+        "pronunciation_dict_size": (
+            len(job.pronunciation_dict) if job.pronunciation_dict else 0
+        ),
+        "previous_text_len":   len(job.previous_text or ""),
+        "next_text_len":       len(job.next_text or ""),
+        "reference_sha256":    getattr(voice_row, "reference_sha256", None),
+    }
+
     try:
         async with session_factory() as s:
             await IdempotencyRepo(s, tenant_id).complete(
@@ -595,6 +619,7 @@ async def process_one_job(
                 # ModelPreset from earlier in this function.
                 model_version=preset.model_id,
                 app_label=job.app_label,
+                engine_inputs=engine_inputs_snapshot,
             )
             await s.commit()
     except Exception as e:

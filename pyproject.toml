@@ -55,10 +55,17 @@ dependencies = [
     # Model runtime (worker process; gateway doesn't need these but we keep
     # them in the umbrella package while the split is fresh — Faz B'de
     # ayrı `nqai-voice-worker` paketine taşınır)
-    "torch>=2.5",
-    "torchaudio>=2.5",
-    "transformers>=4.46",
-    "voxcpm>=0.5",
+    #
+    # MLOps PR #1 (2026-05-25) — minor-pinned so `pip install -U` cannot
+    # silently jump a major torch version under the model. cuDNN /
+    # transformers / voxcpm changes between minors can shift inference
+    # outputs even with the same seed; same-minor patch upgrades are
+    # safe enough to leave open. Production should generate a lockfile
+    # (uv lock / pip-tools) on top of these envelopes for true repro.
+    "torch>=2.5,<2.6",
+    "torchaudio>=2.5,<2.6",
+    "transformers>=4.46,<4.47",
+    "voxcpm>=0.5,<0.6",
 ]
 
 [project.optional-dependencies]

@@ -37,6 +37,7 @@ def build_engine() -> BaseSynthEngine:
         cfg_value=settings.cfg_value,
         inference_timesteps=settings.inference_timesteps,
         optimize=settings.optimize,
+        hf_revision=settings.model_hf_revision,
     )
 
 

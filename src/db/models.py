@@ -449,6 +449,18 @@ class UsageRecord(Base):
     # source of truth for who pays).
     app_label: Mapped[str | None] = mapped_column(Text)
 
+    # MLOps PR #1 (2026-05-25) — reproducibility audit trail. JSONB
+    # snapshot of every input the engine actually saw for THIS request:
+    # `{model_id, hf_revision, preset_id, cfg_value, inference_timesteps,
+    #   seed, voice_settings_resolved, pronunciation_dict_size,
+    #   previous_text_len, next_text_len, reference_sha256}`.
+    # NULL on rows written before this column existed. Lets a future
+    # quality drift investigation answer "what changed between t-1 and
+    # t" without guessing — the inputs are pinned next to the latency
+    # waterfall. Schema is open-ended on purpose; consumers must
+    # tolerate missing keys (forward-compat).
+    engine_inputs: Mapped[dict | None] = mapped_column(_JSONBPortable)
+
     __table_args__ = (
         CheckConstraint("text_char_count >= 0", name="text_char_count_nonneg"),
         CheckConstraint("sentence_count >= 0", name="sentence_count_nonneg"),

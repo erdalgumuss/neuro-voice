@@ -42,6 +42,7 @@ class UsageRepo:
         worker_id: str | None = None,
         model_version: str | None = None,
         app_label: str | None = None,
+        engine_inputs: dict | None = None,
     ) -> UsageRecord:
         rec = UsageRecord(
             tenant_id=self.tenant_id,
@@ -66,6 +67,7 @@ class UsageRepo:
             worker_id=worker_id,
             model_version=model_version,
             app_label=app_label,
+            engine_inputs=engine_inputs,
         )
         self.session.add(rec)
         await self.session.flush()

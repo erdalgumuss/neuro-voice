@@ -187,10 +187,23 @@ class VoxCPM2Engine:
         lora_config_path: Path | None = None,
         optimize: bool = False,
         cache_size: int = DEFAULT_LORA_CACHE_SIZE,
+        hf_revision: str = "main",
     ) -> None:
         if cache_size < 1:
             raise ValueError("cache_size must be >= 1 (base model always cached)")
         self._model_id = model_id
+        # MLOps PR #1 — pin the HuggingFace revision; loaded base model
+        # always reflects THIS specific revision. Unpinned `main` only
+        # for local dev; production sets a commit SHA so upstream churn
+        # cannot silently change inference output.
+        self._hf_revision = hf_revision
+        if hf_revision in (None, "", "main"):
+            logger.warning(
+                "VoxCPM2 model_id=%s loaded WITHOUT a pinned hf_revision "
+                "(value=%r). Set NQAI_MODEL_HF_REVISION to a commit SHA "
+                "for reproducible production deploys.",
+                model_id, hf_revision,
+            )
         self._device = _resolve_device(device)
         self._cfg_value = cfg_value
         self._inference_timesteps = inference_timesteps
@@ -209,6 +222,17 @@ class VoxCPM2Engine:
         self._load_lock = threading.Lock()
         self._inference_lock = threading.Lock()
         self.sample_rate = DEFAULT_SAMPLE_RATE
+
+    # MLOps PR #1 — public accessors so the pipeline can record
+    # which model + revision produced this row without reaching into
+    # `_model_id` / `_hf_revision` directly.
+    @property
+    def model_id(self) -> str:
+        return self._model_id
+
+    @property
+    def hf_revision(self) -> str:
+        return self._hf_revision
 
     def _load(self) -> None:
         if self._models:
@@ -317,6 +341,12 @@ class VoxCPM2Engine:
                 self._cache_size,
             )
             t0 = time.time()
+            # MLOps PR #1 — pin the HuggingFace revision so two workers
+            # booting at different times against the same model_id load
+            # the EXACT same weights. `revision` accepts a branch name,
+            # tag, or commit SHA; we recommend SHA in production envs.
+            if self._hf_revision and self._hf_revision != "main":
+                kwargs["revision"] = self._hf_revision
             model = VoxCPM.from_pretrained(self._model_id, **kwargs)
             inner_sr = getattr(getattr(model, "tts_model", None), "sample_rate", None)
             if inner_sr:
@@ -536,6 +566,7 @@ def get_engine(
     inference_timesteps: int = DEFAULT_INFERENCE_TIMESTEPS,
     optimize: bool = False,
     cache_size: int = DEFAULT_LORA_CACHE_SIZE,
+    hf_revision: str = "main",
 ) -> BaseSynthEngine:
     global _engine_singleton
     if _engine_singleton is not None:
@@ -551,5 +582,6 @@ def get_engine(
                 inference_timesteps=inference_timesteps,
                 optimize=optimize,
                 cache_size=cache_size,
+                hf_revision=hf_revision,
             )
         return _engine_singleton
