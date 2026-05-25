@@ -65,7 +65,11 @@ dependencies = [
     "torch>=2.5,<2.6",
     "torchaudio>=2.5,<2.6",
     "transformers>=4.46,<4.47",
-    "voxcpm>=0.5,<0.6",
+    # voxcpm 2.x is the current series that ships VoxCPM2; 0.x / 1.x are
+    # not on PyPI in the original PR #1 range. Pin to the 2.x major so
+    # `pip install -U` still gets patch fixes but cannot jump to a 3.x
+    # that might break the `from voxcpm import VoxCPM` surface.
+    "voxcpm>=2.0,<3.0",
 ]
 
 [project.optional-dependencies]
