@@ -78,6 +78,7 @@ dev = [
     "aiosqlite>=0.20",          # in-memory SQLite for fast unit tests
     "fakeredis[lua]>=2.26",     # rate-limit unit tests (Lua scripting)
     "moto[s3]>=5.0",            # S3/R2 storage unit tests
+    "pyloudnorm>=0.1.1",        # ITU-R BS.1770-5 LUFS (A.2 hotfix)
 ]
 client = [
     "httpx>=0.27",

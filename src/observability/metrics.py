@@ -323,6 +323,24 @@ TTS_DURATION_PER_CHAR_SECONDS: Histogram = Histogram(
     registry=REGISTRY,
 )
 
+# Quality hotfix A.2 — ITU-R BS.1770-5 integrated loudness (LUFS).
+# RMS catches "is there audio?" but cannot distinguish programme
+# loudness (perceived) from crest factor (dynamic); LUFS is the
+# universal broadcast standard. -16 LUFS ±1 LU is the voice-agent
+# target; -23 LUFS is broadcast-mix. Clips shorter than 400 ms (the
+# BS.1770 gated minimum) emit -70.0 as a sentinel so the bucket is
+# self-consistent.
+TTS_OUTPUT_INTEGRATED_LUFS: Histogram = Histogram(
+    "nqai_tts_output_integrated_lufs",
+    "Integrated loudness (ITU-R BS.1770-5 LUFS, dialog-gated). "
+    "Voice-agent target -16 LUFS ±1 LU; broadcast-mix target -23 LUFS. "
+    "Clips shorter than 400 ms emit -70.0 (BS.1770 gated minimum).",
+    labelnames=_WATERFALL_LABELS,
+    buckets=(-70.0, -50.0, -40.0, -30.0, -23.0, -20.0, -18.0,
+             -16.0, -14.0, -10.0, -6.0, 0.0),
+    registry=REGISTRY,
+)
+
 
 # ---------------------------------------------------------------------------
 # Gauges
@@ -427,11 +445,16 @@ __all__ = [
     "QUEUE_DEPTH",
     "REGISTRY",
     "TTS_DEPRECATED_ENDPOINT_TOTAL",
+    "TTS_DURATION_PER_CHAR_SECONDS",
     "TTS_ERRORS",
     "TTS_FIRST_AUDIO_SECONDS",
     "TTS_FIRST_PCM_SECONDS",
     "TTS_GATEWAY_FIRST_BYTE_SECONDS",
     "TTS_INFERENCE_SECONDS",
+    "TTS_OUTPUT_CLIPPING_RATIO",
+    "TTS_OUTPUT_INTEGRATED_LUFS",
+    "TTS_OUTPUT_RMS",
+    "TTS_OUTPUT_SILENCE_RATIO",
     "TTS_QUEUE_WAIT_SECONDS",
     "TTS_REFERENCE_RESOLVE_SECONDS",
     "TTS_REQUESTS",

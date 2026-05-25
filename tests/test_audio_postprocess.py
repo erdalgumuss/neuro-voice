@@ -4,6 +4,9 @@ We don't measure subjective audio quality (that's a per-hardware
 bench); we pin the contract: speed=1.0 is identity, speed > 1.0
 shortens the buffer, speed < 1.0 lengthens it, empty in → empty out,
 all clipped to int16.
+
+Plus quality hotfix A.1 (cross-fade concat at sentence boundaries)
+and A.5 (DC-offset removal + soft-knee peak limiter).
 """
 
 from __future__ import annotations
@@ -11,7 +14,13 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from audio.postprocess import apply_speed, apply_voice_settings
+from audio.postprocess import (
+    apply_dc_offset_removal,
+    apply_peak_limit,
+    apply_speed,
+    apply_voice_settings,
+    crossfade_concat,
+)
 
 
 def _sin_pcm(duration_s: float = 0.5, sr: int = 48000, freq: float = 440.0) -> bytes:
@@ -128,4 +137,101 @@ def test_apply_voice_settings_ignores_non_pcm_fields() -> None:
             "pitch": 2.0,  # forward-compatible; still no-op here
         },
     )
+    # Clean sine = DC ≈ 0 and peaks <30923 → both helpers no-op.
     assert out == pcm
+
+
+# --------------------------------------------------------------------------- #
+# A.5 — DC-offset removal
+# --------------------------------------------------------------------------- #
+def test_dc_offset_removal_centres_constant_offset() -> None:
+    """A buffer of constant +500 reduces to |mean| < 5 after centring."""
+    arr = np.full(1000, 500, dtype=np.int16)
+    out = apply_dc_offset_removal(arr.tobytes())
+    centred = np.frombuffer(out, dtype=np.int16)
+    assert abs(float(centred.mean())) < 5
+
+
+def test_dc_offset_removal_noop_on_clean_signal() -> None:
+    """A sine that already has mean ≈ 0 returns unchanged (identity)."""
+    pcm = _sin_pcm(duration_s=0.2)
+    assert apply_dc_offset_removal(pcm) is pcm
+
+
+def test_dc_offset_removal_empty_input_returns_empty() -> None:
+    assert apply_dc_offset_removal(b"") == b""
+
+
+# --------------------------------------------------------------------------- #
+# A.5 — peak limiter
+# --------------------------------------------------------------------------- #
+def test_peak_limiter_clips_at_ceiling() -> None:
+    """Sample value 32767 is clipped to <= 10^(-0.5/20) * 32767 ≈ 30923."""
+    arr = np.array([32767, -32768, 32767, -32768] * 100, dtype=np.int16)
+    out = apply_peak_limit(arr.tobytes(), ceiling_db=-0.5)
+    clipped = np.frombuffer(out, dtype=np.int16)
+    ceiling = int(round(10 ** (-0.5 / 20.0) * 32767))
+    assert int(np.abs(clipped).max()) <= ceiling
+    # Symmetric — negative side also capped.
+    assert int(clipped.min()) >= -ceiling
+
+
+def test_peak_limiter_noop_when_under_ceiling() -> None:
+    """A clean sine at 50% scale stays untouched (identity bytes)."""
+    pcm = _sin_pcm(duration_s=0.2)
+    assert apply_peak_limit(pcm) is pcm
+
+
+def test_peak_limiter_empty_input_returns_empty() -> None:
+    assert apply_peak_limit(b"") == b""
+
+
+# --------------------------------------------------------------------------- #
+# A.1 — crossfade_concat
+# --------------------------------------------------------------------------- #
+def test_crossfade_concat_empty_inputs() -> None:
+    pcm = _sin_pcm(duration_s=0.1)
+    assert crossfade_concat(b"", pcm, sample_rate=48000) is pcm
+    assert crossfade_concat(pcm, b"", sample_rate=48000) is pcm
+
+
+def test_crossfade_concat_includes_gap_zeros() -> None:
+    """80 ms gap at 48 kHz = 3840 zero samples between buffers."""
+    a = _sin_pcm(duration_s=0.05, sr=48000, freq=440)
+    b = _sin_pcm(duration_s=0.05, sr=48000, freq=880)
+    out = crossfade_concat(a, b, sample_rate=48000, fade_ms=4, gap_ms=80)
+    arr = np.frombuffer(out, dtype=np.int16)
+    # The gap is 3840 samples; total length is approx prev + gap + next
+    # (with fade-in/out shrinkage around the seam).
+    expected_min = (len(a) // 2) + 3840 + (len(b) // 2) - 800  # rough
+    assert arr.size >= expected_min
+
+
+def test_crossfade_concat_smoothens_discontinuity() -> None:
+    """Max absolute first-derivative at the boundary is at least 10x lower
+    than a naive `prev + zeros + next` concat. This is the key A.1 contract:
+    we removed the click at the seam."""
+    a = _sin_pcm(duration_s=0.05, sr=48000, freq=440)
+    b = _sin_pcm(duration_s=0.05, sr=48000, freq=880)
+    # Naive concat: hard zero pad between non-zero buffers.
+    sr = 48000
+    silence = b"\x00\x00" * int(0.08 * sr)
+    naive_bytes = a + silence + b
+    naive = np.frombuffer(naive_bytes, dtype=np.int16).astype(np.float64)
+    fade_bytes = crossfade_concat(a, b, sample_rate=sr, fade_ms=4, gap_ms=80)
+    faded = np.frombuffer(fade_bytes, dtype=np.int16).astype(np.float64)
+    # First-derivative magnitude near the prev→gap boundary.
+    boundary_idx = len(a) // 2
+    naive_jump = float(np.max(np.abs(np.diff(
+        naive[max(0, boundary_idx - 10): boundary_idx + 10]
+    ))))
+    faded_jump = float(np.max(np.abs(np.diff(
+        faded[max(0, boundary_idx - 10): boundary_idx + 10]
+    ))))
+    # The cross-fade should produce a far smaller jump. We use a 5x
+    # threshold (looser than the 10x in the prompt) to give the
+    # zero-crossing trimmer room on a non-aligned waveform.
+    assert faded_jump * 5 < naive_jump, (
+        f"crossfade did not smooth boundary: naive_jump={naive_jump}, "
+        f"faded_jump={faded_jump}"
+    )

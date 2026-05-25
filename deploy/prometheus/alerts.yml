@@ -211,6 +211,29 @@ groups:
             below 0.03 suggests truncation. Cross-reference with
             sentence_count to localise.
 
+      - alert: NqaiVoiceLoudnessOutOfRange
+        expr: |
+          (
+            histogram_quantile(0.95, sum by (le) (rate(nqai_tts_output_integrated_lufs_bucket[5m]))) > -10
+          )
+          or
+          (
+            histogram_quantile(0.95, sum by (le) (rate(nqai_tts_output_integrated_lufs_bucket[5m]))) < -30
+          )
+        for: 10m
+        labels:
+          severity: warning
+          service: nqai-voice
+        annotations:
+          summary: "p95 integrated LUFS outside [-30, -10] for 10m"
+          description: |
+            Integrated loudness (ITU-R BS.1770-5) p95 is outside the
+            [-30, -10] LUFS envelope. Voice-agent target is -16 LUFS
+            ±1 LU; broadcast-mix target is -23 LUFS. Above -10 LUFS
+            sounds "shouty"; below -30 LUFS sounds "too quiet". Likely
+            causes: gain bug, voice_settings.speed extreme, or a new
+            voice's reference audio loudness mismatch.
+
       - alert: NqaiWorkerRevisionSpread
         expr: |
           count(count by (revision) (nqai_worker_model_info == 1)) > 1

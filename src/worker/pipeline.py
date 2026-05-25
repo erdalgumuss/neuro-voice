@@ -668,6 +668,7 @@ async def process_one_job(
         from observability import (
             TTS_DURATION_PER_CHAR_SECONDS,
             TTS_OUTPUT_CLIPPING_RATIO,
+            TTS_OUTPUT_INTEGRATED_LUFS,
             TTS_OUTPUT_RMS,
             TTS_OUTPUT_SILENCE_RATIO,
         )
@@ -682,6 +683,10 @@ async def process_one_job(
         TTS_OUTPUT_RMS.labels(**labels).observe(stats.rms_normalized)
         TTS_OUTPUT_SILENCE_RATIO.labels(**labels).observe(stats.silence_ratio)
         TTS_OUTPUT_CLIPPING_RATIO.labels(**labels).observe(stats.clipping_ratio)
+        # Quality hotfix A.2 — integrated loudness (LUFS). Always
+        # emitted; -70.0 sentinel for clips shorter than 400 ms keeps
+        # the histogram bucket consistent without a missing-data hole.
+        TTS_OUTPUT_INTEGRATED_LUFS.labels(**labels).observe(stats.integrated_lufs)
         # Per-character output rate — sensitive to truncation
         # (too short) and stuck loops (too long). Only meaningful when
         # text is non-empty, otherwise the ratio is undefined.

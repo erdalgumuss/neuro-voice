@@ -106,6 +106,10 @@ EXPECTED_METRICS: dict[str, dict[str, object]] = {
         "type": "histogram",
         "labels": {"tenant", "voice"},
     },
+    "nqai_tts_output_integrated_lufs": {
+        "type": "histogram",
+        "labels": {"tenant", "voice"},
+    },
     "nqai_worker_capacity_total": {
         "type": "gauge",
         "labels": set(),

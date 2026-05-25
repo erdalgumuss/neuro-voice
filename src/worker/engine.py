@@ -569,10 +569,17 @@ class VoxCPM2Engine:
         engine_overrides: dict[str, float | int] | None = None,
         request_meta: dict[str, object] | None = None,
     ) -> SynthResult:
+        # Quality hotfix A.1 — replace the historical 200 ms zero-pad
+        # between sentences with an 80 ms gap + 4 ms cosine cross-fade
+        # at both edges (handled by `crossfade_concat`). The hard
+        # zero-pad transition is a documented click/pop source on
+        # premium audio; the cosine ramp removes the first-derivative
+        # discontinuity for a click-free seam.
+        from audio.postprocess import crossfade_concat
+
         t0 = time.time()
-        pcm_parts: list[bytes] = []
+        pcm_all = b""
         sr = self.sample_rate
-        silence = b"\x00\x00" * int(0.2 * sr)  # 200 ms inter-segment pad
         count = 0
         for i, chunk in enumerate(
             self.synthesize_stream(
@@ -581,12 +588,15 @@ class VoxCPM2Engine:
                 request_meta=request_meta,
             )
         ):
-            if i > 0:
-                pcm_parts.append(silence)
-            pcm_parts.append(chunk.pcm_int16)
+            if i == 0:
+                pcm_all = chunk.pcm_int16
+            else:
+                pcm_all = crossfade_concat(
+                    pcm_all, chunk.pcm_int16,
+                    sample_rate=chunk.sample_rate,
+                )
             sr = chunk.sample_rate
             count += 1
-        pcm_all = b"".join(pcm_parts)
         duration = len(pcm_all) / (2 * sr) if sr else 0.0
         return SynthResult(
             pcm_int16=pcm_all,

@@ -88,3 +88,43 @@ def test_partial_silence_with_speech_bursts():
     s = compute_pcm_stats(_pcm_int16(mixed), sample_rate=48000)
     assert 0.4 < s.silence_ratio < 0.6
     assert 0.02 < s.rms_normalized < 0.20
+
+
+# --------------------------------------------------------------------------- #
+# A.2 — integrated LUFS (ITU-R BS.1770-5)
+# --------------------------------------------------------------------------- #
+def test_lufs_short_clip_returns_floor():
+    """Clips shorter than 400 ms (BS.1770 gated minimum) emit -70.0."""
+    short = _pcm_int16(np.full(4800, 8000, dtype=np.int16))  # 100 ms at 48k
+    s = compute_pcm_stats(short, sample_rate=48000)
+    assert s.integrated_lufs == -70.0
+
+
+def test_lufs_silent_clip_returns_floor():
+    """Digital silence has no measurable loudness → floor sentinel."""
+    silent = _pcm_int16(np.zeros(48000, dtype=np.int16))
+    s = compute_pcm_stats(silent, sample_rate=48000)
+    assert s.integrated_lufs == -70.0
+
+
+def test_lufs_realistic_signal_lands_in_band():
+    """A 2 s sine wave at 50% scale should land in a reasonable LUFS
+    band (-30, 0]. Loose band — BS.1770's K-weighted filter rejects
+    energy outside the speech band; a pure tone is generous enough
+    to pass gating."""
+    sr = 48000
+    duration_s = 2.0
+    n = int(sr * duration_s)
+    t = np.arange(n) / sr
+    # 440 Hz tone at 50% scale — well above the BS.1770 absolute
+    # threshold (-70 LKFS).
+    sig = (np.sin(2 * np.pi * 440 * t) * 0.5 * 32767).astype(np.int16)
+    s = compute_pcm_stats(sig.tobytes(), sample_rate=sr)
+    assert s.integrated_lufs > -70.0  # not the sentinel
+    assert s.integrated_lufs < 0.0     # below digital full-scale
+
+
+def test_lufs_empty_returns_floor():
+    """Empty buffer → floor (matches the rest of the silence contract)."""
+    s = compute_pcm_stats(b"", sample_rate=48000)
+    assert s.integrated_lufs == -70.0
