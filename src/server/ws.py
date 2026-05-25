@@ -70,13 +70,14 @@ import re
 import uuid
 from typing import Any
 
-from fastapi import WebSocket, WebSocketDisconnect
+from fastapi import HTTPException, WebSocket, WebSocketDisconnect, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from observability import TTS_REQUESTS
-from repos import IdempotencyRepo, VoiceRepo
+from repos import AuditRepo, IdempotencyRepo, VoiceRepo
 
 from .auth import authenticate_bearer
+from .config import settings
 from .models import UnknownModelError, resolve_model
 from .queue import TtsJobPayload, TtsJobQueue
 from .result_stream import ResultStreamTimeout, consume_result_stream
@@ -107,6 +108,23 @@ SEGMENT_TIMEOUT_S = 30.0
 # punctuation followed by whitespace OR end of buffer, not on a decimal
 # point inside "3.14" — the worker frontend will normalise that anyway.
 _SENTENCE_END = re.compile(r"[.!?](?=\s|$)")
+
+
+def _emit_tts_request_metric(tenant: str, voice: str, st: str) -> None:
+    """Faz B.5 hotfix — bump `TTS_REQUESTS` with the correct labelnames.
+
+    The Dalga 3.1 commit used the wrong label keys here (`endpoint=...`
+    instead of the real `(tenant, voice, status)`) which made the
+    `prometheus_client` call raise ValueError, swallowed by
+    `contextlib.suppress(Exception)`. The metric never incremented on
+    the WS happy path so dashboards and alerts under-counted WS traffic.
+    Centralised here so every WS close path emits the same shape.
+
+    ``st`` enum mirrors the HTTP convention: ``success``, ``error``,
+    ``backpressure``, ``auth_failed``.
+    """
+    with contextlib.suppress(Exception):
+        TTS_REQUESTS.labels(tenant=tenant, voice=voice, status=st).inc()
 
 
 def _ws_audio_format(raw: str | None) -> str:
@@ -247,6 +265,7 @@ async def _flush_segment(
     db_voice_slug: str,
     tenant_id: uuid.UUID,
     api_key_id: uuid.UUID,
+    api_key_prefix: str,
     redis: Any,
     queue: TtsJobQueue,
     session: AsyncSession,
@@ -258,7 +277,62 @@ async def _flush_segment(
     request result stream pattern (`consume_result_stream`) drops in
     unchanged. Idempotency is reserved server-side because the client
     can't realistically supply a stable key for partial-text flushes.
+
+    Faz B.5 hotfix (2026-05-25 audit): three admission gates kick in
+    BEFORE the XADD so the WS surface behaves identically to HTTP:
+
+      1. **Per-segment max_chars** — the segment must not exceed
+         `settings.max_chars_per_request` (default 4000). The HTTP sync
+         paths enforce this; without the gate a WS client can submit a
+         20 000-char segment that the sync proxy would have refused.
+      2. **Capacity-aware backpressure** — defers to the HTTP helper
+         `_compute_backpressure_decision`. If the cluster says it's
+         saturated, we send an error frame with `queue_saturated` and
+         drop the segment without enqueueing. Audit + metric writes
+         mirror the HTTP path so `TTS_REQUESTS{status="backpressure"}`
+         stays the single SLO denominator.
     """
+    # Gate 1 — per-segment max_chars.
+    if len(segment) > settings.max_chars_per_request:
+        await _send_error(
+            ws, "segment_too_long",
+            f"segment {len(segment)} chars exceeds max_chars_per_request="
+            f"{settings.max_chars_per_request}; flush more often",
+        )
+        _emit_tts_request_metric(
+            str(tenant_id), db_voice_slug, "error",
+        )
+        return
+
+    # Gate 2 — capacity-aware backpressure (shared HTTP/WS decision).
+    from .main import _compute_backpressure_decision  # local — avoids circular
+    admit, denied_reason, bp_payload = await _compute_backpressure_decision(
+        queue,
+    )
+    if not admit:
+        try:
+            await AuditRepo(session).record(
+                actor_type="api_key",
+                actor_id=api_key_id,
+                actor_label=api_key_prefix,
+                action="tts.backpressure",
+                result="denied",
+                tenant_id=tenant_id,
+                payload={**bp_payload, "reason": denied_reason,
+                         "surface": "ws"},
+            )
+            await session.commit()
+        except Exception:
+            logger.exception("ws backpressure audit write failed; continuing")
+        _emit_tts_request_metric(
+            str(tenant_id), db_voice_slug, "backpressure",
+        )
+        await _send_error(
+            ws, "queue_saturated",
+            f"cluster backpressure ({denied_reason}); slow down or retry",
+        )
+        return
+
     rid = uuid.uuid4()
     idem = IdempotencyRepo(session, tenant_id)
     try:
@@ -369,6 +443,7 @@ async def stream_input_endpoint(
     if api_key_full and not authorization_header:
         authorization_header = f"Bearer {api_key_full}"
     if not authorization_header:
+        _emit_tts_request_metric("unknown", "unknown", "auth_failed")
         await websocket.close(code=1008, reason="missing api key")
         return
 
@@ -376,7 +451,10 @@ async def stream_input_endpoint(
     # so a bad bearer / missing voice closes with a sane reason.
     async with session_factory() as ws_session:
         # auth runs the same DB-backed pipeline as HTTP — we get the
-        # tenant + scope without inventing a parallel auth path.
+        # tenant + scope without inventing a parallel auth path. Faz B.5
+        # hotfix (2026-05-25): preserve the 401-vs-403 distinction the
+        # HTTP path makes — `authenticate_bearer` raises HTTPException
+        # with the right status_code, we just need to map it through.
         try:
             auth_ctx = await authenticate_bearer(
                 authorization_header,
@@ -384,9 +462,25 @@ async def stream_input_endpoint(
                 redis=redis,
                 required_scopes=("tts:write",),
             )
+        except HTTPException as e:
+            _emit_tts_request_metric("unknown", "unknown", "auth_failed")
+            # 401 → "auth failed" (bad bearer, expired, missing).
+            # 403 → "forbidden" (scope insufficient, tenant inactive).
+            # 429 → "rate limited".
+            # RFC 6455 1008 (policy violation) for all auth-class failures;
+            # the `reason` string + an error frame BEFORE close let the
+            # SDK distinguish.
+            reason = {
+                status.HTTP_401_UNAUTHORIZED: "auth failed",
+                status.HTTP_403_FORBIDDEN: "forbidden",
+                status.HTTP_429_TOO_MANY_REQUESTS: "rate limited",
+            }.get(e.status_code, "auth failed")
+            await websocket.close(code=1008, reason=reason)
+            return
         except Exception as e:  # noqa: BLE001 — log + close
-            logger.info("ws auth failed: %s", e)
-            await websocket.close(code=1008, reason="auth failed")
+            logger.exception("ws auth pipeline crashed: %s", e)
+            _emit_tts_request_metric("unknown", "unknown", "auth_failed")
+            await websocket.close(code=1011, reason="internal")
             return
 
         # Resolve voice through the SAME VoiceRepo as HTTP — accessible
@@ -395,12 +489,21 @@ async def stream_input_endpoint(
         repo = VoiceRepo(ws_session, auth_ctx.tenant_id)
         db_voice = await repo.get_accessible(voice_id)
         if db_voice is None or db_voice.deleted_at is not None:
+            _emit_tts_request_metric(
+                str(auth_ctx.tenant_id), "unknown", "error",
+            )
             await websocket.close(code=1008, reason="voice not found")
             return
 
         await websocket.accept()
-        with contextlib.suppress(Exception):
-            TTS_REQUESTS.labels(endpoint="ws_stream_input", status="ok").inc()
+        # Faz B.5 hotfix — Dalga 3.1 sürümü `TTS_REQUESTS.labels(
+        # endpoint=..., status=...)` ile yanlış label kullanıyor ve
+        # `contextlib.suppress(Exception)` sayesinde silent fail ediyordu;
+        # WS happy-path SLO sayaç'ından düşüyordu. Düzelttik: gerçek
+        # labelnames (tenant, voice, status) ile sayalım.
+        _emit_tts_request_metric(
+            str(auth_ctx.tenant_id), db_voice.voice_id, "success",
+        )
 
         state = _WsState()
         # Most-recent app label wins; clients can set it via header on the
@@ -505,6 +608,7 @@ async def stream_input_endpoint(
                     db_voice_slug=db_voice.voice_id,
                     tenant_id=auth_ctx.tenant_id,
                     api_key_id=auth_ctx.api_key_id,
+                    api_key_prefix=auth_ctx.api_key.prefix,
                     redis=redis,
                     queue=queue,
                     session=ws_session,
@@ -524,6 +628,7 @@ async def stream_input_endpoint(
                     db_voice_slug=db_voice.voice_id,
                     tenant_id=auth_ctx.tenant_id,
                     api_key_id=auth_ctx.api_key_id,
+                    api_key_prefix=auth_ctx.api_key.prefix,
                     redis=redis,
                     queue=queue,
                     session=ws_session,

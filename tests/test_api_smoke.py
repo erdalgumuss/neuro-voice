@@ -620,3 +620,31 @@ def test_tenant_isolation_voice_invisible_to_other_tenant(client, second_tenant_
         headers={"Authorization": f"Bearer {second_tenant_key}"},
     ).json()
     assert listing["count"] == 0
+
+
+def test_public_voice_hides_owner_api_key_id_from_non_owner(
+    client, second_tenant_key,
+):
+    """Faz B.5 hotfix (2026-05-25 audit) — `created_by` MUST NOT
+    disclose the owner's `api_key_id` UUID to a non-owner viewing the
+    voice via the public catalog. Owner still sees the real id."""
+    wav = _make_wav_bytes()
+    # Tenant 1 enrolls + publishes
+    client.post(
+        "/v1/voices",
+        data={
+            "voice_id": "public-01",
+            "display_name": "Public",
+            "visibility": "public",
+            "voice_talent_consent": "true",
+        },
+        files={"reference_audio": ("p.wav", wav, "audio/wav")},
+    )
+    owner_view = client.get("/v1/voices/public-01").json()
+    other_view = client.get(
+        "/v1/voices/public-01",
+        headers={"Authorization": f"Bearer {second_tenant_key}"},
+    ).json()
+    # Owner sees the real api_key UUID; non-owner sees "system".
+    assert owner_view["created_by"] != "system"
+    assert other_view["created_by"] == "system"

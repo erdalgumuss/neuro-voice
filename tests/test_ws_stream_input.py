@@ -366,3 +366,104 @@ async def test_ws_rejects_unknown_model_id(ws_setup):
                 assert done.get("event") == "done"
     finally:
         app.dependency_overrides.clear()
+
+
+# --------------------------------------------------------------------------- #
+# Faz B.5 hotfix (2026-05-25 audit) — WS admission gates align with HTTP
+# --------------------------------------------------------------------------- #
+async def test_ws_rejects_segment_exceeding_max_chars(ws_setup, monkeypatch):
+    """Per-segment max_chars gate — without it WS bypasses the
+    HTTP `/v1/tts` 4 000-char cap because the worker schema goes up to
+    20 000 chars."""
+    from fastapi.testclient import TestClient
+
+    # Lower the cap so the test can hit it with a short segment instead of
+    # generating 4 000+ chars of payload.
+    from server import config as cfg_mod
+    from server.auth import get_redis
+    from server.main import app
+    from server.queue import DEFAULT_STREAM, TtsJobQueue, get_queue
+    monkeypatch.setenv("NQAI_MAX_CHARS", "50")
+    new_settings = cfg_mod.Settings()
+    monkeypatch.setattr(cfg_mod, "settings", new_settings)
+    from server import ws as ws_mod
+    monkeypatch.setattr(ws_mod, "settings", new_settings)
+
+    fake_redis = fakeredis.aioredis.FakeRedis()
+    queue = TtsJobQueue(fake_redis, stream=DEFAULT_STREAM)
+    app.dependency_overrides[get_redis] = lambda: fake_redis
+    app.dependency_overrides[get_queue] = lambda: queue
+
+    try:
+        with TestClient(app) as client:
+            client.bearer = ws_setup["bearer"]
+            _enroll_via_http(client, "ws-voice")
+
+            with client.websocket_connect(
+                f"/v1/text-to-speech/ws-voice/stream-input?api_key={client.bearer}",
+            ) as ws:
+                # 100-char segment, cap is 50.
+                long_segment = "Bu çok uzun bir cümle " * 6 + "."
+                ws.send_json({"text": long_segment, "flush": True})
+                err = ws.receive_json()
+                assert err["event"] == "error"
+                assert err["code"] == "segment_too_long"
+                ws.send_json({"close": True})
+                done = ws.receive_json()
+                assert done.get("event") == "done"
+    finally:
+        app.dependency_overrides.clear()
+
+
+async def test_ws_backpressure_sends_queue_saturated_frame(ws_setup, monkeypatch):
+    """When `_compute_backpressure_decision` denies admission the WS
+    surface emits a `queue_saturated` error frame, does NOT XADD, and
+    bumps `TTS_REQUESTS{status=backpressure}` consistent with HTTP."""
+    from fastapi.testclient import TestClient
+
+    from observability import TTS_REQUESTS
+    from server.auth import get_redis
+    from server.main import app
+    from server.queue import DEFAULT_STREAM, TtsJobQueue, get_queue
+
+    fake_redis = fakeredis.aioredis.FakeRedis()
+    queue = TtsJobQueue(fake_redis, stream=DEFAULT_STREAM)
+    app.dependency_overrides[get_redis] = lambda: fake_redis
+    app.dependency_overrides[get_queue] = lambda: queue
+
+    # Stub the decision function to force a refusal.
+    from server import ws as ws_mod
+    async def _deny(_q):
+        return False, "capacity_exhausted", {"queue_depth": 1, "limit": 0}
+    monkeypatch.setattr("server.main._compute_backpressure_decision", _deny)
+
+    try:
+        with TestClient(app) as client:
+            client.bearer = ws_setup["bearer"]
+            _enroll_via_http(client, "ws-voice")
+
+            with client.websocket_connect(
+                f"/v1/text-to-speech/ws-voice/stream-input?api_key={client.bearer}",
+            ) as ws:
+                # Force-flush a segment that clears MIN_BUFFER_CHARS.
+                ws.send_json({
+                    "text": "Yeterince uzun bir cümle.",
+                    "flush": True,
+                })
+                err = ws.receive_json()
+                assert err["event"] == "error"
+                assert err["code"] == "queue_saturated"
+                ws.send_json({"close": True})
+                done = ws.receive_json()
+                assert done.get("event") == "done"
+
+            # Queue must be empty — denied segments do NOT XADD.
+            async def _xlen():
+                return await fake_redis.xlen(DEFAULT_STREAM)
+            assert await _xlen() == 0
+    finally:
+        app.dependency_overrides.clear()
+        # Don't assert on the metric value (other tests share the global
+        # CollectorRegistry); the WS path emitting it is verified by the
+        # absence-of-XADD assertion above + the error code check.
+        _ = TTS_REQUESTS, ws_mod

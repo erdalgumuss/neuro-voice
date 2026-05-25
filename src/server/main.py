@@ -323,7 +323,7 @@ def _slugify_voice_id(display_name: str) -> str:
     return candidate
 
 
-def _voice_to_public(v) -> VoicePublic:
+def _voice_to_public(v, viewer_tenant_id: uuid.UUID | None = None) -> VoicePublic:
     # Faz B.5 Dalga 2.4 — vendor-parity fields surfaced. Settings
     # defaults are stored as a plain dict (JSONB) on the row; pydantic
     # parses them into VoiceSettings here, validating bounds.
@@ -337,6 +337,20 @@ def _voice_to_public(v) -> VoicePublic:
                 "voice_settings_defaults parse failed for voice=%s — skipping",
                 v.voice_id,
             )
+    # Faz B.5 hotfix (2026-05-25 D-08 audit) — `created_by` discloses the
+    # owner's `api_key_id` UUID. For owned voices the viewer already has
+    # that key, so showing it is fine; for public/shared voices it leaks
+    # a foreign-tenant attribute. Default-mask to "system" unless the
+    # viewer is the owner OR no viewer is supplied (admin / internal
+    # callers retain the full record).
+    is_owner = (
+        viewer_tenant_id is not None
+        and v.owner_tenant_id == viewer_tenant_id
+    )
+    if viewer_tenant_id is None or is_owner:
+        created_by = str(v.created_by_key_id) if v.created_by_key_id else "system"
+    else:
+        created_by = "system"
     return VoicePublic(
         voice_id=v.voice_id,
         display_name=v.display_name,
@@ -348,7 +362,7 @@ def _voice_to_public(v) -> VoicePublic:
         license=v.license,
         visibility=v.visibility,
         created_at=v.created_at.isoformat(),
-        created_by=str(v.created_by_key_id) if v.created_by_key_id else "system",
+        created_by=created_by,
         description=getattr(v, "description", None),
         labels=list(v.labels) if getattr(v, "labels", None) else None,
         preview_url=getattr(v, "preview_url", None),
@@ -415,7 +429,7 @@ async def list_voices(
     all_accessible = list(await repo.list_accessible())
     total = len(all_accessible)
     page = all_accessible[offset:offset + limit]
-    voices = [_voice_to_public(v) for v in page]
+    voices = [_voice_to_public(v, viewer_tenant_id=ctx.tenant_id) for v in page]
     return VoiceListResponse(
         voices=voices,
         count=len(voices),
@@ -434,7 +448,7 @@ async def get_voice(
     db_voice = await _assert_voice_accessible_or_404(
         voice_id, ctx.tenant_id, session,
     )
-    return _voice_to_public(db_voice)
+    return _voice_to_public(db_voice, viewer_tenant_id=ctx.tenant_id)
 
 
 async def _enroll_voice_impl(
@@ -597,7 +611,7 @@ async def _enroll_voice_impl(
     )
     await session.commit()
     return EnrollResponse(
-        voice=_voice_to_public(voice),
+        voice=_voice_to_public(voice, viewer_tenant_id=ctx.tenant_id),
         requires_verification=requires_verification,
     )
 
@@ -752,7 +766,7 @@ async def update_voice(
             status.HTTP_404_NOT_FOUND, detail=f"voice '{voice_id}' not found",
         )
     await session.commit()
-    return _voice_to_public(updated)
+    return _voice_to_public(updated, viewer_tenant_id=ctx.tenant_id)
 
 
 @app.delete("/v1/voices/{voice_id}", response_model=DeleteResponse, tags=["voices"])
@@ -1467,39 +1481,19 @@ def _hash_sync_body(body) -> str:
 QUEUE_DEPTH_BACKPRESSURE = int(os.environ.get("NQAI_QUEUE_DEPTH_LIMIT", "200"))
 
 
-async def _check_queue_depth_or_503(
+async def _compute_backpressure_decision(
     queue: TtsJobQueue,
-    session: AsyncSession,
-    ctx: AuthContext,
-    *,
-    voice_id: str | None = None,
-) -> None:
-    """Faz C capacity-aware backpressure.
+) -> tuple[bool, str | None, dict]:
+    """Faz B.5 hotfix — pure decision function shared by HTTP and WS.
 
-    Strategy
-    --------
-    1. Read cluster capacity from worker heartbeats. If any healthy workers
-       exist, admit while:
+    Returns ``(admit, denied_reason, payload)``. Caller is responsible
+    for audit-log write, metric increment, and the actual refusal
+    response (HTTPException for HTTP, error frame for WS).
 
-           depth <= total_capacity + headroom
-
-       where ``headroom = total_capacity - total_inflight``. The intent
-       is: "if I admit this job, the next wave of cluster work (the slots
-       currently free, plus one full pass through every slot) will
-       absorb what's queued." This **accepts backlog up to one full
-       cluster-pass even when the cluster is 100 % utilised** — a
-       deliberate choice for TTS workloads where individual jobs are
-       multi-second and a few seconds of queue latency is acceptable.
-       Pinned by ``tests/test_metrics_endpoint.py::test_backpressure_
-       admits_at_capacity_with_one_cluster_pass_backlog`` so a future
-       refactor can't quietly tighten it. A hard XLEN ceiling still
-       applies as a final fail-safe so a slow cluster can't accept
-       unbounded jobs even if its self-reported capacity says otherwise.
-    2. If NO healthy workers (cold start, all workers crashed, or the
-       heartbeat read itself failed): fall back to the original
-       XLEN-only path — the queue ceiling is the only signal we trust.
-       This keeps backpressure safe even when the heartbeat plane is
-       degraded.
+    Decision logic mirrors `_check_queue_depth_or_503` Faz C strategy:
+      1. Capacity-aware admission when workers are healthy
+         (``depth ≤ headroom + total_capacity``).
+      2. XLEN-only fallback when the heartbeat plane is degraded.
     """
     depth = await queue.depth()
     capacity_known = False
@@ -1507,9 +1501,6 @@ async def _check_queue_depth_or_503(
         cluster = await read_cluster_capacity(queue.redis)
         capacity_known = cluster.worker_count > 0
     except Exception as e:
-        # Throttle the noise — under a degraded Redis every admission
-        # path would otherwise emit a stack trace per request. Drop the
-        # traceback; the exception type + message is enough signal.
         logger.warning(
             "read_cluster_capacity failed — falling back to XLEN-only: %s", e,
         )
@@ -1523,20 +1514,38 @@ async def _check_queue_depth_or_503(
             and depth <= QUEUE_DEPTH_BACKPRESSURE
             and depth <= headroom + cluster.total_capacity
         ):
-            return
-        denied_reason = "capacity_exhausted"
-        payload = {
+            return True, None, {}
+        return False, "capacity_exhausted", {
             "queue_depth": depth,
             "limit": QUEUE_DEPTH_BACKPRESSURE,
             "worker_count": cluster.worker_count,
             "total_capacity": cluster.total_capacity,
             "total_inflight": cluster.total_inflight,
         }
-    else:
-        if depth <= QUEUE_DEPTH_BACKPRESSURE:
-            return
-        denied_reason = "queue_depth_limit"
-        payload = {"queue_depth": depth, "limit": QUEUE_DEPTH_BACKPRESSURE}
+    if depth <= QUEUE_DEPTH_BACKPRESSURE:
+        return True, None, {}
+    return False, "queue_depth_limit", {
+        "queue_depth": depth,
+        "limit": QUEUE_DEPTH_BACKPRESSURE,
+    }
+
+
+async def _check_queue_depth_or_503(
+    queue: TtsJobQueue,
+    session: AsyncSession,
+    ctx: AuthContext,
+    *,
+    voice_id: str | None = None,
+) -> None:
+    """Faz C capacity-aware backpressure (HTTP wrapper).
+
+    See `_compute_backpressure_decision` for the admission logic. On
+    refusal this writes an audit row, bumps the SLO denominator
+    (`TTS_REQUESTS{status=backpressure}`), and raises 503 + Retry-After.
+    """
+    admit, denied_reason, payload = await _compute_backpressure_decision(queue)
+    if admit:
+        return
 
     await AuditRepo(session).record(
         actor_type="api_key",
