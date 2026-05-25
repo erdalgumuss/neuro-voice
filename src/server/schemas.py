@@ -211,10 +211,30 @@ class TTSJobAccepted(BaseModel):
 
 
 class TTSJobMetrics(BaseModel):
+    """Latency + billing metadata in the async job status response.
+
+    Faz B.5 Dalga 2.3 — fields added so the response shape lines up
+    with ElevenLabs raw-header metadata + MiniMax `extra_info` body.
+    All fields nullable — the worker may not have written some yet
+    (e.g. a job that errored before inference).
+    """
+    model_config = ConfigDict(protected_namespaces=())
+
     queue_wait_ms: int | None = None
     inference_ms: int | None = None
+    # `first_audio_ms`: worker-side inference-start → first-publish_chunk
+    # XADD. Surfaced on the API now that the streaming endpoint also
+    # measures it (Faz C v1 item 1 wired the column; this just
+    # re-exposes it on the async status response).
+    first_audio_ms: int | None = None
     generated_audio_ms: int | None = None
     rtf: float | None = None
+    # Billing primary key — character count of the original text.
+    # Same value the gateway puts on the `X-NQAI-Character-Count`
+    # header for sync paths.
+    character_count: int | None = None
+    # Preset that actually ran (registry-default when client sent None).
+    model_id: str | None = None
 
 
 class TTSJobOutput(BaseModel):

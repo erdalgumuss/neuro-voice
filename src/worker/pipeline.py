@@ -543,6 +543,11 @@ async def process_one_job(
                 rtf=rtf,
                 status="ok",
                 worker_id=worker_id,
+                # Faz B.5 Dalga 2.3 — model_id (preset slug) persisted so
+                # the status response can return which preset ran. Maps
+                # to UsageRecord.model_version. preset is the resolved
+                # ModelPreset from earlier in this function.
+                model_version=preset.model_id,
                 app_label=job.app_label,
             )
             await s.commit()

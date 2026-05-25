@@ -225,6 +225,8 @@ app.add_middleware(
         "X-NQAI-Sample-Rate",
         "X-NQAI-Voice-Id",
         "X-NQAI-Model-Id",
+        "X-NQAI-Output-Format",
+        "X-NQAI-Character-Count",
         "X-NQAI-Sentences",
         "X-NQAI-Duration-Seconds",
         "X-NQAI-Elapsed-Seconds",
@@ -706,6 +708,10 @@ async def synthesize(
         "X-NQAI-Sample-Rate": str(sample_rate),
         "X-NQAI-Voice-Id": db_voice.voice_id,
         "X-NQAI-Model-Id": preset.model_id,
+        # Faz B.5 Dalga 2.3 — billing primary signal + echo of the
+        # actually-returned format (vendor parity).
+        "X-NQAI-Character-Count": str(len(body.text)),
+        "X-NQAI-Output-Format": body.audio_format,
         "X-NQAI-Sentences": str(sentences),
         "X-NQAI-Duration-Seconds": f"{duration_ms / 1000.0:.3f}",
         "X-NQAI-Elapsed-Seconds": f"{elapsed_ms / 1000.0:.3f}",
@@ -853,6 +859,12 @@ async def synthesize_stream(
         "X-NQAI-Sample-Rate": str(sample_rate),
         "X-NQAI-Voice-Id": db_voice.voice_id,
         "X-NQAI-Model-Id": preset.model_id,
+        # Faz B.5 Dalga 2.3 — billing + format echo. Duration / RTF /
+        # sentence count aren't known yet on the streaming path (worker
+        # writes them post-stream in usage_records); the streaming
+        # response only exposes what's known at request time.
+        "X-NQAI-Character-Count": str(len(body.text)),
+        "X-NQAI-Output-Format": body.audio_format,
     }
 
     # Faz C v1 item 1 — gateway-side TTFB measurement.
@@ -1406,13 +1418,19 @@ async def get_tts_job(
                 content_type="audio/wav",
             )
         # Per-job metrics come from usage_records via request_id.
+        # Faz B.5 Dalga 2.3 — extended with first_audio_ms,
+        # character_count, model_id so the response matches the vendor
+        # metadata shape (ElevenLabs raw headers + MiniMax extra_info).
         usage_row = await _find_usage_row(session, ctx.tenant_id, rid)
         if usage_row is not None:
             response["metrics"] = TTSJobMetrics(
                 queue_wait_ms=usage_row.queue_wait_ms,
                 inference_ms=usage_row.inference_ms or usage_row.elapsed_ms,
+                first_audio_ms=usage_row.first_audio_ms,
                 generated_audio_ms=usage_row.duration_ms,
                 rtf=usage_row.rtf,
+                character_count=usage_row.text_char_count,
+                model_id=usage_row.model_version,
             )
 
     return TTSJobStatusResponse(**response)

@@ -146,6 +146,148 @@ def _enroll_voice(client, voice_id: str = "demo-01") -> None:
     assert r.status_code == 200, r.text
 
 
+async def test_stream_response_headers_include_billing_metadata(setup):
+    """Faz B.5 Dalga 2.3 — `X-NQAI-Character-Count` and
+    `X-NQAI-Output-Format` echo on /v1/tts/stream so clients can
+    bill + know which container format they received without
+    parsing the body."""
+    import httpx
+
+    from server.auth import get_redis
+    from server.main import app
+    from server.queue import DEFAULT_STREAM, TtsJobQueue, get_queue
+    from worker.consumer import WorkerConsumer
+
+    fake_redis = fakeredis.aioredis.FakeRedis()
+    queue = TtsJobQueue(fake_redis, stream=DEFAULT_STREAM)
+    app.dependency_overrides[get_redis] = lambda: fake_redis
+    app.dependency_overrides[get_queue] = lambda: queue
+
+    stop = asyncio.Event()
+    consumer = WorkerConsumer(
+        redis=fake_redis, engine=_StubEngine(),
+        archive_to_r2=setup["archive"],
+        stop_event=stop, block_ms=10,
+    )
+    worker_task = asyncio.create_task(consumer.run())
+
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test",
+            headers={"Authorization": f"Bearer {setup['bearer']}"},
+            timeout=10.0,
+        ) as client:
+            wav = _make_wav_bytes()
+            await client.post(
+                "/v1/voices",
+                data={"voice_id": "hdr-voice", "display_name": "HDR"},
+                files={"reference_audio": ("h.wav", wav, "audio/wav")},
+            )
+            text = "Bir varmış, bir yokmuş."
+            async with client.stream(
+                "POST",
+                "/v1/tts/stream",
+                json={
+                    "text": text,
+                    "voice_id": "hdr-voice",
+                    "audio_format": "pcm16",
+                },
+            ) as r:
+                assert r.status_code == 200
+                # Character count = len(text), regardless of audio output.
+                assert r.headers["x-nqai-character-count"] == str(len(text))
+                # Output format echoes the request.
+                assert r.headers["x-nqai-output-format"] == "pcm16"
+                async for _ in r.aiter_bytes():
+                    pass
+    finally:
+        stop.set()
+        try:
+            await asyncio.wait_for(worker_task, timeout=2.0)
+        except asyncio.TimeoutError:
+            worker_task.cancel()
+        app.dependency_overrides.clear()
+
+
+async def test_async_job_status_metrics_include_model_id_and_char_count(setup):
+    """Faz B.5 Dalga 2.3 — `GET /v1/tts/jobs/{id}` exposes the
+    extended TTSJobMetrics shape: character_count, model_id,
+    first_audio_ms in addition to the original queue_wait_ms /
+    inference_ms / rtf."""
+    import uuid
+
+    from fastapi.testclient import TestClient
+
+    from server.auth import get_redis
+    from server.main import app
+    from server.queue import DEFAULT_STREAM, TtsJobQueue, get_queue
+    from worker.consumer import WorkerConsumer
+
+    fake_redis = fakeredis.aioredis.FakeRedis()
+    queue = TtsJobQueue(fake_redis, stream=DEFAULT_STREAM)
+    app.dependency_overrides[get_redis] = lambda: fake_redis
+    app.dependency_overrides[get_queue] = lambda: queue
+
+    stop = asyncio.Event()
+    consumer = WorkerConsumer(
+        redis=fake_redis, engine=_StubEngine(),
+        archive_to_r2=setup["archive"],
+        stop_event=stop, block_ms=10,
+    )
+    worker_task = asyncio.create_task(consumer.run())
+
+    try:
+        with TestClient(app) as client:
+            client.headers["Authorization"] = f"Bearer {setup['bearer']}"
+            wav = _make_wav_bytes()
+            client.post(
+                "/v1/voices",
+                data={"voice_id": "metrics-voice", "display_name": "M"},
+                files={"reference_audio": ("m.wav", wav, "audio/wav")},
+            )
+            rid = str(uuid.uuid4())
+            text = "Sayaç kontrolü."
+            r = client.post(
+                "/v1/tts/jobs",
+                headers={"Idempotency-Key": rid},
+                json={
+                    "text": text,
+                    "voice_id": "metrics-voice",
+                    "model_id": "nqai-voxcpm2-tr-turbo",
+                },
+            )
+            assert r.status_code == 202
+
+            deadline = asyncio.get_event_loop().time() + 5.0
+            body = None
+            while asyncio.get_event_loop().time() < deadline:
+                r = client.get(f"/v1/tts/jobs/{rid}")
+                body = r.json()
+                if body["status"] == "complete":
+                    break
+                await asyncio.sleep(0.05)
+            assert body is not None
+            assert body["status"] == "complete"
+
+            metrics = body["metrics"]
+            assert metrics["character_count"] == len(text)
+            assert metrics["model_id"] == "nqai-voxcpm2-tr-turbo"
+            assert metrics["first_audio_ms"] is not None
+            assert metrics["first_audio_ms"] >= 0
+            # Original fields still there.
+            assert "queue_wait_ms" in metrics
+            assert "inference_ms" in metrics
+            assert "rtf" in metrics
+    finally:
+        stop.set()
+        try:
+            await asyncio.wait_for(worker_task, timeout=2.0)
+        except asyncio.TimeoutError:
+            worker_task.cancel()
+        app.dependency_overrides.clear()
+
+
 async def test_vendor_alias_text_to_speech_voice_id_stream(setup):
     """Faz B.5 Dalga 2.2 — ElevenLabs-style alias:
     `POST /v1/text-to-speech/{voice_id}/stream` works as a thin wrapper
