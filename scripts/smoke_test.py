@@ -48,6 +48,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     p.add_argument("--out", type=Path, default=Path("experiments/platform-smoke"))
     p.add_argument("--streaming", action="store_true", help="use /v1/tts/stream instead of /v1/tts")
+    p.add_argument(
+        "--skip-warmup",
+        action="store_true",
+        help="skip legacy /admin/warmup call; worker boot warmup is enough for B.1+",
+    )
     p.add_argument("--text-set", type=Path, default=None,
                    help="optional JSON file with [{id, cat, text}, ...]; defaults to mini set")
     args = p.parse_args(argv)
@@ -62,10 +67,19 @@ def main(argv: list[str] | None = None) -> int:
 
     headers = {"Authorization": f"Bearer {args.api_key}"}
     with httpx.Client(base_url=args.base_url, headers=headers, timeout=300) as client:
-        # warm up the model
-        wr = client.post("/admin/warmup")
-        wr.raise_for_status()
-        print(f"warmup OK ({wr.json()})")
+        # Older single-process deployments exposed /admin/warmup. B.1+
+        # workers warm themselves on boot, and some smoke targets do not
+        # expose the legacy endpoint at all. Treat 401/403/404 as a
+        # non-fatal skip; real synthesis below is the actual health check.
+        if args.skip_warmup:
+            print("warmup skipped (--skip-warmup)")
+        else:
+            wr = client.post("/admin/warmup")
+            if wr.status_code in {401, 403, 404}:
+                print(f"warmup skipped ({wr.status_code}: {wr.text[:120]})")
+            else:
+                wr.raise_for_status()
+                print(f"warmup OK ({wr.json()})")
 
         catalog = client.get("/v1/voices").json()
         catalog_ids = [v["voice_id"] for v in catalog["voices"]]
