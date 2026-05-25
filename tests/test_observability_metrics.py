@@ -118,6 +118,22 @@ EXPECTED_METRICS: dict[str, dict[str, object]] = {
         "type": "gauge",
         "labels": set(),
     },
+    "nqai_worker_model_info": {
+        "type": "gauge",
+        "labels": {"worker_id", "model_id", "revision"},
+    },
+    "nqai_worker_lora_cache_hits_total": {
+        "type": "counter",
+        "labels": {"voice"},
+    },
+    "nqai_worker_lora_cache_misses_total": {
+        "type": "counter",
+        "labels": {"voice"},
+    },
+    "nqai_worker_lora_cache_evictions_total": {
+        "type": "counter",
+        "labels": set(),
+    },
     "nqai_queue_depth": {
         "type": "gauge",
         "labels": {"stream"},

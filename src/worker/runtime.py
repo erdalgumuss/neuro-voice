@@ -23,6 +23,14 @@ from .engine import BaseSynthEngine, get_engine
 logger = logging.getLogger("nqai_voice.worker.runtime")
 
 
+# MLOps PR #4 (A.4) — worker_id is generated once per process boot. The
+# WORKER_MODEL_INFO gauge below uses it as a label so on-call can
+# `count by (revision)` across pods during a rollout. Stable for the
+# lifetime of the worker; regenerated on restart (which is the right
+# semantics — a restarted pod IS a different rollout slot).
+_WORKER_ID = uuid.uuid4().hex[:12]
+
+
 def build_engine() -> BaseSynthEngine:
     """Build the VoxCPM2 engine from the same settings the gateway uses.
 
@@ -194,6 +202,20 @@ async def boot_worker(
         # load uses the freshly-warm base. A failure here doesn't
         # abort boot — the worker still starts and serves cold-load.
         await _warmup_voices_from_env(engine)
+
+    # MLOps PR #4 (A.4) — emit WORKER_MODEL_INFO once boot is ready
+    # so `count by (revision)` answers "which workers are on which
+    # revision" during a rollout. Best-effort: if Prometheus isn't
+    # installed for some reason, don't fail boot.
+    try:
+        from observability import WORKER_MODEL_INFO
+        WORKER_MODEL_INFO.labels(
+            worker_id=_WORKER_ID,
+            model_id=getattr(engine, "model_id", "unknown") or "unknown",
+            revision=getattr(engine, "hf_revision", "unknown") or "unknown",
+        ).set(1)
+    except Exception:
+        logger.exception("WORKER_MODEL_INFO emit failed at boot — ignoring")
 
     # Ping Redis so we fail fast on bad URL / unreachable host instead
     # of hanging on the first XREADGROUP.

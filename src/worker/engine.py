@@ -268,6 +268,17 @@ class VoxCPM2Engine:
             return
         evicted_key, evicted_model = self._models.popitem(last=False)
         self._evictions_total += 1
+        # MLOps PR #4 (A.6) — global eviction counter for Prometheus.
+        # Frequent evictions signal NQAI_LORA_CACHE_SIZE is too small
+        # for the active voice set. Best-effort: metric failure must
+        # not block the eviction itself (cache integrity > telemetry).
+        try:
+            from observability import WORKER_LORA_CACHE_EVICTIONS
+            WORKER_LORA_CACHE_EVICTIONS.inc()
+        except Exception:
+            logger.exception(
+                "LoRA cache eviction metric emission failed — ignoring",
+            )
         logger.info(
             "LoRA cache eviction (LRU): adapter=%s (cache_size=%d, evictions_total=%d)",
             evicted_key[1] or "base",
@@ -299,19 +310,53 @@ class VoxCPM2Engine:
         When omitted (background warmup paths that don't have a voice
         slug) the metric is labelled `_base_` so the cardinality stays
         bounded and operators can still see un-attributed cold loads."""
+        # MLOps PR #4 (A.6) — cache hit/miss counters share the same
+        # `voice` label domain as WORKER_COLD_LOAD_SECONDS (catalog
+        # slugs + "_base_") so the misses counter and the cold-load
+        # observe count line up under any aggregation.
+        cache_label = voice_id or "_base_"
         key = (self._model_id, adapter.cache_key if adapter else None)
         cached = self._models.get(key)
         if cached is not None:
             # Mark as most-recently-used.
             self._models.move_to_end(key)
             self._model = cached  # keep /health pointer fresh
+            try:
+                from observability import WORKER_LORA_CACHE_HITS
+                WORKER_LORA_CACHE_HITS.labels(voice=cache_label).inc()
+            except Exception:
+                logger.exception(
+                    "LoRA cache hit metric emission failed for voice=%s",
+                    cache_label,
+                )
             return cached
         with self._load_lock:
             cached = self._models.get(key)
             if cached is not None:
                 self._models.move_to_end(key)
                 self._model = cached
+                try:
+                    from observability import WORKER_LORA_CACHE_HITS
+                    WORKER_LORA_CACHE_HITS.labels(voice=cache_label).inc()
+                except Exception:
+                    logger.exception(
+                        "LoRA cache hit metric emission failed for voice=%s",
+                        cache_label,
+                    )
                 return cached
+
+            # Cache miss → cold-load path. Increment miss counter BEFORE
+            # the actual load so a load that crashes still shows up in
+            # the miss histogram (otherwise an OOM on cold-load would
+            # be invisible to ops).
+            try:
+                from observability import WORKER_LORA_CACHE_MISSES
+                WORKER_LORA_CACHE_MISSES.labels(voice=cache_label).inc()
+            except Exception:
+                logger.exception(
+                    "LoRA cache miss metric emission failed for voice=%s",
+                    cache_label,
+                )
 
             # Make room before loading the new model so peak VRAM stays bounded.
             while len(self._models) >= self._cache_size:

@@ -210,3 +210,20 @@ groups:
             generating audio for far longer than the text warrants;
             below 0.03 suggests truncation. Cross-reference with
             sentence_count to localise.
+
+      - alert: NqaiWorkerRevisionSpread
+        expr: |
+          count(count by (revision) (nqai_worker_model_info == 1)) > 1
+        for: 30m
+        labels:
+          severity: warning
+          service: nqai-voice
+        annotations:
+          summary: "Workers split across >1 model revision for 30m (stuck rollout)"
+          description: |
+            More than one distinct `revision` label is active in
+            nqai_worker_model_info. A rollout that takes >30m to
+            converge means at least one pod is wedged on the old
+            revision. Use `count by (revision)
+            (nqai_worker_model_info == 1)` to see the split and
+            check kubectl rollout status / unhealthy pods.

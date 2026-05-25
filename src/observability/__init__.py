@@ -33,6 +33,10 @@ from observability.metrics import (
     WORKER_COUNT,
     WORKER_DLQ,
     WORKER_INFLIGHT,
+    WORKER_LORA_CACHE_EVICTIONS,
+    WORKER_LORA_CACHE_HITS,
+    WORKER_LORA_CACHE_MISSES,
+    WORKER_MODEL_INFO,
     record_waterfall,
     render_metrics,
 )
@@ -62,6 +66,10 @@ __all__ = [
     "WORKER_COUNT",
     "WORKER_DLQ",
     "WORKER_INFLIGHT",
+    "WORKER_LORA_CACHE_EVICTIONS",
+    "WORKER_LORA_CACHE_HITS",
+    "WORKER_LORA_CACHE_MISSES",
+    "WORKER_MODEL_INFO",
     "record_waterfall",
     "render_metrics",
 ]

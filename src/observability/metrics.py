@@ -116,6 +116,33 @@ WORKER_DLQ: Counter = Counter(
 )
 
 
+# MLOps PR #4 (A.6) — LoRA adapter cache effectiveness. The cold-load
+# histogram (WORKER_COLD_LOAD_SECONDS, below) tells us WHEN a load
+# happened, not how often it happened vs. cache hits. The counter pair
+# here closes that gap so operators can size NQAI_LORA_CACHE_SIZE
+# based on cache hit rate rather than a guess.
+WORKER_LORA_CACHE_HITS: Counter = Counter(
+    "nqai_worker_lora_cache_hits_total",
+    "Per-voice LoRA adapter cache hits in _model_for_adapter — request "
+    "found the adapter already loaded, no cold-load.",
+    labelnames=("voice",),
+    registry=REGISTRY,
+)
+WORKER_LORA_CACHE_MISSES: Counter = Counter(
+    "nqai_worker_lora_cache_misses_total",
+    "Per-voice LoRA adapter cache misses — request triggered a cold load. "
+    "Should match the WORKER_COLD_LOAD_SECONDS observe count.",
+    labelnames=("voice",),
+    registry=REGISTRY,
+)
+WORKER_LORA_CACHE_EVICTIONS: Counter = Counter(
+    "nqai_worker_lora_cache_evictions_total",
+    "LRU evictions from the per-worker LoRA cache (capacity reached). "
+    "Frequent evictions indicate NQAI_LORA_CACHE_SIZE is too small.",
+    registry=REGISTRY,
+)
+
+
 # ---------------------------------------------------------------------------
 # Histograms
 # ---------------------------------------------------------------------------
@@ -319,6 +346,15 @@ WORKER_COUNT: Gauge = Gauge(
     registry=REGISTRY,
 )
 
+WORKER_MODEL_INFO: Gauge = Gauge(
+    "nqai_worker_model_info",
+    "Active model + revision per worker. Value is constant 1; labels carry "
+    "the variable. Use `count by (revision)` to see how many workers are on "
+    "each revision during a rollout. Set to 0 on shutdown for clean counts.",
+    labelnames=("worker_id", "model_id", "revision"),
+    registry=REGISTRY,
+)
+
 QUEUE_DEPTH: Gauge = Gauge(
     "nqai_queue_depth",
     "Snapshot of XLEN per Redis Streams stream the gateway/worker manages.",
@@ -407,6 +443,10 @@ __all__ = [
     "WORKER_COUNT",
     "WORKER_DLQ",
     "WORKER_INFLIGHT",
+    "WORKER_LORA_CACHE_EVICTIONS",
+    "WORKER_LORA_CACHE_HITS",
+    "WORKER_LORA_CACHE_MISSES",
+    "WORKER_MODEL_INFO",
     "record_waterfall",
     "render_metrics",
 ]
