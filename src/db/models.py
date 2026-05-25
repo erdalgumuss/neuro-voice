@@ -566,6 +566,17 @@ class JobIdempotency(Base):
         DateTime(timezone=True), nullable=False,
     )
 
+    # Faz B.5 Dalga 3.2 — per-sentence alignment for long-form playback.
+    # The worker fills this when the job completes; a list of
+    # `{seq, start_ms, end_ms, text}` dicts in playback order. Lets
+    # async clients render subtitles + scrub-bar timestamps without
+    # parsing the WAV themselves. Nullable so pre-Dalga-3.2 rows stay
+    # valid; format matches the SRT/JSON shape the gateway returns on
+    # GET /v1/tts/jobs/{id}.
+    sentence_alignment: Mapped[list[dict[str, Any]] | None] = mapped_column(
+        _JSONBPortable,
+    )
+
     __table_args__ = (
         CheckConstraint(
             "status IN ('processing','complete','failed')",

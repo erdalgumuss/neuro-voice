@@ -319,7 +319,16 @@ class TTSJobParams(BaseModel):
 class TTSJobCreate(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
-    text: str = Field(..., min_length=1, max_length=20000)
+    # Faz B.5 Dalga 3.2 — async surface accepts long-form text.
+    # ElevenLabs / MiniMax async paths take 100k–1M chars (full books).
+    # The schema ceiling is generous (250 000 chars ≈ ~5h playback at
+    # 14 chars/sec read rate); a tighter, env-tunable runtime cap
+    # (NQAI_ASYNC_MAX_CHARS, default 100 000) is enforced in the
+    # gateway so operators can lift it per deployment without a code
+    # change. Sync `/v1/tts` stays at 4 000 chars (config.max_chars_per_request)
+    # because the gateway → result-stream → response timeout (30s default)
+    # would 504 long before long-form finishes.
+    text: str = Field(..., min_length=1, max_length=250000)
     voice_id: str = Field(..., min_length=3, max_length=64)
     language: Literal["tr", "en"] = "tr"
     audio_format: AudioFormat = "wav"
@@ -381,6 +390,17 @@ class TTSJobOutput(BaseModel):
     content_type: str = "audio/wav"
 
 
+class SentenceAlignment(BaseModel):
+    """Faz B.5 Dalga 3.2 — one row of the per-sentence alignment list
+    returned with long-form jobs. Timestamps are PLAYBACK milliseconds
+    relative to the start of the rendered audio, so a client can map a
+    scrub-bar position straight to a sentence."""
+    seq: int
+    start_ms: int
+    end_ms: int
+    text: str
+
+
 class TTSJobStatusResponse(BaseModel):
     job_id: str
     status: JobStatus
@@ -389,5 +409,9 @@ class TTSJobStatusResponse(BaseModel):
     created_at: str
     metrics: TTSJobMetrics | None = None
     output: TTSJobOutput | None = None
+    # Faz B.5 Dalga 3.2 — only present on completed long-form jobs.
+    # Short jobs (or pre-Dalga-3.2 rows) leave this NULL so the response
+    # payload doesn't balloon for the common single-sentence case.
+    alignment: list[SentenceAlignment] | None = None
 
 

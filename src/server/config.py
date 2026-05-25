@@ -59,6 +59,16 @@ class Settings:
     max_chars_per_request: int = field(default_factory=lambda: int(
         os.environ.get("NQAI_MAX_CHARS", "4000")
     ))
+    # Faz B.5 Dalga 3.2 — async long-form ceiling. The Pydantic schema
+    # caps `TTSJobCreate.text` at 250 000 chars; this runtime knob lets
+    # operators throttle further (e.g. 20 000 in dev to avoid surprise
+    # GPU bills) or lift toward the schema ceiling once they've measured
+    # worker capacity for hour-long jobs. The sync `/v1/tts` paths stay
+    # bound to `max_chars_per_request` — the queue + result-stream
+    # gateway timeout would 504 long before long-form finishes.
+    async_max_chars: int = field(default_factory=lambda: int(
+        os.environ.get("NQAI_ASYNC_MAX_CHARS", "100000")
+    ))
     reference_trim_seconds: float = field(default_factory=lambda: float(
         os.environ.get("NQAI_REF_TRIM_SECONDS", "15.0")
     ))

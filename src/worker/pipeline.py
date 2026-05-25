@@ -450,6 +450,15 @@ async def process_one_job(
     if job.next_text is not None:
         request_meta["next_text"] = job.next_text
 
+    # Faz B.5 Dalga 3.2 — per-sentence alignment. Built incrementally
+    # alongside the chunk loop so playback timestamps reflect the
+    # actual concatenated audio (PCM byte count → ms via sample_rate).
+    # Zero-cost when text is single-sentence: alignment is just one
+    # row and the gateway returns it as a 1-element list. Long-form
+    # jobs accumulate one row per sentence for SRT-style rendering.
+    alignment: list[dict] = []
+    cumulative_samples = 0
+
     try:
         async for chunk in iter_engine_chunks(
             engine,
@@ -483,6 +492,17 @@ async def process_one_job(
                     (time.monotonic() - inference_started) * 1000,
                 )
             pcm_buffer.extend(pcm_out)
+            chunk_sr = chunk.sample_rate or sample_rate
+            chunk_samples = len(pcm_out) // 2
+            start_ms = int(cumulative_samples / max(chunk_sr, 1) * 1000)
+            cumulative_samples += chunk_samples
+            end_ms = int(cumulative_samples / max(chunk_sr, 1) * 1000)
+            alignment.append({
+                "seq": seq,
+                "start_ms": start_ms,
+                "end_ms": end_ms,
+                "text": getattr(chunk, "sentence_text", "") or "",
+            })
             seq += 1
     except Exception as e:
         # TRANSIENT — DO NOT publish error chunk or fail the idempotency
@@ -543,7 +563,14 @@ async def process_one_job(
     try:
         async with session_factory() as s:
             await IdempotencyRepo(s, tenant_id).complete(
-                rid, response_uri=response_uri,
+                rid,
+                response_uri=response_uri,
+                # Faz B.5 Dalga 3.2 — persist alignment so /v1/tts/jobs/{id}
+                # can surface subtitle / scrub-bar data. Workers built
+                # before Dalga 3.2 pass None and the column stays NULL —
+                # exactly the same shape the gateway expects for "no
+                # alignment available".
+                sentence_alignment=alignment if alignment else None,
             )
             await UsageRepo(s, tenant_id).record(
                 api_key_id=api_key_id,

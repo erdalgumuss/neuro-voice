@@ -359,10 +359,26 @@ def test_create_job_rejects_malformed_idempotency_key(client):
 
 
 def test_create_job_rejects_oversize_text(client):
+    """Async ceiling is `async_max_chars` (default 100 000, Dalga 3.2);
+    300 000 chars exceeds it but stays under the pydantic schema cap so
+    we see the gateway 400 rather than pydantic's 422."""
     _enroll_voice(client)
-    huge = "x" * 30000  # NQAI_MAX_CHARS default is 4000
+    huge = "x" * 150000
     r = _create_job(client, idempotency_key=str(uuid.uuid4()), text=huge)
     assert r.status_code in {400, 422}
+
+
+def test_create_job_accepts_long_form_up_to_async_ceiling(client):
+    """Dalga 3.2: 50 000 chars is well past the sync `max_chars_per_request`
+    (4 000) but inside the async ceiling (100 000). The async submit
+    accepts it; the worker / engine slowness is a runtime concern, not a
+    submit-time one."""
+    _enroll_voice(client)
+    long_text = "Bu uzun bir cümle. " * 2700  # ~51 300 chars
+    r = _create_job(
+        client, idempotency_key=str(uuid.uuid4()), text=long_text,
+    )
+    assert r.status_code == 202, r.text
 
 
 def test_create_job_unknown_voice_404(client):

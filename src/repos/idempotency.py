@@ -154,13 +154,24 @@ class IdempotencyRepo:
         await self.session.flush()
         return result.rowcount or 0
 
-    async def complete(self, request_id: uuid.UUID, response_uri: str | None = None) -> None:
+    async def complete(
+        self,
+        request_id: uuid.UUID,
+        response_uri: str | None = None,
+        *,
+        sentence_alignment: list[dict] | None = None,
+    ) -> None:
         row = await self.get(request_id)
         if row is None:
             return
         row.status = "complete"
         if response_uri is not None:
             row.response_uri = response_uri
+        # Faz B.5 Dalga 3.2 — only write the column when the worker
+        # actually computed alignment (long-form path). Shorter jobs
+        # leave it NULL so the response payload stays small.
+        if sentence_alignment is not None:
+            row.sentence_alignment = sentence_alignment
         await self.session.flush()
 
     async def fail(self, request_id: uuid.UUID) -> None:

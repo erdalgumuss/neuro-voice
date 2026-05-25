@@ -92,6 +92,7 @@ from .schemas import (
     HealthResponse,
     ModelListResponse,
     ModelPublic,
+    SentenceAlignment,
     TTSAliasRequest,
     TTSJobAccepted,
     TTSJobCreate,
@@ -1581,11 +1582,19 @@ async def create_tts_job(
     """Enqueue a synthesis job. Idempotent — same Idempotency-Key returns
     the existing job's id, never enqueues twice. Worker side completes
     the job and writes the output to R2; clients poll the status endpoint.
+
+    Faz B.5 Dalga 3.2 — async surface accepts long-form text up to
+    `async_max_chars` (default 100 000, env NQAI_ASYNC_MAX_CHARS). The
+    sync `/v1/tts` paths stay bound to `max_chars_per_request` (4 000)
+    so they don't 504 against the result-stream gateway timeout.
     """
-    if len(body.text) > settings.max_chars_per_request:
+    if len(body.text) > settings.async_max_chars:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
-            detail=f"text exceeds max_chars={settings.max_chars_per_request}",
+            detail=(
+                f"text exceeds async_max_chars={settings.async_max_chars}; "
+                "split the request or raise NQAI_ASYNC_MAX_CHARS"
+            ),
         )
 
     try:
@@ -1770,6 +1779,20 @@ async def get_tts_job(
                 character_count=usage_row.text_char_count,
                 model_id=usage_row.model_version,
             )
+        # Faz B.5 Dalga 3.2 — per-sentence alignment. NULL on rows
+        # written before Dalga 3.2 (or short jobs the worker chose not
+        # to record). Defensive: a malformed row shouldn't 500 the
+        # status endpoint — log + return without alignment.
+        if row.sentence_alignment:
+            try:
+                response["alignment"] = [
+                    SentenceAlignment(**a) for a in row.sentence_alignment
+                ]
+            except Exception:
+                logger.exception(
+                    "sentence_alignment parse failed for job=%s — skipping",
+                    job_id,
+                )
 
     return TTSJobStatusResponse(**response)
 

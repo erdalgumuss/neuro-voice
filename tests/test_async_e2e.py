@@ -524,6 +524,20 @@ async def test_async_job_completes_when_worker_is_running(setup):
             assert body["output"]["content_type"] == "audio/wav"
             # Usage row should have the X-NQAI-App label.
             assert body["metrics"]["rtf"] is not None
+            # Faz B.5 Dalga 3.2 — alignment present on completed jobs,
+            # one entry per sentence the worker emitted. The stub
+            # engine yields two sentences, so we expect 2 alignment
+            # rows with monotonically increasing seq + non-decreasing
+            # timestamps.
+            alignment = body["alignment"]
+            assert alignment is not None
+            assert len(alignment) == 2
+            assert [a["seq"] for a in alignment] == [0, 1]
+            assert alignment[0]["start_ms"] == 0
+            assert alignment[1]["start_ms"] >= alignment[0]["end_ms"]
+            assert all(
+                a["end_ms"] >= a["start_ms"] for a in alignment
+            )
 
         # Verify the artifact actually exists on disk (file:// fallback).
         artifacts = list(setup["artifact_dir"].iterdir())
