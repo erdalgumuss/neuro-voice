@@ -217,6 +217,87 @@ TTS_TOTAL_SECONDS: Histogram = Histogram(
 
 
 # ---------------------------------------------------------------------------
+# MLOps PR #2 — quality observability (output-side audio dimensions)
+# ---------------------------------------------------------------------------
+# Why these four histograms:
+#
+# RMS (root-mean-square amplitude) is the cheapest reliable signal of
+# "the model produced actual audio". A worker that loops on empty PCM,
+# crashes mid-segment, or returns silent floats will surface as
+# `nqai_tts_output_rms_normalized` near 0.0 — invisible today.
+#
+# silence_ratio catches the "audio with periodic dropouts" failure
+# mode (a stuck attention head produces partial silence) that RMS
+# averages out.
+#
+# clipping_ratio catches the opposite: a denoiser pass or post-gain
+# bug that drives output past ±32767. Clipping > 1 % is audible
+# distortion the client will hear before the metric, but the metric
+# is the only thing on-call can scroll through after a 2 a.m. page.
+#
+# duration_per_char_seconds catches "we're producing audio but it's
+# the wrong length" — too short = truncation, too long = stuck loop.
+# Per-char (not per-segment) so a 20-char request and a 2000-char
+# request live in the same histogram.
+#
+# All four use the same `(tenant, voice)` labels as the latency
+# waterfall so a single Grafana row can correlate "latency went up
+# AND quality dropped." Cardinality stays bounded by voice catalog
+# size + active tenant count (D-15 budget).
+
+# RMS normalised to int16 full-scale (0.0 = silent, 1.0 = clipping).
+# Linear-ish buckets in the 0.0–0.3 range because real voice signal
+# rarely sits above 0.3 RMS (we peak-normalize references to 0.95);
+# above 0.5 is almost certainly distortion territory.
+TTS_OUTPUT_RMS: Histogram = Histogram(
+    "nqai_tts_output_rms_normalized",
+    "Output PCM RMS amplitude (0.0–1.0 of int16 full-scale). Near zero "
+    "means the engine produced silence; near one means clipping.",
+    labelnames=_WATERFALL_LABELS,
+    buckets=(0.0, 0.005, 0.01, 0.02, 0.05, 0.10, 0.15, 0.20, 0.30,
+             0.50, 0.75, 1.0),
+    registry=REGISTRY,
+)
+
+# silence_ratio: fraction of int16 samples whose absolute value is below
+# a 1 % full-scale threshold (~328 / 32767). 1.0 = pure silence; mid-
+# values indicate periodic dropouts inside otherwise-valid audio.
+TTS_OUTPUT_SILENCE_RATIO: Histogram = Histogram(
+    "nqai_tts_output_silence_ratio",
+    "Fraction of int16 PCM samples below 1 % full-scale (near-silence). "
+    "1.0 = silent; mid values = stutters / partial dropouts.",
+    labelnames=_WATERFALL_LABELS,
+    buckets=(0.0, 0.05, 0.10, 0.20, 0.35, 0.50, 0.75, 0.90, 0.99, 1.0),
+    registry=REGISTRY,
+)
+
+# clipping_ratio: fraction of samples saturating at ±32767 (or 95 % of
+# it). Anything above ~0.001 is audible distortion.
+TTS_OUTPUT_CLIPPING_RATIO: Histogram = Histogram(
+    "nqai_tts_output_clipping_ratio",
+    "Fraction of int16 PCM samples at >= 95 %% full-scale. Above 0.001 "
+    "is audible distortion the client will hear before this metric.",
+    labelnames=_WATERFALL_LABELS,
+    buckets=(0.0, 1e-5, 1e-4, 1e-3, 5e-3, 1e-2, 5e-2, 0.1, 0.5, 1.0),
+    registry=REGISTRY,
+)
+
+# Speech-rate sanity check: total audio duration / input character count.
+# Turkish steady-state read-rate ~70-80 ms/char in our domain; below 30
+# ms/char suggests truncation, above 200 ms/char suggests a stuck loop.
+TTS_DURATION_PER_CHAR_SECONDS: Histogram = Histogram(
+    "nqai_tts_output_seconds_per_char",
+    "Output audio duration divided by input character count. "
+    "Sanity bound on truncation (too low) and stuck-loop (too high). "
+    "Real-voice steady-state for Turkish in our domain is ~0.07-0.08.",
+    labelnames=_WATERFALL_LABELS,
+    buckets=(0.0, 0.01, 0.03, 0.05, 0.07, 0.10, 0.15, 0.25, 0.50, 1.0,
+             2.0, 5.0),
+    registry=REGISTRY,
+)
+
+
+# ---------------------------------------------------------------------------
 # Gauges
 # ---------------------------------------------------------------------------
 

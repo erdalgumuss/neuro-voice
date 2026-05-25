@@ -657,6 +657,41 @@ async def process_one_job(
         # best-effort; a misbehaving Prometheus client gets swallowed.
         logger.exception("waterfall metric observation failed for %s", rid)
 
+    # ---------- 6c. MLOps PR #2 — output PCM quality histograms ----------
+    # Catch "audio came out but it's garbage" failure modes the
+    # latency / error counters do NOT see: silent PCM, mid-stream
+    # dropouts, clipping, truncation, stuck-loop runaway. Single pass
+    # over the assembled buffer (cheap — already in memory). Metrics
+    # are best-effort like the waterfall above; never raise.
+    try:
+        from audio.stats import compute_pcm_stats
+        from observability import (
+            TTS_DURATION_PER_CHAR_SECONDS,
+            TTS_OUTPUT_CLIPPING_RATIO,
+            TTS_OUTPUT_RMS,
+            TTS_OUTPUT_SILENCE_RATIO,
+        )
+
+        stats = compute_pcm_stats(
+            bytes(pcm_buffer), sample_rate=sample_rate,
+        )
+        labels = {
+            "tenant": str(tenant_id),
+            "voice": voice_view.voice_id,
+        }
+        TTS_OUTPUT_RMS.labels(**labels).observe(stats.rms_normalized)
+        TTS_OUTPUT_SILENCE_RATIO.labels(**labels).observe(stats.silence_ratio)
+        TTS_OUTPUT_CLIPPING_RATIO.labels(**labels).observe(stats.clipping_ratio)
+        # Per-character output rate — sensitive to truncation
+        # (too short) and stuck loops (too long). Only meaningful when
+        # text is non-empty, otherwise the ratio is undefined.
+        if len(job.text) > 0:
+            TTS_DURATION_PER_CHAR_SECONDS.labels(**labels).observe(
+                stats.duration_seconds / len(job.text)
+            )
+    except Exception:
+        logger.exception("quality metric observation failed for %s", rid)
+
     # ---------- 7. publish final marker (ONLY after commit succeeded) ---
     # Gateway invariant: seeing final=True ⇒ GET /v1/tts/jobs/{id}
     # WILL return complete + response_uri. If this XADD itself raises,

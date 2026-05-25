@@ -90,6 +90,22 @@ EXPECTED_METRICS: dict[str, dict[str, object]] = {
         "type": "histogram",
         "labels": {"tenant", "voice"},
     },
+    "nqai_tts_output_rms_normalized": {
+        "type": "histogram",
+        "labels": {"tenant", "voice"},
+    },
+    "nqai_tts_output_silence_ratio": {
+        "type": "histogram",
+        "labels": {"tenant", "voice"},
+    },
+    "nqai_tts_output_clipping_ratio": {
+        "type": "histogram",
+        "labels": {"tenant", "voice"},
+    },
+    "nqai_tts_output_seconds_per_char": {
+        "type": "histogram",
+        "labels": {"tenant", "voice"},
+    },
     "nqai_worker_capacity_total": {
         "type": "gauge",
         "labels": set(),

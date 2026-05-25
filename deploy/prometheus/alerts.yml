@@ -131,3 +131,82 @@ groups:
             ASGI buffering / network overhead is dominating, not the
             worker. Check uvicorn worker count, body-size limits, and
             client-side network path.
+
+  # ---------------------------------------------------------------------
+  # MLOps PR #2 — output PCM quality (catches "audio out but garbage")
+  # ---------------------------------------------------------------------
+  # These alerts close the gap that the latency / error rules can't
+  # see: the model produces SOMETHING (no exception, no DLQ) but that
+  # something is silent, clipping, or wrong-length. Failure mode is
+  # invisible without these; first signal is a customer ticket.
+  - name: nqai-voice-quality
+    interval: 30s
+    rules:
+      - alert: NqaiVoiceSilentOutput
+        expr: |
+          histogram_quantile(0.5, sum by (le) (rate(nqai_tts_output_rms_normalized_bucket[5m]))) < 0.005
+        for: 5m
+        labels:
+          severity: critical
+          service: nqai-voice
+        annotations:
+          summary: "Median TTS output RMS < 0.005 (effectively silent) for 5m"
+          description: |
+            The engine is producing audio buffers whose median RMS is
+            below 0.5% of int16 full-scale — effectively silence. No
+            HTTP error fires for this; the request looks healthy in
+            every other metric. Likely causes: stuck inference loop
+            returning zeros, post-process gain bug, or reference audio
+            failure cascading into engine silence.
+
+      - alert: NqaiVoiceHighSilenceRatio
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(nqai_tts_output_silence_ratio_bucket[5m]))) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+          service: nqai-voice
+        annotations:
+          summary: "p95 of output silence_ratio > 0.5 for 10m"
+          description: |
+            Half or more of the output PCM samples are below the
+            silence threshold for the top 5% of requests. Indicates
+            attention dropouts or partial truncation; check the
+            engine_inputs audit trail for a model_id / preset
+            correlation.
+
+      - alert: NqaiVoiceClippingDetected
+        expr: |
+          histogram_quantile(0.95, sum by (le) (rate(nqai_tts_output_clipping_ratio_bucket[5m]))) > 0.001
+        for: 10m
+        labels:
+          severity: warning
+          service: nqai-voice
+        annotations:
+          summary: "p95 of clipping_ratio > 0.1% for 10m"
+          description: |
+            Output is saturating at int16 full-scale for the top 5%
+            of requests. Audible distortion. Likely a post-process
+            gain bug or aggressive voice_settings.speed extreme.
+
+      - alert: NqaiVoiceAbnormalDurationPerChar
+        expr: |
+          (
+            histogram_quantile(0.95, sum by (le) (rate(nqai_tts_output_seconds_per_char_bucket[5m]))) > 0.25
+          )
+          or
+          (
+            histogram_quantile(0.5, sum by (le) (rate(nqai_tts_output_seconds_per_char_bucket[5m]))) < 0.03
+          )
+        for: 15m
+        labels:
+          severity: warning
+          service: nqai-voice
+        annotations:
+          summary: "Output seconds-per-char out of [0.03, 0.25] envelope for 15m"
+          description: |
+            Turkish steady-state read rate is ~0.07-0.08 s/char in our
+            domain. Sustained values above 0.25 suggest a stuck loop
+            generating audio for far longer than the text warrants;
+            below 0.03 suggests truncation. Cross-reference with
+            sentence_count to localise.

@@ -779,3 +779,59 @@ async def test_pipeline_omits_request_meta_when_no_dalga_26_fields(setup_db):
     )
 
     assert captured["request_meta"] is None
+
+
+# --------------------------------------------------------------------------- #
+# MLOps PR #2 — output PCM quality metrics emit per job
+# --------------------------------------------------------------------------- #
+async def test_pipeline_emits_quality_metrics_per_job(setup_db):
+    """Happy path emits all four quality histograms with the right
+    labels. Without this guard the metrics could silently never
+    increment (label-name typo or import-time exception inside the
+    `try / except` block) and the new alerts would never fire."""
+    setup = setup_db
+    from observability import (
+        TTS_DURATION_PER_CHAR_SECONDS,
+        TTS_OUTPUT_CLIPPING_RATIO,
+        TTS_OUTPUT_RMS,
+        TTS_OUTPUT_SILENCE_RATIO,
+    )
+    from worker.pipeline import process_one_job
+
+    def _sample_count(metric, labels: dict[str, str]) -> int:
+        try:
+            child = metric.labels(**labels)
+        except Exception:
+            return 0
+        # Histogram exposes a `_sum` accumulator and a per-bucket `_buckets`
+        # list; we only need to detect "was observe() called at least once."
+        return int(child._sum.get())  # noqa: SLF001 — pinning intent
+
+    redis = fakeredis.aioredis.FakeRedis()
+    job = _job(setup, text="Bu altı kelimelik bir test cümlesidir.")
+    await _reserve(setup, job)
+    labels = {
+        "tenant": str(setup["tenant_id"]),
+        "voice": setup["voice_id"],
+    }
+
+    await process_one_job(
+        job, redis=redis, engine=_StubEngine(),
+        resolve_reference=_stub_resolver(setup),
+        archive_to_r2=_local_archiver(setup),
+    )
+
+    # _StubEngine emits silent PCM (b"\x00\x00" * 1024) so we expect:
+    #   silence_ratio child observed >= 1 sample
+    #   rms child observed >= 1 sample (value ≈ 0)
+    #   clipping child observed >= 1 sample (value 0)
+    # duration_per_char observed because text is non-empty.
+    for metric in (
+        TTS_OUTPUT_RMS,
+        TTS_OUTPUT_SILENCE_RATIO,
+        TTS_OUTPUT_CLIPPING_RATIO,
+        TTS_DURATION_PER_CHAR_SECONDS,
+    ):
+        child = metric.labels(**labels)
+        count = sum(b.get() for b in child._buckets)  # noqa: SLF001
+        assert count > 0, f"{metric._name} has zero observations"  # noqa: SLF001
