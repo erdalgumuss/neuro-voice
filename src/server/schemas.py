@@ -82,6 +82,34 @@ class TTSStreamRequest(TTSRequest):
     audio_format: StreamFormat = "wav"
 
 
+# --------------------------------------------------------------------------- #
+# Vendor-compat URL aliases — Dalga 2.2
+# --------------------------------------------------------------------------- #
+# ElevenLabs ships `POST /v1/text-to-speech/{voice_id}` and the
+# corresponding `/stream` variant. SDKs they generate (Python, Node,
+# Go) call those exact URLs. To let NEEKO/NIVA/NeuroCourse swap base
+# URL and keep their code, we accept the same shape. `voice_id` lives
+# in the URL path; the request body is the rest of `TTSRequest`
+# WITHOUT the voice_id field.
+class TTSAliasRequest(BaseModel):
+    """Body for ``POST /v1/text-to-speech/{voice_id}``.
+
+    Same fields as ``TTSRequest`` minus ``voice_id`` (URL-bound).
+    """
+    model_config = ConfigDict(protected_namespaces=())
+
+    text: str = Field(..., min_length=1, max_length=20000)
+    language: Literal["tr"] = "tr"
+    audio_format: AudioFormat = "wav"
+    model_id: str | None = Field(default=None, max_length=64)
+    voice_settings: VoiceSettings | None = None
+
+
+class TTSStreamAliasRequest(TTSAliasRequest):
+    """Body for ``POST /v1/text-to-speech/{voice_id}/stream``."""
+    audio_format: StreamFormat = "wav"
+
+
 class VoicePublic(BaseModel):
     voice_id: str
     display_name: str

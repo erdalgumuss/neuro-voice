@@ -39,6 +39,10 @@ from fastapi import (
     UploadFile,
     status,
 )
+
+# `fastapi.Path` clashes with the already-imported `pathlib.Path`; the
+# alias keeps the URL-parameter validator distinct.
+from fastapi import Path as FastapiPath
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -87,12 +91,14 @@ from .schemas import (
     HealthResponse,
     ModelListResponse,
     ModelPublic,
+    TTSAliasRequest,
     TTSJobAccepted,
     TTSJobCreate,
     TTSJobMetrics,
     TTSJobOutput,
     TTSJobStatusResponse,
     TTSRequest,
+    TTSStreamAliasRequest,
     TTSStreamRequest,
     VoiceListResponse,
     VoicePublic,
@@ -1029,6 +1035,70 @@ async def synthesize_stream(
         media_type=media_type,
         headers=headers,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Vendor-compat URL aliases — Dalga 2.2
+# --------------------------------------------------------------------------- #
+# ElevenLabs ships `POST /v1/text-to-speech/{voice_id}` (sync) and
+# `POST /v1/text-to-speech/{voice_id}/stream`. SDKs they generate
+# expect these exact paths. To make NEEKO/NIVA/NeuroCourse and any
+# external customer's ElevenLabs-shaped client work after one
+# base-URL swap, we accept the path-prefixed shape and delegate to
+# the canonical handler internally.
+#
+# `voice_id` is validated here too (not just inside
+# `_assert_voice_accessible_or_404`) so an obviously-malformed path
+# returns 400 before the auth dependency runs — matches vendor UX.
+@app.post(
+    "/v1/text-to-speech/{voice_id}",
+    tags=["synthesis"],
+    summary="ElevenLabs-style alias for POST /v1/tts",
+)
+async def synthesize_alias(
+    voice_id: Annotated[str, FastapiPath(min_length=3, max_length=64)],
+    body: TTSAliasRequest,
+    request: Request,
+    ctx: Annotated[AuthContext, Depends(require_auth("tts:write"))],
+    session: Annotated[AsyncSession, Depends(get_session)],
+    queue: Annotated[TtsJobQueue, Depends(get_queue)],
+) -> Response:
+    """Vendor-compat URL shape. The body matches ``TTSRequest`` minus
+    `voice_id` (which is path-bound). We rebuild the canonical request
+    and delegate to ``synthesize`` so behaviour stays identical to
+    the native ``/v1/tts`` path."""
+    try:
+        validate_voice_id(voice_id)
+    except InvalidVoiceId as e:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, detail=str(e),
+        ) from e
+    canonical = TTSRequest(voice_id=voice_id, **body.model_dump())
+    return await synthesize(canonical, request, ctx, session, queue)
+
+
+@app.post(
+    "/v1/text-to-speech/{voice_id}/stream",
+    tags=["synthesis"],
+    summary="ElevenLabs-style alias for POST /v1/tts/stream",
+)
+async def synthesize_stream_alias(
+    voice_id: Annotated[str, FastapiPath(min_length=3, max_length=64)],
+    body: TTSStreamAliasRequest,
+    request: Request,
+    ctx: Annotated[AuthContext, Depends(require_auth("tts:write"))],
+    session: Annotated[AsyncSession, Depends(get_session)],
+    queue: Annotated[TtsJobQueue, Depends(get_queue)],
+) -> StreamingResponse:
+    """Vendor-compat URL shape. Delegates to ``synthesize_stream``."""
+    try:
+        validate_voice_id(voice_id)
+    except InvalidVoiceId as e:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, detail=str(e),
+        ) from e
+    canonical = TTSStreamRequest(voice_id=voice_id, **body.model_dump())
+    return await synthesize_stream(canonical, request, ctx, session, queue)
 
 
 def _hash_sync_body(body) -> str:

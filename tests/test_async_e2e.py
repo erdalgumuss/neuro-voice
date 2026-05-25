@@ -146,6 +146,92 @@ def _enroll_voice(client, voice_id: str = "demo-01") -> None:
     assert r.status_code == 200, r.text
 
 
+async def test_vendor_alias_text_to_speech_voice_id_stream(setup):
+    """Faz B.5 Dalga 2.2 — ElevenLabs-style alias:
+    `POST /v1/text-to-speech/{voice_id}/stream` works as a thin wrapper
+    around `/v1/tts/stream`. Body has no voice_id (URL-bound)."""
+    import httpx
+
+    from server.auth import get_redis
+    from server.main import app
+    from server.queue import DEFAULT_STREAM, TtsJobQueue, get_queue
+    from worker.consumer import WorkerConsumer
+
+    fake_redis = fakeredis.aioredis.FakeRedis()
+    queue = TtsJobQueue(fake_redis, stream=DEFAULT_STREAM)
+    app.dependency_overrides[get_redis] = lambda: fake_redis
+    app.dependency_overrides[get_queue] = lambda: queue
+
+    stop = asyncio.Event()
+    consumer = WorkerConsumer(
+        redis=fake_redis, engine=_StubEngine(),
+        archive_to_r2=setup["archive"],
+        stop_event=stop, block_ms=10,
+    )
+    worker_task = asyncio.create_task(consumer.run())
+
+    try:
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test",
+            headers={"Authorization": f"Bearer {setup['bearer']}"},
+            timeout=10.0,
+        ) as client:
+            wav = _make_wav_bytes()
+            await client.post(
+                "/v1/voices",
+                data={"voice_id": "alias-voice", "display_name": "Alias"},
+                files={"reference_audio": ("a.wav", wav, "audio/wav")},
+            )
+            async with client.stream(
+                "POST",
+                "/v1/text-to-speech/alias-voice/stream",
+                json={
+                    "text": "Merhaba.",
+                    "audio_format": "pcm16",
+                    # No voice_id — URL provides it (vendor-shape body).
+                },
+            ) as r:
+                assert r.status_code == 200, r.text
+                # Same response headers as canonical /v1/tts/stream.
+                assert r.headers["x-nqai-voice-id"] == "alias-voice"
+                assert "x-nqai-model-id" in r.headers
+                body = b""
+                async for piece in r.aiter_bytes():
+                    body += piece
+            assert len(body) > 0
+    finally:
+        stop.set()
+        try:
+            await asyncio.wait_for(worker_task, timeout=2.0)
+        except asyncio.TimeoutError:
+            worker_task.cancel()
+        app.dependency_overrides.clear()
+
+
+async def test_vendor_alias_rejects_invalid_voice_id_path(setup) -> None:
+    """Auth'd request with a malformed voice_id in URL → 400 from
+    `validate_voice_id`. Auth runs first (Depends ordering) so the
+    test needs a valid bearer; the alias handler then maps the
+    `InvalidVoiceId` to HTTPException(400)."""
+    import httpx
+
+    from server.main import app
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test",
+        headers={"Authorization": f"Bearer {setup['bearer']}"},
+        timeout=5.0,
+    ) as client:
+        # Uppercase isn't allowed by the voice_id regex.
+        r = await client.post(
+            "/v1/text-to-speech/INVALID-UPPERCASE/stream",
+            json={"text": "x", "audio_format": "pcm16"},
+        )
+        assert r.status_code == 400, r.text
+
+
 async def test_stream_voice_settings_speed_shortens_output(setup):
     """Faz B.5 Dalga 2.1 — speed=1.2 on /v1/tts/stream produces a
     shorter audio body than the speed=1.0 baseline (same text, same
