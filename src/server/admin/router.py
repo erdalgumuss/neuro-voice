@@ -55,7 +55,7 @@ from server.security.passwords import SecretMismatchError, verify_secret
 _TEMPLATE_DIR = Path(__file__).parent / "templates"
 templates = Jinja2Templates(directory=str(_TEMPLATE_DIR))
 
-admin_router = APIRouter(prefix="/admin", tags=["admin"])
+admin_router = APIRouter(prefix="/admin", tags=["admin"], include_in_schema=False)
 
 ACCESS_COOKIE = "nv_admin_access"
 REFRESH_COOKIE = "nv_admin_refresh"

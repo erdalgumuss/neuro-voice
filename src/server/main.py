@@ -4,7 +4,7 @@ Run with:
     uvicorn server.main:app --host 0.0.0.0 --port 8000
 
 Auth surface:
-    * Bearer API key (DB-backed argon2id) on /v1/* and /admin/warmup
+    * Bearer API key (DB-backed argon2id) on /v1/*
     * JWT cookie (operator) on /admin/*
     * /health is unauthenticated (k8s liveness)
 
@@ -24,6 +24,7 @@ import os
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
 from time import time
 from typing import Annotated, Any
@@ -113,7 +114,14 @@ logging.basicConfig(
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
 )
 
-VERSION = "0.4.0"
+try:
+    VERSION = _pkg_version("neurovoice")
+except PackageNotFoundError:
+    # Running from a source tree without `pip install -e .` — surface
+    # the dev sentinel so /health and /openapi.json don't lie about
+    # what's deployed. pyproject.toml is canonical (see ADR-9 /
+    # docs/api/versioning.md).
+    VERSION = "0.0.0+dev"
 
 # cutover: the gateway no longer holds a VoxCPM2 engine.
 # Sync /v1/tts and /v1/tts/stream proxy through the same Redis queue
@@ -212,12 +220,26 @@ app = FastAPI(
     description=(
         "Multilingual TTS API on VoxCPM2 (Apache 2.0) with per-language and "
         "per-character LoRA adapters, voice cloning, and chunked streaming. "
-        "Catalog at `/v1/voices`, synthesis at `/v1/tts`, streaming at "
-        "`/v1/tts/stream`. Admin surface (DB-backed JWT) at `/admin`."
+        "Catalog at `/v1/voices`, async synthesis at `/v1/tts/jobs`, "
+        "streaming at `/v1/tts/stream`. ElevenLabs-compatible parity routes "
+        "under `/v1/text-to-speech/*` (see vendor-parity docs). "
+        "Admin surface (DB-backed JWT) at `/admin`, hidden from the public spec."
     ),
     version=VERSION,
     lifespan=lifespan,
-    responses={401: {"model": ErrorResponse}, 404: {"model": ErrorResponse}},
+    # ADR-9 / docs/api/openapi-policy.md — uniform ErrorResponse envelope on
+    # the standard status code set. Per-route `responses=` may override the
+    # example for a status code, never the schema.
+    responses={
+        401: {"model": ErrorResponse},
+        403: {"model": ErrorResponse},
+        404: {"model": ErrorResponse},
+        409: {"model": ErrorResponse},
+        422: {"model": ErrorResponse},
+        429: {"model": ErrorResponse},
+        500: {"model": ErrorResponse},
+        503: {"model": ErrorResponse},
+    },
 )
 
 if "*" in settings.cors_origins:

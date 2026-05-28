@@ -143,16 +143,18 @@ Model checkpoint (`*.safetensors`, `*.bin`) — Git LFS olmadan commit etme. Ağ
 | ADR-6 | Multilingual frontend — pluggable `lang_packs/<iso>/` mimarisi | 2026-05-28 |
 | ADR-7 | Voice manifest schema v2 (`schema_version`, `base_model_id`, `lexicon`, `watermark`, `eval_pin`) + brand-neutral sample voice | 2026-05-28 |
 | ADR-8 | LoRA fine-tune pipeline: notebook → `src/finetune/` paketi + `scripts/finetune.py` CLI | 2026-05-28 |
+| ADR-9 | Public API spec stratejisi — native = FastAPI auto-OpenAPI + CI snapshot; parity = ElevenLabs spec'i `vendors/elevenlabs/` altında pin'lenip contract test ile sözleşmeye alınır (MiniMax v0 dışı; SDK gen ayrı ADR) | 2026-05-28 |
 
 ## Bilinçli ertelenmiş kararlar (sıradaki ADR'ler)
 
-1. **Public API spec'i** — kendi spec mi, OpenAI/ElevenLabs uyumlu mu, ikisi birden mi. Vendor-parity URL alias'ları zaten var; formal spec/OpenAPI doc'u henüz yok.
-2. **Billing / metering / quota modeli** — usage_records'tan billing'e bağlanma mantığı; per-tenant quota enforcement; subscription tier'ları.
-3. **Multi-region deployment** — R2 region seçimi + worker pool coğrafyası + cross-region eviction politikası.
-4. **Voice ownership + KVKK/GDPR/voice-talent kontrat çerçevesi** (uluslararası) — `voices.license` taksonomi tipi netleşmeli (`example` / `synthetic` / `user-owned` / `talent-contract:<id>`); consent verification flow.
-5. **Eval pin entegrasyonu** — `infer` çıktısını `voices.eval_metrics` JSONB sütununa yazan production-edilebilir adım (ADR-8 kapsamı dışında bırakıldı).
-6. **Watermark generation** — `voices.watermark_key_id` runtime synthesis'te imzalama; ayrı bir ADR konusu (fine-tune değil).
-7. **Multi-tenant fine-tune servisi** — `src/finetune/`'ı queue-backed multi-tenant servisle sarmak (`POST /v1/finetune-jobs`); şu an CLI-only.
-8. **Test suite (Codex authoring)** — `tests/` boş, `old_tests/` parkta; Codex mimariye göre adım-adım yeniden yazıyor (bkz. `feedback_codex_writes_tests` memory).
+1. **Billing / metering / quota modeli** — usage_records'tan billing'e bağlanma mantığı; per-tenant quota enforcement; subscription tier'ları.
+2. **Multi-region deployment** — R2 region seçimi + worker pool coğrafyası + cross-region eviction politikası.
+3. **Voice ownership + KVKK/GDPR/voice-talent kontrat çerçevesi** (uluslararası) — `voices.license` taksonomi tipi netleşmeli (`example` / `synthetic` / `user-owned` / `talent-contract:<id>`); consent verification flow.
+4. **Eval pin entegrasyonu** — `infer` çıktısını `voices.eval_metrics` JSONB sütununa yazan production-edilebilir adım (ADR-8 kapsamı dışında bırakıldı).
+5. **Watermark generation** — `voices.watermark_key_id` runtime synthesis'te imzalama; ayrı bir ADR konusu (fine-tune değil).
+6. **Multi-tenant fine-tune servisi** — `src/finetune/`'ı queue-backed multi-tenant servisle sarmak (`POST /v1/finetune-jobs`); şu an CLI-only.
+7. **SDK generation** — kendi Python/TS SDK'larımızın üretimi ve yayın disiplini (ADR-9 kapsamı dışında bırakıldı; pyproject yayın disiplini önce oturmalı).
+8. **MiniMax parity** — v0'da yok; karar değişirse ayrı ADR.
+9. **Test suite (Codex authoring)** — `tests/` boş, `old_tests/` parkta; Codex mimariye göre adım-adım yeniden yazıyor (bkz. `feedback_codex_writes_tests` memory). ADR-9 follow-up'ları (CI snapshot + ElevenLabs contract test) bu paketin parçası.
 
 Her biri kararlaştığında `/nqv-adr <slug>` ile kayda geçer.
