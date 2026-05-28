@@ -21,6 +21,7 @@ from .usage import UsageRepo
 from .voice import VoiceRepo, lifecycle_state
 from .voice_access import VoiceAccessRepo
 from .voice_consent import VoiceConsentRecordRepo
+from .watermark import WatermarkKeyRepo
 
 __all__ = [
     "TenantRepo",
@@ -30,6 +31,7 @@ __all__ = [
     "VoiceConsentRecordRepo",
     "TalentContractRepo",
     "DataDeletionRequestRepo",
+    "WatermarkKeyRepo",
     "UsageRepo",
     "AuditRepo",
     "OperatorRepo",

@@ -23,6 +23,7 @@ from typing import Any
 from sqlalchemy import (
     ARRAY,
     JSON,
+    Boolean,
     CheckConstraint,
     DateTime,
     Float,
@@ -284,7 +285,16 @@ class Voice(Base, TimestampMixin):
     adapter_uri: Mapped[str | None] = mapped_column(Text)
     adapter_sha256: Mapped[str | None] = mapped_column(Text)
     adapter_type: Mapped[str | None] = mapped_column(Text)
-    watermark_key_id: Mapped[str | None] = mapped_column(Text)
+    # ADR-13 — UUID FK to watermark_keys.id (was TEXT in ADR-7's
+    # forward-shape). v0.x DROP+ADD migration converted the type.
+    watermark_key_id: Mapped[uuid.UUID | None] = mapped_column(
+        _UUIDPortable,
+        ForeignKey("watermark_keys.id", ondelete="SET NULL"),
+    )
+    # ADR-13 — default TRUE; license-kind invariants enforced app-layer.
+    watermark_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True,
+    )
     eval_metrics: Mapped[dict[str, Any] | None] = mapped_column(_JSONBPortable)
     release_status: Mapped[str] = mapped_column(Text, nullable=False, default="draft")
 
@@ -841,4 +851,65 @@ class DataDeletionRequest(Base):
         return (
             f"<DataDeletionRequest tenant={self.tenant_id} status={self.status} "
             f"voices={len(self.voice_slugs)}>"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Watermark keys — operator-managed AudioSeal 16-bit payload allocations
+# --------------------------------------------------------------------------- #
+# Each row is one allocation. Voice.watermark_key_id points here. The
+# 16-bit `message_bits` is the value AudioSeal embeds into synthesized
+# audio. Retired keys are kept (not deleted) so historical detection
+# results stay resolvable to a key + allocation context. See ADR-13.
+class WatermarkKey(Base):
+    __tablename__ = "watermark_keys"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        _UUIDPortable, primary_key=True, default=new_uuid,
+    )
+    # 0..65535 (AudioSeal default 16-bit payload). Stored as INTEGER
+    # for SQL ergonomics; worker converts to/from the bit pattern.
+    message_bits: Mapped[int] = mapped_column(Integer, nullable=False)
+    label: Mapped[str] = mapped_column(Text, nullable=False)
+    allocated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow,
+    )
+    retired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    retired_reason: Mapped[str | None] = mapped_column(Text)
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_by_operator_id: Mapped[uuid.UUID | None] = mapped_column(
+        _UUIDPortable, ForeignKey("operators.id", ondelete="SET NULL"),
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "message_bits BETWEEN 0 AND 65535",
+            name="watermark_keys_message_bits_range",
+        ),
+        CheckConstraint(
+            "char_length(label) BETWEEN 1 AND 200",
+            name="watermark_keys_label_length",
+        ),
+        CheckConstraint(
+            "retired_at IS NULL OR retired_at >= allocated_at",
+            name="watermark_keys_retired_after_allocated",
+        ),
+        # Partial unique — active keys hold a unique 16-bit slot.
+        # Retired keys can share bit patterns (different allocation
+        # contexts at different points in time).
+        Index(
+            "ix_watermark_keys_message_bits_active", "message_bits",
+            unique=True, postgresql_where="retired_at IS NULL",
+        ),
+        Index(
+            "ix_watermark_keys_active_allocated", "allocated_at",
+            postgresql_where="retired_at IS NULL",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        status = "retired" if self.retired_at else "active"
+        return (
+            f"<WatermarkKey {self.label!r} bits={self.message_bits} "
+            f"{status}>"
         )

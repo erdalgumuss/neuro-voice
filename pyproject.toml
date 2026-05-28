@@ -98,6 +98,14 @@ eval = [
     "openai-whisper>=20240930",   # Whisper-large-v3 WER + CER backend
     "jiwer>=3.0",                  # WER / CER computation
 ]
+# ADR-13 — AudioSeal watermark generator + detector. Opt-in; the
+# worker treats a missing dep as "skip watermarking" so the
+# minimum install can still serve un-watermarked voices. License-
+# kind-bound voices (talent-contract / public-figure /
+# partner-licensed) practically require this extra.
+watermark = [
+    "audioseal>=0.2",
+]
 
 [project.scripts]
 neurovoice-server = "server.main:run"

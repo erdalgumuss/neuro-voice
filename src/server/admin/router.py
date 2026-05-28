@@ -26,10 +26,13 @@ from fastapi import (
     Body,
     Cookie,
     Depends,
+    File,
     Form,
     HTTPException,
+    Query,
     Request,
     Response,
+    UploadFile,
     status,
 )
 from fastapi.responses import HTMLResponse
@@ -46,9 +49,17 @@ from repos import (
     TenantRepo,
     UsageRepo,
     VoiceRepo,
+    WatermarkKeyRepo,
 )
+from sqlalchemy import select
 from storage.r2 import get_r2_storage
-from server.schemas import EvalPinRequest
+from server.schemas import (
+    EvalPinRequest,
+    WatermarkDetectionResultPublic,
+    WatermarkKeyAllocateRequest,
+    WatermarkKeyPublic,
+    WatermarkKeyRetireRequest,
+)
 from server.security import (
     decode_operator_jwt,
     generate_api_key,
@@ -632,6 +643,332 @@ async def admin_pin_voice_eval(
         "voice_id": voice.voice_id,
         "eval_metrics": voice.eval_metrics,
     }
+
+
+# --------------------------------------------------------------------------- #
+# Watermark key management + voice toggle + forensics (ADR-13)
+# --------------------------------------------------------------------------- #
+def _watermark_key_to_public(k) -> WatermarkKeyPublic:
+    return WatermarkKeyPublic(
+        id=str(k.id),
+        message_bits=k.message_bits,
+        label=k.label,
+        allocated_at=k.allocated_at.isoformat(),
+        retired_at=k.retired_at.isoformat() if k.retired_at else None,
+        retired_reason=k.retired_reason,
+        notes=k.notes,
+        created_by_operator_id=(
+            str(k.created_by_operator_id) if k.created_by_operator_id else None
+        ),
+    )
+
+
+@admin_router.post(
+    "/watermark-keys", response_model=WatermarkKeyPublic,
+    status_code=status.HTTP_201_CREATED,
+)
+async def admin_allocate_watermark_key(
+    body: Annotated[WatermarkKeyAllocateRequest, Body()],
+    op = Depends(_current_operator),
+    session: Annotated[AsyncSession, Depends(get_session)] = ...,
+):
+    """Allocate a new active watermark key. `message_bits=None` picks a
+    random unused slot; explicit `message_bits` allocates that slot or
+    409s if it's already active."""
+    try:
+        key = await WatermarkKeyRepo(session).allocate(
+            label=body.label,
+            created_by_operator_id=op.id,
+            notes=body.notes,
+            message_bits=body.message_bits,
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, detail=str(e),
+        ) from e
+    await AuditRepo(session).record(
+        actor_type="operator",
+        actor_id=op.id,
+        actor_label=op.email,
+        action="watermark_key.allocate",
+        result="success",
+        tenant_id=None,
+        target_type="watermark_key",
+        target_id=str(key.id),
+        payload={
+            "label": body.label,
+            "message_bits": key.message_bits,
+            "operator_specified_bits": body.message_bits is not None,
+        },
+    )
+    await session.commit()
+    return _watermark_key_to_public(key)
+
+
+@admin_router.get("/watermark-keys")
+async def admin_list_watermark_keys(
+    include_retired: Annotated[bool, Query()] = False,
+    op = Depends(_current_operator),
+    session: Annotated[AsyncSession, Depends(get_session)] = ...,
+):
+    """List watermark keys. Default: active only. Pass
+    `include_retired=true` to surface historical allocations for
+    forensics review."""
+    from db.models import WatermarkKey
+
+    q = select(WatermarkKey)
+    if not include_retired:
+        q = q.where(WatermarkKey.retired_at.is_(None))
+    q = q.order_by(WatermarkKey.allocated_at.desc())
+    keys = list((await session.execute(q)).scalars().all())
+    return {"keys": [_watermark_key_to_public(k).model_dump() for k in keys]}
+
+
+@admin_router.post("/watermark-keys/{key_id}/retire")
+async def admin_retire_watermark_key(
+    key_id: uuid.UUID,
+    body: Annotated[WatermarkKeyRetireRequest, Body()],
+    op = Depends(_current_operator),
+    session: Annotated[AsyncSession, Depends(get_session)] = ...,
+):
+    """Retire a key. Voices that reference it via watermark_key_id
+    keep the FK (ON DELETE SET NULL doesn't trigger since the row
+    isn't deleted); but the synth path treats the missing active
+    lookup as a watermark skip. Operator should re-assign affected
+    voices to a new key before retiring or be ready to accept the
+    skip.
+    """
+    key = await WatermarkKeyRepo(session).retire(
+        key_id, reason=body.reason,
+    )
+    if key is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            detail=f"watermark key '{key_id}' not found",
+        )
+    await AuditRepo(session).record(
+        actor_type="operator",
+        actor_id=op.id,
+        actor_label=op.email,
+        action="watermark_key.retire",
+        result="success",
+        tenant_id=None,
+        target_type="watermark_key",
+        target_id=str(key.id),
+        payload={"reason": body.reason, "label": key.label},
+    )
+    await session.commit()
+    return _watermark_key_to_public(key)
+
+
+# License kinds that legally MUST stay watermarked. Disabling the
+# watermark on these voices is refused by the toggle endpoint.
+_WATERMARK_REQUIRED_LICENSE_KINDS = {
+    "talent-contract",
+    "public-figure",
+    "partner-licensed",
+}
+
+
+@admin_router.post("/voices/{voice_db_id}/watermark/enable")
+async def admin_enable_voice_watermark(
+    voice_db_id: uuid.UUID,
+    key_id: Annotated[uuid.UUID | None, Form()] = None,
+    op = Depends(_current_operator),
+    session: Annotated[AsyncSession, Depends(get_session)] = ...,
+):
+    """Enable watermark on a voice. Optionally assign / re-assign a
+    watermark key. If `key_id` is omitted and the voice has no key,
+    the watermark stays inactive (enabled=true + key_id=null is a
+    valid "ready but not yet keyed" state — synth path treats it as
+    a skip until a key is bound)."""
+    voice_repo = VoiceRepo(session, uuid.uuid4())
+    voice = await voice_repo.get_by_id(voice_db_id)
+    _voice_or_404(voice, voice_db_id)
+    if key_id is not None:
+        wk = await WatermarkKeyRepo(session).get_active(key_id)
+        if wk is None:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"watermark key '{key_id}' is not active",
+            )
+        voice.watermark_key_id = wk.id
+    voice.watermark_enabled = True
+    await session.flush()
+    await AuditRepo(session).record(
+        actor_type="operator",
+        actor_id=op.id,
+        actor_label=op.email,
+        action="voice.watermark_enable",
+        result="success",
+        tenant_id=voice.owner_tenant_id,
+        target_type="voice",
+        target_id=str(voice.id),
+        payload={
+            "voice_slug": voice.voice_id,
+            "key_id": str(voice.watermark_key_id) if voice.watermark_key_id else None,
+        },
+    )
+    await session.commit()
+    return {
+        "voice_id": voice.voice_id,
+        "watermark_enabled": True,
+        "watermark_key_id": (
+            str(voice.watermark_key_id) if voice.watermark_key_id else None
+        ),
+    }
+
+
+@admin_router.post("/voices/{voice_db_id}/watermark/disable")
+async def admin_disable_voice_watermark(
+    voice_db_id: uuid.UUID,
+    op = Depends(_current_operator),
+    session: Annotated[AsyncSession, Depends(get_session)] = ...,
+):
+    """Disable watermark on a voice. Refused on license_kinds that
+    legally MUST be watermarked (talent-contract / public-figure /
+    partner-licensed) — operator must change license_kind first
+    (separate audited action)."""
+    voice_repo = VoiceRepo(session, uuid.uuid4())
+    voice = await voice_repo.get_by_id(voice_db_id)
+    _voice_or_404(voice, voice_db_id)
+    if voice.license_kind in _WATERMARK_REQUIRED_LICENSE_KINDS:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"voice license_kind='{voice.license_kind}' requires "
+                "watermark; change license_kind first"
+            ),
+        )
+    voice.watermark_enabled = False
+    await session.flush()
+    await AuditRepo(session).record(
+        actor_type="operator",
+        actor_id=op.id,
+        actor_label=op.email,
+        action="voice.watermark_disable",
+        result="success",
+        tenant_id=voice.owner_tenant_id,
+        target_type="voice",
+        target_id=str(voice.id),
+        payload={"voice_slug": voice.voice_id},
+    )
+    await session.commit()
+    return {"voice_id": voice.voice_id, "watermark_enabled": False}
+
+
+@admin_router.post(
+    "/forensics/detect-watermark",
+    response_model=WatermarkDetectionResultPublic,
+)
+async def admin_detect_watermark(
+    audio: Annotated[UploadFile, File()],
+    threshold: Annotated[float, Form(ge=0.0, le=1.0)] = 0.5,
+    op = Depends(_current_operator),
+    session: Annotated[AsyncSession, Depends(get_session)] = ...,
+):
+    """Operator-only forensics endpoint. Upload an audio file
+    (wav/mp3/flac/ogg/m4a — anything `soundfile` can decode) and
+    receive the detected AudioSeal watermark probability + decoded
+    16-bit payload + the matched key allocation + voices currently
+    bound to that key.
+
+    The audio file is NOT persisted. The detection itself is logged
+    to audit_log so a forensics audit trail exists (who ran which
+    detection when), but the raw audio bytes are forgotten on response.
+    """
+    from datetime import datetime, timezone
+
+    from audio.watermark import WatermarkDetector
+    from db.models import Voice, WatermarkKey
+
+    audio_bytes = await audio.read()
+    if not audio_bytes:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, detail="empty audio upload",
+        )
+
+    # Decode whatever format the operator uploaded → mono int16 PCM.
+    # soundfile handles wav/flac/ogg natively; mp3/m4a need ffmpeg
+    # via audioread — but for the forensics use case operators
+    # generally have a wav/flac available.
+    import io
+
+    try:
+        import numpy as np
+        import soundfile as sf
+
+        with io.BytesIO(audio_bytes) as buf:
+            data, sr = sf.read(buf, dtype="int16", always_2d=False)
+        if data.ndim == 2:
+            # Mono-mix multichannel for AudioSeal.
+            data = data.mean(axis=1).astype(np.int16)
+        pcm_bytes = data.tobytes()
+        sample_rate = int(sr)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail=f"audio decode failed: {type(e).__name__}: {e}",
+        ) from e
+
+    # Run AudioSeal detection. Build a per-request detector so the
+    # operator-supplied threshold is honored without mutating the
+    # singleton's state.
+    detector = WatermarkDetector(detection_threshold=threshold)
+    try:
+        result = detector.detect(pcm_bytes, sample_rate)
+    except RuntimeError as e:
+        # audioseal not installed / model load failed — forensics MUST
+        # be honest, so we surface 503 rather than degrading silently.
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e),
+        ) from e
+
+    matched_key_id: str | None = None
+    matched_key_label: str | None = None
+    matched_voice_ids: list[str] = []
+    if result.message is not None:
+        key = await WatermarkKeyRepo(session).get_active_by_bits(result.message)
+        if key is not None:
+            matched_key_id = str(key.id)
+            matched_key_label = key.label
+            voices = (await session.execute(
+                select(Voice).where(Voice.watermark_key_id == key.id)
+            )).scalars().all()
+            matched_voice_ids = [v.voice_id for v in voices]
+
+    await AuditRepo(session).record(
+        actor_type="operator",
+        actor_id=op.id,
+        actor_label=op.email,
+        action="forensics.detect",
+        result="success",
+        tenant_id=None,
+        target_type="watermark_key" if matched_key_id else "audio",
+        target_id=matched_key_id or "anonymous",
+        payload={
+            "probability": result.probability,
+            "decoded_message": result.message,
+            "threshold": threshold,
+            "matched_key_id": matched_key_id,
+            "matched_voice_ids": matched_voice_ids,
+            "uploaded_filename": audio.filename,
+            "uploaded_size_bytes": len(audio_bytes),
+        },
+    )
+    await session.commit()
+
+    return WatermarkDetectionResultPublic(
+        probability=result.probability,
+        message=result.message,
+        matched_key_id=matched_key_id,
+        matched_key_label=matched_key_label,
+        matched_voice_ids=matched_voice_ids,
+        sample_rate_used=result.sample_rate_used,
+        duration_seconds=result.duration_seconds,
+        detected_at=datetime.now(timezone.utc).isoformat(),
+        detail=result.detail,
+    )
 
 
 @admin_router.post("/data-deletion-requests/{request_id}/reject")

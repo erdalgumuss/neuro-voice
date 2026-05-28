@@ -62,7 +62,7 @@ from sqlalchemy import select
 
 from db.models import UsageRecord
 from db.session import AsyncSessionLocal
-from repos import IdempotencyRepo, UsageRepo, VoiceRepo
+from repos import IdempotencyRepo, UsageRepo, VoiceRepo, WatermarkKeyRepo
 from server.queue import (
     DEFAULT_RESULTS_TTL_SECONDS,
     TtsJobPayload,
@@ -304,8 +304,27 @@ async def process_one_job(
     await redis.delete(result_stream_name(rid))
 
     # ---------- 1. resolve voice (DB, viewer = job tenant) ---------------
+    # Also look up the watermark key payload (ADR-13) in the same
+    # session — the worker needs the 16-bit message_bits to embed
+    # into each synth chunk. NULL when watermarking is disabled OR
+    # no key is allocated; the applier treats NULL as a skip.
+    watermark_message_bits: int | None = None
     async with session_factory() as s:
         voice_row = await VoiceRepo(s, tenant_id).get_accessible(job.voice_id)
+        if (
+            voice_row is not None
+            and getattr(voice_row, "watermark_enabled", False)
+            and getattr(voice_row, "watermark_key_id", None) is not None
+        ):
+            key = await WatermarkKeyRepo(s).get_active(voice_row.watermark_key_id)
+            if key is not None:
+                watermark_message_bits = key.message_bits
+            else:
+                logger.warning(
+                    "watermark skip: voice=%s has watermark_key_id=%s "
+                    "but no active key row found",
+                    voice_row.voice_id, voice_row.watermark_key_id,
+                )
     if voice_row is None:
         await mark_terminal_failure(
             job,
@@ -480,6 +499,30 @@ async def process_one_job(
                 sample_rate=chunk.sample_rate,
                 voice_settings=voice_settings,
             )
+            # ADR-13 — embed the AudioSeal watermark per chunk. Runs
+            # in a thread so the model inference (~10-30ms per chunk)
+            # doesn't block the asyncio loop. Graceful degrade inside
+            # the applier returns the input unchanged when audioseal
+            # is missing or the model failed to load; we log once
+            # below in that case so operators can spot the gap.
+            if watermark_message_bits is not None:
+                from audio.watermark import get_applier
+                applier = get_applier()
+                if applier.is_available():
+                    pcm_out = await asyncio.to_thread(
+                        applier.watermark_pcm,
+                        pcm_out,
+                        chunk.sample_rate or sample_rate,
+                        message_bits=watermark_message_bits,
+                    )
+                elif seq == 0:
+                    # Log once per request (seq=0 chunk only) so a long-
+                    # form synth doesn't spam the log.
+                    logger.warning(
+                        "watermark skip: applier unavailable for voice=%s "
+                        "rid=%s — install neurovoice[watermark] to enable",
+                        voice_view.voice_id, rid,
+                    )
             await publish_chunk(
                 redis, rid,
                 seq=seq,

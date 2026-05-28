@@ -571,6 +571,55 @@ class EvalPinModel(BaseModel):
     lexicon_id: str | None = None
 
 
+# --------------------------------------------------------------------------- #
+# Watermark (ADR-13)
+# --------------------------------------------------------------------------- #
+class WatermarkKeyPublic(BaseModel):
+    """Operator-visible watermark key row. NEVER returned on tenant-
+    facing routes — exposing the 16-bit pattern to a tenant defeats
+    the forensics goal (an adversary with the pattern can fingerprint
+    or attempt removal). Admin only."""
+    id: str
+    message_bits: int = Field(ge=0, le=65535)
+    label: str
+    allocated_at: str
+    retired_at: str | None = None
+    retired_reason: str | None = None
+    notes: str | None = None
+    created_by_operator_id: str | None = None
+
+
+class WatermarkKeyAllocateRequest(BaseModel):
+    """Admin body for POST /admin/watermark-keys. Operator allocates a
+    new active key; the 16-bit slot can be specified explicitly or
+    chosen at random from unused slots (default).
+    """
+    label: str = Field(min_length=1, max_length=200)
+    message_bits: int | None = Field(default=None, ge=0, le=65535)
+    notes: str | None = Field(default=None, max_length=4096)
+
+
+class WatermarkKeyRetireRequest(BaseModel):
+    """Admin body for POST /admin/watermark-keys/{id}/retire."""
+    reason: str | None = Field(default=None, max_length=2048)
+
+
+class WatermarkDetectionResultPublic(BaseModel):
+    """Admin-visible forensics result. `matched_voice_ids` enumerates
+    voices currently assigned this key (active + historical via the
+    retired-key lookup path). `message` is None when the detection
+    probability is below threshold."""
+    probability: float = Field(ge=0.0, le=1.0)
+    message: int | None = Field(default=None, ge=0, le=65535)
+    matched_key_id: str | None = None
+    matched_key_label: str | None = None
+    matched_voice_ids: list[str] = Field(default_factory=list)
+    sample_rate_used: int
+    duration_seconds: float
+    detected_at: str
+    detail: dict[str, Any] | None = None
+
+
 class EvalPinRequest(BaseModel):
     """Operator-side body for POST /admin/voices/{voice_db_id}/eval-pin.
 
