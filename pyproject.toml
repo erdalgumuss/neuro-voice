@@ -99,6 +99,8 @@ where = ["src"]
 include = [
     "audio*",
     "db*",
+    "eval*",
+    "finetune*",
     "frontend*",
     "live*",
     "observability*",
