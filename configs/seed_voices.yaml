@@ -17,6 +17,7 @@ voices:
     language: tr
     gender: neutral
     style_tags: [warm, narrative, storyteller]
-    source: example
-    license: example
+    source: bootstrap
+    license_kind: example
+    license_ref: null
     reference_audio: tr-warm-storyteller-v0-reference.mp3

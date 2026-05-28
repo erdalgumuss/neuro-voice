@@ -133,12 +133,13 @@ class VoiceRepo:
         reference_uri: str,
         reference_sha256: str,
         reference_seconds: float,
+        license_kind: str,
         reference_sample_rate: int = 16000,
         language: str = "tr",
         gender: str = "neutral",
         style_tags: list[str] | None = None,
-        source: str = "user-enroll",
-        license: str = "user-owned",
+        source: str = "tenant-enroll",
+        license_ref: str | None = None,
         visibility: str = "private",
         engine_params: dict[str, Any] | None = None,
         created_by_key_id: uuid.UUID | None = None,
@@ -147,6 +148,10 @@ class VoiceRepo:
         preview_url: str | None = None,
         voice_settings_defaults: dict[str, Any] | None = None,
     ) -> Voice:
+        # `license_kind` is required (no default) — ADR-10 closes the
+        # license taxonomy. Callers that previously passed `license=...`
+        # must now decide a license_kind explicitly; if the caller wants
+        # the prior behaviour, pass `license_kind='user-owned'`.
         v = Voice(
             owner_tenant_id=self.tenant_id,
             voice_id=voice_id,
@@ -159,7 +164,8 @@ class VoiceRepo:
             reference_seconds=reference_seconds,
             reference_sample_rate=reference_sample_rate,
             source=source,
-            license=license,
+            license_kind=license_kind,
+            license_ref=license_ref,
             visibility=visibility,
             engine_params=engine_params or {},
             created_by_key_id=created_by_key_id,

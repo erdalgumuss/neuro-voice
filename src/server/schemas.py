@@ -185,16 +185,26 @@ class TTSStreamAliasRequest(TTSAliasRequest):
 
 
 class VoicePublic(BaseModel):
-    """Voice catalog entry. Fields added in are
-    optional so old enrolled voices stay representable."""
+    """Voice catalog entry. Optional fields stay None on rows that
+    pre-date the field's introduction."""
     voice_id: str
     display_name: str
     language: str
     gender: str
     style_tags: list[str]
     reference_seconds: float
-    source: str
-    license: str
+    # ADR-10 — closed-list taxonomy on `source` and `license_kind`;
+    # `license_ref` is polymorphic (talent_contracts.id, partner URL,
+    # public-figure rationale, or NULL).
+    source: Literal[
+        "bootstrap", "tenant-enroll", "talent-recorded",
+        "synthetic-from-prompt", "partner-import",
+    ]
+    license_kind: Literal[
+        "example", "synthetic", "user-owned",
+        "talent-contract", "public-figure", "partner-licensed",
+    ]
+    license_ref: str | None = None
     visibility: Literal["private", "shared", "public"] = "private"
     created_at: str
     created_by: str
@@ -232,16 +242,14 @@ class VoiceUpdateRequest(BaseModel):
 
 
 class EnrollResponse(BaseModel):
-    """first-class voice clone response.
+    """Voice enrollment response.
 
-    `requires_verification` mirrors ElevenLabs IVC: when True, the
-    voice is enrolled but the platform expects the operator to confirm
-    talent consent + KVKK / FSEK rider before the voice flows into
-    production synthesis. Today this is purely an audit flag the
-    catalog stores alongside the row; in Faz 3 (governance layer) it
-    gates `release_status='production'` transitions. Defaults to False
-    when the caller passes `voice_talent_consent=true` on enroll —
-    same shape vendors use.
+    `requires_verification` mirrors ElevenLabs IVC: True when the
+    consent record on file is `tenant-asserted` only (no artifact in
+    our system). Operators may upgrade the consent (signed contract,
+    recorded statement) out-of-band; the flag flips to False once the
+    upgrade lands. This gates `release_status='production'` transitions
+    in the governance layer (separate ADR).
     """
     voice: VoicePublic
     requires_verification: bool = False
@@ -399,5 +407,53 @@ class TTSJobStatusResponse(BaseModel):
     # Short jobs (or pre-Dalga-3.2 rows) leave this NULL so the response
     # payload doesn't balloon for the common single-sentence case.
     alignment: list[SentenceAlignment] | None = None
+
+
+# --------------------------------------------------------------------------- #
+# License + consent surface (ADR-10)
+# --------------------------------------------------------------------------- #
+# These schemas describe the operator-facing read shape for talent
+# contracts and voice consent records. They do not appear on any public
+# tenant-facing route yet; the admin UI / operator endpoints that
+# surface them are scheduled for a follow-up.
+class TalentContractPublic(BaseModel):
+    """Operator-visible talent contract row.
+
+    `contract_pdf_uri` is a presigned R2 URL when returned by an admin
+    endpoint; the stored value is the raw `s3://bucket/key`. Operators
+    only — never returned on tenant-facing routes.
+    """
+    id: str
+    talent_full_name: str
+    contract_pdf_uri: str
+    contract_pdf_sha256: str
+    signed_at: str
+    expires_at: str | None = None
+    jurisdiction: str | None = None
+    notes: str | None = None
+    created_at: str
+    revoked_at: str | None = None
+
+
+class VoiceConsentRecordPublic(BaseModel):
+    """One consent record on a voice's timeline.
+
+    Operator-visible. The synthesis path consumes the latest unrevoked
+    row; this schema is the audit / governance shape.
+    """
+    id: str
+    voice_id: str
+    consent_kind: Literal[
+        "tenant-asserted", "recorded-statement",
+        "signed-contract", "estate-permission",
+    ]
+    evidence_uri: str | None = None
+    evidence_sha256: str | None = None
+    evidence_notes: str | None = None
+    recorded_at: str
+    recorded_by_kind: Literal["tenant", "operator"]
+    recorded_by_actor_id: str | None = None
+    revoked_at: str | None = None
+    revoked_reason: str | None = None
 
 

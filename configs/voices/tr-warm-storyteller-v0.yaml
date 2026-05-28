@@ -9,8 +9,9 @@ style_tags:
   - storyteller
 reference_audio: tr-warm-storyteller-v0-reference.mp3
 reference_seconds: 15.0
-source: example
-license: example
+source: bootstrap
+license_kind: example
+license_ref: null
 created_at: "2026-05-28T00:00:00+00:00"
 created_by: system
 

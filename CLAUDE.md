@@ -144,17 +144,19 @@ Model checkpoint (`*.safetensors`, `*.bin`) — Git LFS olmadan commit etme. Ağ
 | ADR-7 | Voice manifest schema v2 (`schema_version`, `base_model_id`, `lexicon`, `watermark`, `eval_pin`) + brand-neutral sample voice | 2026-05-28 |
 | ADR-8 | LoRA fine-tune pipeline: notebook → `src/finetune/` paketi + `scripts/finetune.py` CLI | 2026-05-28 |
 | ADR-9 | Public API spec stratejisi — native = FastAPI auto-OpenAPI + CI snapshot; parity = ElevenLabs spec'i `vendors/elevenlabs/` altında pin'lenip contract test ile sözleşmeye alınır (MiniMax v0 dışı; SDK gen ayrı ADR) | 2026-05-28 |
+| ADR-10 | Voice license taxonomy + consent records + talent contracts — `voices.license_kind` kapalı liste CHECK constraint (6 değer); polymorphic `license_ref`; yeni `talent_contracts` + `voice_consent_records` tabloları; v0'da tenant-asserted consent yeterli, esnek genişletilebilir mimari | 2026-05-28 |
 
 ## Bilinçli ertelenmiş kararlar (sıradaki ADR'ler)
 
 1. **Billing / metering / quota modeli** — usage_records'tan billing'e bağlanma mantığı; per-tenant quota enforcement; subscription tier'ları.
 2. **Multi-region deployment** — R2 region seçimi + worker pool coğrafyası + cross-region eviction politikası.
-3. **Voice ownership + KVKK/GDPR/voice-talent kontrat çerçevesi** (uluslararası) — `voices.license` taksonomi tipi netleşmeli (`example` / `synthetic` / `user-owned` / `talent-contract:<id>`); consent verification flow.
+3. **Voice lifecycle / right-to-be-forgotten** — frozen voice state, `purge_after_at`, consent revocation runtime semantics, audit retention, jurisdiction-spesifik silme süreleri (KVKK/GDPR). ADR-10 schema'yı (`revoked_at` kolonları, frozen state için yer) hazırladı; runtime + policy ayrı ADR.
 4. **Eval pin entegrasyonu** — `infer` çıktısını `voices.eval_metrics` JSONB sütununa yazan production-edilebilir adım (ADR-8 kapsamı dışında bırakıldı).
 5. **Watermark generation** — `voices.watermark_key_id` runtime synthesis'te imzalama; ayrı bir ADR konusu (fine-tune değil).
 6. **Multi-tenant fine-tune servisi** — `src/finetune/`'ı queue-backed multi-tenant servisle sarmak (`POST /v1/finetune-jobs`); şu an CLI-only.
 7. **SDK generation** — kendi Python/TS SDK'larımızın üretimi ve yayın disiplini (ADR-9 kapsamı dışında bırakıldı; pyproject yayın disiplini önce oturmalı).
 8. **MiniMax parity** — v0'da yok; karar değişirse ayrı ADR.
-9. **Test suite (Codex authoring)** — `tests/` boş, `old_tests/` parkta; Codex mimariye göre adım-adım yeniden yazıyor (bkz. `feedback_codex_writes_tests` memory). ADR-9 follow-up'ları (CI snapshot + ElevenLabs contract test) bu paketin parçası.
+9. **Operator admin UI: talent contracts + consent verification** — ADR-10 data layer'ı kurdu; operator UI (talent_contracts CRUD + consent record review) ileride. Şu an manuel SQL.
+10. **Test suite (Codex authoring)** — `tests/` boş, `old_tests/` parkta; Codex mimariye göre adım-adım yeniden yazıyor (bkz. `feedback_codex_writes_tests` memory). ADR-9 follow-up'ları (CI snapshot + ElevenLabs contract test) ve ADR-10 follow-up'ları (license/consent enrollment paths) bu paketin parçası.
 
 Her biri kararlaştığında `/nqv-adr <slug>` ile kayda geçer.

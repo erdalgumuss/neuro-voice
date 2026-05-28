@@ -253,7 +253,13 @@ class Voice(Base, TimestampMixin):
     reference_seconds: Mapped[float] = mapped_column(Float, nullable=False)
     reference_sample_rate: Mapped[int] = mapped_column(Integer, nullable=False, default=16000)
     source: Mapped[str] = mapped_column(Text, nullable=False)
-    license: Mapped[str] = mapped_column(Text, nullable=False)
+    # ADR-10 — closed-list taxonomy (DB CHECK constraint). Per-row
+    # cross-validation with `license_ref` (e.g. 'talent-contract' must
+    # carry a talent_contracts.id) is application-layer; no FK on
+    # license_ref so it can also hold a partner-agreement URL or
+    # public-figure rationale string (polymorphic by design).
+    license_kind: Mapped[str] = mapped_column(Text, nullable=False)
+    license_ref: Mapped[str | None] = mapped_column(Text)
     visibility: Mapped[str] = mapped_column(Text, nullable=False, default="private")
     engine_params: Mapped[dict[str, Any]] = mapped_column(
         _JSONBPortable, nullable=False, default=dict
@@ -309,8 +315,14 @@ class Voice(Base, TimestampMixin):
             name="reference_seconds_range",
         ),
         CheckConstraint(
-            "source IN ('elevenlabs','voice-talent','user-enroll','placeholder','bootstrap')",
+            "source IN ('bootstrap','tenant-enroll','talent-recorded',"
+            "'synthetic-from-prompt','partner-import')",
             name="source_enum",
+        ),
+        CheckConstraint(
+            "license_kind IN ('example','synthetic','user-owned',"
+            "'talent-contract','public-figure','partner-licensed')",
+            name="license_kind_enum",
         ),
         CheckConstraint(
             "visibility IN ('private','shared','public')",
@@ -598,3 +610,131 @@ class JobIdempotency(Base):
         ),
         Index("ix_idempotency_expires", "expires_at"),
     )
+
+
+# --------------------------------------------------------------------------- #
+# Talent contracts — NeuroVoice-side signed agreements for talent voices
+# --------------------------------------------------------------------------- #
+# Operator-managed; NOT tenant-scoped. A voice with
+# `license_kind='talent-contract'` carries a talent_contracts.id in its
+# `license_ref` column. See ADR-10.
+class TalentContract(Base):
+    __tablename__ = "talent_contracts"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        _UUIDPortable, primary_key=True, default=new_uuid,
+    )
+    talent_full_name: Mapped[str] = mapped_column(Text, nullable=False)
+    contract_pdf_uri: Mapped[str] = mapped_column(Text, nullable=False)
+    contract_pdf_sha256: Mapped[str] = mapped_column(Text, nullable=False)
+    signed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+    )
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    jurisdiction: Mapped[str | None] = mapped_column(Text)
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_by_operator_id: Mapped[uuid.UUID | None] = mapped_column(
+        _UUIDPortable, ForeignKey("operators.id", ondelete="SET NULL"),
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow,
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        CheckConstraint(
+            "char_length(talent_full_name) BETWEEN 1 AND 200",
+            name="talent_contracts_name_length",
+        ),
+        CheckConstraint(
+            r"contract_pdf_sha256 ~ '^[0-9a-f]{64}$'",
+            name="talent_contracts_sha256_format",
+        ),
+        CheckConstraint(
+            "jurisdiction IS NULL OR jurisdiction = 'EU' "
+            r"OR jurisdiction ~ '^[A-Z]{2}$'",
+            name="talent_contracts_jurisdiction_format",
+        ),
+        CheckConstraint(
+            "expires_at IS NULL OR expires_at > signed_at",
+            name="talent_contracts_expires_after_signed",
+        ),
+        Index(
+            "ix_talent_contracts_active", "signed_at",
+            postgresql_where="revoked_at IS NULL",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return f"<TalentContract id={self.id} name={self.talent_full_name!r}>"
+
+
+# --------------------------------------------------------------------------- #
+# Voice consent records — 1:N voice → records (append-mostly)
+# --------------------------------------------------------------------------- #
+# A voice accumulates consent records over its lifetime: an initial
+# tenant-asserted attestation may later be upgraded to a signed-contract
+# upload, and eventually revoked. Active consent = latest row with
+# `revoked_at IS NULL` per voice; application layer enforces the
+# read-side semantics. See ADR-10.
+class VoiceConsentRecord(Base):
+    __tablename__ = "voice_consent_records"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        _UUIDPortable, primary_key=True, default=new_uuid,
+    )
+    voice_id: Mapped[uuid.UUID] = mapped_column(
+        _UUIDPortable, ForeignKey("voices.id", ondelete="CASCADE"), nullable=False,
+    )
+    consent_kind: Mapped[str] = mapped_column(Text, nullable=False)
+    # NULL only when consent_kind='tenant-asserted' (no artifact in our
+    # system; tenant accepts liability via the API call). Enforced by
+    # ck_voice_consent_records_evidence_presence in migration 0010.
+    evidence_uri: Mapped[str | None] = mapped_column(Text)
+    evidence_sha256: Mapped[str | None] = mapped_column(Text)
+    evidence_notes: Mapped[str | None] = mapped_column(Text)
+    recorded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow,
+    )
+    recorded_by_kind: Mapped[str] = mapped_column(Text, nullable=False)
+    # polymorphic: api_keys.id (tenant path) or operators.id (operator
+    # path), keyed by recorded_by_kind. No FK so a single column carries
+    # either without referential-integrity contortions.
+    recorded_by_actor_id: Mapped[uuid.UUID | None] = mapped_column(_UUIDPortable)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_reason: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (
+        CheckConstraint(
+            "consent_kind IN ('tenant-asserted','recorded-statement',"
+            "'signed-contract','estate-permission')",
+            name="voice_consent_records_consent_kind_enum",
+        ),
+        CheckConstraint(
+            "recorded_by_kind IN ('tenant','operator')",
+            name="voice_consent_records_recorded_by_kind_enum",
+        ),
+        CheckConstraint(
+            "(consent_kind = 'tenant-asserted' AND evidence_uri IS NULL) "
+            "OR (consent_kind <> 'tenant-asserted' AND evidence_uri IS NOT NULL)",
+            name="voice_consent_records_evidence_presence",
+        ),
+        CheckConstraint(
+            "evidence_sha256 IS NULL OR evidence_sha256 ~ '^[0-9a-f]{64}$'",
+            name="voice_consent_records_evidence_sha256_format",
+        ),
+        CheckConstraint(
+            "revoked_at IS NULL OR revoked_at >= recorded_at",
+            name="voice_consent_records_revoked_after_recorded",
+        ),
+        Index(
+            "ix_voice_consent_records_active", "voice_id", "recorded_at",
+            postgresql_where="revoked_at IS NULL",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<VoiceConsentRecord voice={self.voice_id} kind={self.consent_kind} "
+            f"recorded_at={self.recorded_at}>"
+        )

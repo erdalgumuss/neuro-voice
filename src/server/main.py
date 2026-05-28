@@ -71,7 +71,9 @@ from repos import (
     AuditRepo,
     IdempotencyConflict,
     IdempotencyRepo,
+    TalentContractRepo,
     UsageRepo,
+    VoiceConsentRecordRepo,
     VoiceRepo,
 )
 
@@ -414,7 +416,8 @@ def _voice_to_public(v, viewer_tenant_id: uuid.UUID | None = None) -> VoicePubli
         style_tags=list(v.style_tags or []),
         reference_seconds=v.reference_seconds,
         source=v.source,
-        license=v.license,
+        license_kind=v.license_kind,
+        license_ref=v.license_ref,
         visibility=v.visibility,
         created_at=v.created_at.isoformat(),
         created_by=created_by,
@@ -516,34 +519,44 @@ async def _enroll_voice_impl(
     language: str,
     gender: str,
     style_tags: str,
-    source: str,
-    license: str,  # noqa: A002 — DB column name
+    license_kind: str,
+    consent_kind: str,
+    license_ref: str | None,
+    consent_evidence_uri: str | None,
+    consent_evidence_sha256: str | None,
+    consent_evidence_notes: str | None,
     description: str | None,
     labels: str | None,
     visibility: str,
     remove_background_noise: bool,
-    voice_talent_consent: bool,
 ) -> EnrollResponse:
     """shared clone/enroll implementation.
 
-    Backs both `POST /v1/voices` and the ElevenLabs-style alias
-    `POST /v1/voices/add`. Multipart fields mirror ElevenLabs IVC plus
-    NQAI extras: explicit `voice_talent_consent` (KVKK/FSEK gate),
-    `visibility` (private/shared/public), and `description`/`labels`
-    that the vendor docs treat as core voice metadata.
+    Backs both `POST /v1/voices` (native) and `POST /v1/voices/add`
+    (ElevenLabs-compat alias). Native route exposes the full license +
+    consent surface; parity route forces `license_kind='user-owned'` +
+    `consent_kind='tenant-asserted'` server-side per ADR-9 (parity
+    routes do not accept native-only extension fields).
 
-    Sample validation (vendor-parity envelope):
+    Sample validation envelope:
       * format suffix in ALLOWED_AUDIO_SUFFIXES (wav/mp3/m4a/ogg/flac)
       * size 1 KB .. NEUROVOICE_ENROLL_MAX_MB (default 20 MB)
-      * trimmed duration ≥ NEUROVOICE_ENROLL_MIN_SECONDS (default 1.0 s in tests;
-        production deployments set it to 3-10 s per FSEK rider)
+      * trimmed duration ≥ NEUROVOICE_ENROLL_MIN_SECONDS
 
-    `remove_background_noise` is captured today (stored in
-    `engine_params.remove_background_noise` for audit + future preprocess
-    pass) but the active denoise step is deferred to a follow-up — we
-    don't ship a half-measure that degrades premium audio. The flag
-    surfaces in the audit log so adoption can be measured before the
-    real RNNoise/DeepFilterNet hookup lands.
+    License + consent persistence (ADR-10):
+      * `source` is hardcoded to 'tenant-enroll' — the source enum is
+        about HOW the voice was captured, not which API was called.
+      * `license_kind='talent-contract'` requires `license_ref` to be an
+        active talent_contracts.id (validated via TalentContractRepo).
+      * `consent_kind != 'tenant-asserted'` requires `consent_evidence_uri`.
+      * Voice row + voice_consent_records row are written in the same
+        transaction.
+
+    `remove_background_noise` is captured (stored in
+    `engine_params.remove_background_noise` for audit + future
+    preprocess pass) but the active denoise step is deferred to a
+    follow-up. The flag surfaces in the audit log so adoption can be
+    measured before the real denoise hookup lands.
     """
     try:
         validate_voice_id(voice_id)
@@ -616,12 +629,79 @@ async def _enroll_voice_impl(
         [t.strip() for t in labels.split(",") if t.strip()]
         if labels else None
     )
-    # Vendor parity: ElevenLabs returns `requires_verification=true`
-    # when the caller has NOT attached a consent signal. We model that
-    # explicitly via the `voice_talent_consent` form field; absence
-    # flips the catalog row into a state the future governance layer
-    # will gate on.
-    requires_verification = not voice_talent_consent
+    # ADR-10 license + consent validation (closed lists are also
+    # CHECK-constrained at the DB level; these app-layer checks emit
+    # 4xx with a useful message before the row hits the DB).
+    _LICENSE_KINDS = {
+        "example", "synthetic", "user-owned",
+        "talent-contract", "public-figure", "partner-licensed",
+    }
+    _CONSENT_KINDS = {
+        "tenant-asserted", "recorded-statement",
+        "signed-contract", "estate-permission",
+    }
+    if license_kind not in _LICENSE_KINDS:
+        target.unlink(missing_ok=True)
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail=f"invalid license_kind '{license_kind}'; "
+                   f"use one of {sorted(_LICENSE_KINDS)}",
+        )
+    if consent_kind not in _CONSENT_KINDS:
+        target.unlink(missing_ok=True)
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail=f"invalid consent_kind '{consent_kind}'; "
+                   f"use one of {sorted(_CONSENT_KINDS)}",
+        )
+    if consent_kind == "tenant-asserted" and consent_evidence_uri is not None:
+        target.unlink(missing_ok=True)
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="tenant-asserted consent must NOT carry evidence_uri; "
+                   "use a different consent_kind to attach evidence",
+        )
+    if consent_kind != "tenant-asserted" and not consent_evidence_uri:
+        target.unlink(missing_ok=True)
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail=f"consent_kind '{consent_kind}' requires consent_evidence_uri",
+        )
+
+    # talent-contract license_kind binds to an active talent_contracts.id.
+    # Validate via the operator-scoped repo before persisting the voice;
+    # an inactive or unknown contract returns 422 (semantically valid
+    # input shape, but the referenced contract isn't honourable).
+    if license_kind == "talent-contract":
+        if not license_ref:
+            target.unlink(missing_ok=True)
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                detail="license_kind='talent-contract' requires license_ref "
+                       "(talent_contracts.id UUID)",
+            )
+        try:
+            contract_uuid = uuid.UUID(license_ref)
+        except ValueError as e:
+            target.unlink(missing_ok=True)
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                detail=f"license_ref '{license_ref}' is not a valid UUID for "
+                       "license_kind='talent-contract'",
+            ) from e
+        if await TalentContractRepo(session).get_active(contract_uuid) is None:
+            target.unlink(missing_ok=True)
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"talent_contracts.id '{license_ref}' is not active "
+                       "(revoked, expired, or unknown)",
+            )
+
+    # `requires_verification` mirrors ElevenLabs IVC semantics: True
+    # while only a tenant-asserted consent is on file. An operator may
+    # later upgrade the consent (signed contract upload) which flips
+    # this to False via the governance flow (separate ADR).
+    requires_verification = consent_kind == "tenant-asserted"
 
     engine_params: dict[str, Any] = {
         "remove_background_noise": remove_background_noise,
@@ -638,13 +718,26 @@ async def _enroll_voice_impl(
         language=language,
         gender=gender,
         style_tags=tags,
-        source=source,
-        license=license,
+        source="tenant-enroll",
+        license_kind=license_kind,
+        license_ref=license_ref,
         visibility=visibility,
         engine_params=engine_params,
         created_by_key_id=ctx.api_key_id,
         description=description,
         labels=parsed_labels,
+    )
+
+    # ADR-10 — write the initial consent record in the same transaction.
+    # Tenant-scoped actor: recorded_by_actor_id = the api_key used.
+    await VoiceConsentRecordRepo(session).record(
+        voice_id=voice.id,
+        consent_kind=consent_kind,
+        recorded_by_kind="tenant",
+        recorded_by_actor_id=ctx.api_key_id,
+        evidence_uri=consent_evidence_uri,
+        evidence_sha256=consent_evidence_sha256,
+        evidence_notes=consent_evidence_notes,
     )
     await AuditRepo(session).record(
         actor_type="api_key",
@@ -662,6 +755,10 @@ async def _enroll_voice_impl(
             "remove_background_noise": remove_background_noise,
             "requires_verification": requires_verification,
             "visibility": visibility,
+            "license_kind": license_kind,
+            "license_ref": license_ref,
+            "consent_kind": consent_kind,
+            "has_consent_evidence": consent_evidence_uri is not None,
         },
     )
     await session.commit()
@@ -678,22 +775,31 @@ async def enroll_voice(
     voice_id: Annotated[str, Form(min_length=3, max_length=64)],
     display_name: Annotated[str, Form(min_length=1, max_length=120)],
     reference_audio: Annotated[UploadFile, File()],
+    # ADR-10 — license + consent are required; closed-list values
+    # documented at docs/api/openapi-policy.md "Native vendor
+    # extensions" and enforced by app-layer validation +
+    # CHECK constraint at the DB level.
+    license_kind: Annotated[str, Form()],
+    consent_kind: Annotated[str, Form()],
     language: Annotated[str, Form()] = "tr",
     gender: Annotated[str, Form()] = "neutral",
     style_tags: Annotated[str, Form()] = "",
-    source: Annotated[str, Form()] = "user-enroll",
-    license: Annotated[str, Form()] = "user-owned",  # noqa: A002 — DB column name
+    license_ref: Annotated[str | None, Form(max_length=512)] = None,
+    consent_evidence_uri: Annotated[str | None, Form(max_length=1024)] = None,
+    consent_evidence_sha256: Annotated[str | None, Form(max_length=128)] = None,
+    consent_evidence_notes: Annotated[str | None, Form(max_length=2048)] = None,
     description: Annotated[str | None, Form(max_length=2048)] = None,
     labels: Annotated[str | None, Form(max_length=2048)] = None,
     visibility: Annotated[str, Form()] = "private",
     remove_background_noise: Annotated[bool, Form()] = False,
-    voice_talent_consent: Annotated[bool, Form()] = False,
 ) -> EnrollResponse:
-    """first-class voice clone API.
+    """Native voice enrollment.
 
-    Drop-in target for ElevenLabs/MiniMax SDK shapes. See
-    [_enroll_voice_impl][] for the validation envelope and the consent /
-    governance semantics.
+    Accepts the full license + consent surface (ADR-10). For
+    integrators migrating from ElevenLabs SDKs that don't carry these
+    fields, the compatible alias `POST /v1/voices/add` forces
+    `license_kind='user-owned'` + `consent_kind='tenant-asserted'`
+    server-side. See [_enroll_voice_impl][] for the validation envelope.
     """
     return await _enroll_voice_impl(
         ctx=ctx,
@@ -704,13 +810,16 @@ async def enroll_voice(
         language=language,
         gender=gender,
         style_tags=style_tags,
-        source=source,
-        license=license,
+        license_kind=license_kind,
+        consent_kind=consent_kind,
+        license_ref=license_ref,
+        consent_evidence_uri=consent_evidence_uri,
+        consent_evidence_sha256=consent_evidence_sha256,
+        consent_evidence_notes=consent_evidence_notes,
         description=description,
         labels=labels,
         visibility=visibility,
         remove_background_noise=remove_background_noise,
-        voice_talent_consent=voice_talent_consent,
     )
 
 
@@ -729,21 +838,23 @@ async def enroll_voice_alias(
     language: Annotated[str, Form()] = "tr",
     gender: Annotated[str, Form()] = "neutral",
     style_tags: Annotated[str, Form()] = "",
-    source: Annotated[str, Form()] = "user-enroll",
-    license: Annotated[str, Form()] = "user-owned",  # noqa: A002 — DB column name
     description: Annotated[str | None, Form(max_length=2048)] = None,
     labels: Annotated[str | None, Form(max_length=2048)] = None,
     visibility: Annotated[str, Form()] = "private",
     remove_background_noise: Annotated[bool, Form()] = False,
-    voice_talent_consent: Annotated[bool, Form()] = False,
 ) -> EnrollResponse:
     """ElevenLabs `POST /v1/voices/add` shape alias.
 
     Field names follow the vendor: `name` → display_name, `files` →
     reference_audio (single file; multi-file IVC stitches in a follow-up).
-    `voice_id` is optional — when omitted, a slug is derived from `name`
-    so SDKs that don't expose it still work. Same handler as the canonical
-    `POST /v1/voices`.
+    `voice_id` is optional — when omitted, a slug is derived from `name`.
+
+    Per ADR-9 (native extensions on parity routes prohibited), this
+    route does NOT accept `license_kind`, `license_ref`, `consent_kind`,
+    or evidence fields. License is force-defaulted to `'user-owned'`
+    and consent to `'tenant-asserted'`; integrators who need the full
+    license + consent surface must use the native `POST /v1/voices`.
+    See docs/api/vendor-parity.md.
     """
     derived_voice_id = voice_id or _slugify_voice_id(name)
     return await _enroll_voice_impl(
@@ -755,13 +866,16 @@ async def enroll_voice_alias(
         language=language,
         gender=gender,
         style_tags=style_tags,
-        source=source,
-        license=license,
+        license_kind="user-owned",
+        consent_kind="tenant-asserted",
+        license_ref=None,
+        consent_evidence_uri=None,
+        consent_evidence_sha256=None,
+        consent_evidence_notes=None,
         description=description,
         labels=labels,
         visibility=visibility,
         remove_background_noise=remove_background_noise,
-        voice_talent_consent=voice_talent_consent,
     )
 
 

@@ -4,7 +4,8 @@ Layout on disk:
     configs/voices/<voice_id>.yaml          # manifest
     data/reference-audio/<voice_id>.wav     # reference audio (trimmed copy)
 
-Manifest schema (v0):
+Manifest schema (v2, ADR-7 + ADR-10):
+    schema_version: int     # exactly 2 in this codebase
     voice_id: str           # kebab-case, primary key
     display_name: str       # human-readable
     language: str           # ISO 639-1, "tr" default
@@ -12,8 +13,14 @@ Manifest schema (v0):
     style_tags: [str]       # ["warm", "narrative", "professional", ...]
     reference_audio: str    # filename inside reference_audio_dir
     reference_seconds: float
-    source: str             # "elevenlabs" | "voice-talent" | "user-enroll" | "synthetic"
-    license: str            # "internal-bridge" | "talent-contract:<id>" | "user-owned"
+    source: str             # ADR-10 enum: "bootstrap" | "tenant-enroll" |
+                            #              "talent-recorded" | "synthetic-from-prompt" |
+                            #              "partner-import"
+    license_kind: str       # ADR-10 enum: "example" | "synthetic" | "user-owned" |
+                            #              "talent-contract" | "public-figure" |
+                            #              "partner-licensed"
+    license_ref: str | None # polymorphic: talent_contracts.id UUID, partner URL,
+                            #              public-figure rationale, or null
     created_at: str         # ISO-8601 UTC
     created_by: str         # api_key prefix or "system"
     adapter: dict | None    # optional model adapter, e.g. {"type": "lora", "path": "..."}
@@ -63,6 +70,23 @@ def _normalize_manifest_dict(raw: dict[str, Any]) -> dict[str, Any]:
         out["style_tags"] = []
     elif isinstance(tags, str):
         out["style_tags"] = [t.strip() for t in tags.split(",") if t.strip()]
+    # ADR-10 — soft upgrade for manifests authored under the old
+    # freeform `license: <str>` shape. The new field is `license_kind`,
+    # with `license_ref` carrying any "talent-contract:<id>" suffix.
+    # Unknown legacy values fold into `user-owned` so the manifest still
+    # loads; an operator can re-pin the kind with a PATCH.
+    if "license_kind" not in out and "license" in out:
+        legacy = out.pop("license")
+        if isinstance(legacy, str) and legacy.startswith("talent-contract:"):
+            out["license_kind"] = "talent-contract"
+            out["license_ref"] = legacy.split(":", 1)[1] or None
+        elif legacy in {"example", "synthetic", "user-owned",
+                        "talent-contract", "public-figure",
+                        "partner-licensed"}:
+            out["license_kind"] = legacy
+        else:
+            out["license_kind"] = "user-owned"
+    out.setdefault("license_ref", None)
     return out
 
 
@@ -102,7 +126,8 @@ class Voice:
     reference_audio: str
     reference_seconds: float
     source: str
-    license: str
+    license_kind: str
+    license_ref: str | None
     created_at: str
     created_by: str
     schema_version: int = CURRENT_SCHEMA_VERSION
@@ -213,8 +238,9 @@ class VoiceRegistry:
         language: str = "tr",
         gender: str = "neutral",
         style_tags: list[str] | None = None,
-        source: str = "user-enroll",
-        license: str = "user-owned",
+        source: str = "tenant-enroll",
+        license_kind: str = "user-owned",
+        license_ref: str | None = None,
         created_by: str = "system",
         reference_trim_seconds: float = 15.0,
         target_sample_rate: int = 16000,
@@ -251,7 +277,8 @@ class VoiceRegistry:
                 reference_audio=ref_filename,
                 reference_seconds=duration_seconds,
                 source=source,
-                license=license,
+                license_kind=license_kind,
+                license_ref=license_ref,
                 created_at=datetime.now(timezone.utc).isoformat(),
                 created_by=created_by,
             )

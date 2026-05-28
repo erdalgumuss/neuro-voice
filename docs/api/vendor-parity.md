@@ -40,6 +40,24 @@ The native NeuroVoice API ([openapi-policy.md](openapi-policy.md)) is the canoni
 - **Native extensions on parity routes.** Parity request models have `extra="forbid"`. `lexicon_id`, `adapter_id`, `language_pack`, `eval_pin`, and other VoxCPM2-specific fields are rejected with 422. An integrator who needs these must use the native route.
 - **Tracking the vendor roadmap.** When ElevenLabs ships a new field or endpoint, we evaluate inclusion case-by-case. There is no automatic catch-up obligation.
 
+## License + consent on parity enrollment (ADR-10)
+
+The native enrollment route `POST /v1/voices` requires the integrator to declare `license_kind` and `consent_kind` explicitly (closed-list taxonomy, see [openapi-policy.md](openapi-policy.md) "Native vendor extensions" and ADR-10).
+
+The parity alias `POST /v1/voices/add` does **not** accept those fields — the request shape mirrors ElevenLabs IVC verbatim. Server-side defaults applied on every parity enrollment:
+
+| Field | Forced value | Meaning |
+| --- | --- | --- |
+| `license_kind` | `user-owned` | The tenant attests they own the voice (their employee, spokesperson, or contracted talent). |
+| `license_ref` | `null` | No reference to a NeuroVoice-side talent contract or partner agreement. |
+| `consent_kind` | `tenant-asserted` | The tenant accepts liability for consent via the API call; no consent artifact is stored in our system. |
+| `consent_evidence_uri` | `null` | None — `tenant-asserted` consent does not carry evidence. |
+| `recorded_by_kind` | `tenant` | The consent record is attributed to the calling API key. |
+
+This makes parity enrollment a one-call drop-in for ElevenLabs SDKs. Integrators who need to enroll a voice under `talent-contract`, `public-figure`, `partner-licensed`, or any `consent_kind` other than `tenant-asserted` must use the native `POST /v1/voices` directly.
+
+The `requires_verification` field in the response is `true` for parity-enrolled voices (consent is tenant-asserted only), matching ElevenLabs IVC semantics. An operator can later upgrade the consent out-of-band (recorded statement or signed contract upload via admin), which appends a new consent record and flips `requires_verification` to `false`.
+
 ## Drift control
 
 The vendor's published OpenAPI spec is pinned under [vendors/elevenlabs/openapi.yaml](../../vendors/elevenlabs/). Contract tests (`tests/contract/test_elevenlabs_parity.py`, owned by the test team) replay vendor-schema requests against our server. A schema-incompatible response fails CI.
