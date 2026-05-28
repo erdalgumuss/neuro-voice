@@ -9,8 +9,8 @@ The seed YAML lists 5 voices and the local audio file each one should be
 enrolled with. Reference files must already exist on disk. If a voice with the
 same id is already enrolled, it is left in place (idempotent).
 
-For the first voice (`neeko-v01`) we don't need to upload — the manifest
-shipped in `configs/voices/neeko-v01.yaml` already points at the on-disk
+For the first voice (`tr-warm-storyteller-v0`) we don't need to upload — the manifest
+shipped in `configs/voices/tr-warm-storyteller-v0.yaml` already points at the on-disk
 reference. The bootstrap script verifies it is reachable.
 """
 

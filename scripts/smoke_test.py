@@ -7,7 +7,7 @@ per-call timing + RTF + a final summary.
 Usage:
     python scripts/smoke_test.py --base-url http://localhost:8000 \
         --api-key dev-key-1 \
-        --voices neeko-v01 \
+        --voices tr-warm-storyteller-v0 \
         --out experiments/2026-05-24-platform-smoke
 """
 

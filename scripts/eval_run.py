@@ -5,7 +5,7 @@ Single command to produce the comparison table the audit asks for:
     PYTHONPATH=src python scripts/eval_run.py \\
         --test-set v0.1-mini \\
         --systems neurovoice elevenlabs \\
-        --neurovoice-voice neeko-v01 \\
+        --neurovoice-voice tr-warm-storyteller-v0 \\
         --elevenlabs-voice 21m00Tcm4TlvDq8ikWAM \\
         --metrics whisper_wer \\
         --output-dir experiments \\

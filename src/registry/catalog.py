@@ -45,6 +45,14 @@ def _normalize_manifest_dict(raw: dict[str, Any]) -> dict[str, Any]:
     """
     if not isinstance(raw, dict):
         raise TypeError(f"manifest root must be a mapping, got {type(raw).__name__}")
+    if "schema_version" not in raw:
+        # No backwards-compat shell in v0.x — every manifest declares
+        # the version it was authored against so future schema bumps
+        # have a sharp boundary to refuse against.
+        raise ManifestSchemaError(
+            "voice manifest is missing required `schema_version` field "
+            f"(expected {CURRENT_SCHEMA_VERSION})"
+        )
     out = dict(raw)
     for key in ("created_at",):
         v = out.get(key)
@@ -60,6 +68,16 @@ def _normalize_manifest_dict(raw: dict[str, Any]) -> dict[str, Any]:
 
 VOICE_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{1,62}[a-z0-9]$")
 ALLOWED_AUDIO_SUFFIXES = {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
+
+CURRENT_SCHEMA_VERSION = 2
+"""Voice manifest schema version handled by this codebase. v2 added
+optional `lexicon`, `watermark`, `eval_pin`, and `base_model_id` fields;
+v1 manifests (no `schema_version` key) are no longer accepted in v0.x
+since there is no backwards-compat shell to bridge them."""
+
+
+class ManifestSchemaError(ValueError):
+    """Raised when a voice manifest declares an unsupported schema_version."""
 
 
 class VoiceNotFound(LookupError):
@@ -87,8 +105,35 @@ class Voice:
     license: str
     created_at: str
     created_by: str
+    schema_version: int = CURRENT_SCHEMA_VERSION
     adapter: dict[str, Any] | None = None
     engine_params: dict[str, Any] | None = None
+    # v2 optional forward-shape fields. They sit unpopulated on bundled
+    # example voices and on freshly enrolled user voices, and get filled
+    # in by later ADRs as the production voice lifecycle wires up.
+    base_model_id: str | None = None
+    """Engine baseline this voice is pinned to (e.g. ``voxcpm2-tr-hd``).
+    NULL means "use the request-time default"; populated rows let the
+    model_id preset be tracked across catalog migrations."""
+    lexicon: dict[str, Any] | None = None
+    """Per-voice pronunciation overlay, layered on top of the language
+    pack's lexicon when the worker normalises text. Schema TBD."""
+    watermark: dict[str, Any] | None = None
+    """Inaudible audio watermark configuration. ``key_id`` references an
+    operator-managed key; the worker stamps every generated chunk."""
+    eval_pin: dict[str, Any] | None = None
+    """Snapshot of the eval baseline that certified this voice
+    (``test_set``, ``metrics``, ``evaluated_at``). Lets a regression run
+    months later compare apples to apples even after model drift."""
+
+    def __post_init__(self) -> None:
+        if self.schema_version != CURRENT_SCHEMA_VERSION:
+            raise ManifestSchemaError(
+                f"voice {self.voice_id!r} declares schema_version="
+                f"{self.schema_version}; this codebase requires "
+                f"schema_version={CURRENT_SCHEMA_VERSION}. Update the "
+                "manifest or pin an older release."
+            )
 
     def to_public(self) -> dict[str, Any]:
         d = asdict(self)

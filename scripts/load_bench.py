@@ -20,7 +20,7 @@ Usage:
     python scripts/load_bench.py \\
         --base-url http://localhost:8000 \\
         --api-key "nv_dev_..." \\
-        --voice neeko-v01 \\
+        --voice tr-warm-storyteller-v0 \\
         --concurrency 20 \\
         --duration-s 60 \\
         --hardware-label "L4-runpod" \\

@@ -20,7 +20,7 @@ Usage:
     python scripts/latency_bench.py \\
         --base-url http://localhost:8000 \\
         --api-key "nv_dev_..." \\
-        --voice neeko-v01 \\
+        --voice tr-warm-storyteller-v0 \\
         --requests 30 \\
         --concurrency 4 \\
         --hardware-label "L4-runpod" \\
