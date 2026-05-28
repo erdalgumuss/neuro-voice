@@ -1,21 +1,62 @@
-"""Turkish text frontend v0 — sentence segmentation + lightweight normalization.
+"""Multilingual text frontend — language pack dispatch.
 
-Scope of v0:
-    * Unicode NFKC + whitespace squeeze
-    * Sentence segmentation respecting Turkish apostrophe + abbreviations
-    * Number-to-Turkish words (Tr. cardinals + ordinals, up to 10^12)
-    * Common abbreviation expansion (Dr., Av., Prof., vb., Bn., TBMM, AB)
-    * Symbol expansion (%, ₺, €, $, +, =, -, /, ×)
-    * Code-mix lexicon (iPhone, Bluetooth, vb.) — extensible JSON
+Public API:
 
-Out of scope of v0 (will be filled by Faz-1 hafta 1-2 work):
-    * Phoneme-level G2P (modern multilingual models handle Turkish orthography)
-    * Morphological analysis (Zemberek)
-    * Style tag injection
+    normalize_text(text, lang="tr", **kwargs) -> str
+    segment_sentences(text, lang="tr") -> list[str]
+    number_to_words(n, lang="tr") -> str
+    get_pack(lang="tr") -> LanguagePack
+
+Today only the Turkish pack ships. Adding another language is a
+directory-add under ``src/frontend/lang_packs/<iso>/`` that exports
+``pack: LanguagePack`` — no central registration. See
+``docs/decisions/2026-05-28-multilingual-frontend.md`` for the shape
+rationale.
 """
 
-from .normalize import normalize_text
-from .numbers import number_to_turkish
-from .segment import segment_sentences
+from __future__ import annotations
 
-__all__ = ["normalize_text", "segment_sentences", "number_to_turkish"]
+import importlib
+from typing import Any
+
+from .protocol import LanguagePack
+
+_DEFAULT_LANG = "tr"
+
+
+def get_pack(lang: str = _DEFAULT_LANG) -> LanguagePack:
+    """Resolve the LanguagePack for ``lang``. Raises on unknown codes."""
+    try:
+        module = importlib.import_module(f"frontend.lang_packs.{lang}")
+    except ModuleNotFoundError as e:
+        raise ValueError(
+            f"unknown language pack {lang!r}; "
+            f"create src/frontend/lang_packs/{lang}/ exporting `pack` to add"
+        ) from e
+    pack = getattr(module, "pack", None)
+    if pack is None:
+        raise ValueError(
+            f"frontend.lang_packs.{lang} does not export `pack: LanguagePack`"
+        )
+    return pack
+
+
+def normalize_text(text: str, lang: str = _DEFAULT_LANG, **kwargs: Any) -> str:
+    return get_pack(lang).normalize_text(text, **kwargs)
+
+
+def segment_sentences(text: str, lang: str = _DEFAULT_LANG) -> list[str]:
+    return get_pack(lang).segment_sentences(text)
+
+
+def number_to_words(n: int, lang: str = _DEFAULT_LANG) -> str:
+    return get_pack(lang).number_to_words(n)
+
+
+__all__ = [
+    "LanguagePack",
+    "get_pack",
+    "normalize_text",
+    "number_to_words",
+    "segment_sentences",
+]
