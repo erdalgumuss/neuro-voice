@@ -12,12 +12,13 @@ or from app-layer validation paths.
 
 from .api_key import ApiKeyRepo
 from .audit import AuditRepo
+from .data_deletion import DataDeletionRequestRepo
 from .idempotency import IdempotencyConflict, IdempotencyRepo
 from .operator import OperatorRepo
 from .talent_contract import TalentContractRepo
 from .tenant import TenantRepo
 from .usage import UsageRepo
-from .voice import VoiceRepo
+from .voice import VoiceRepo, lifecycle_state
 from .voice_access import VoiceAccessRepo
 from .voice_consent import VoiceConsentRecordRepo
 
@@ -28,9 +29,11 @@ __all__ = [
     "VoiceAccessRepo",
     "VoiceConsentRecordRepo",
     "TalentContractRepo",
+    "DataDeletionRequestRepo",
     "UsageRepo",
     "AuditRepo",
     "OperatorRepo",
     "IdempotencyRepo",
     "IdempotencyConflict",
+    "lifecycle_state",
 ]

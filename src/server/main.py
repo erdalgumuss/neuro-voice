@@ -46,7 +46,7 @@ from fastapi import (
 # alias keeps the URL-parameter validator distinct.
 from fastapi import Path as FastapiPath
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from audio.wav import pcm16_to_wav_bytes
@@ -69,12 +69,14 @@ from registry.catalog import (
 )
 from repos import (
     AuditRepo,
+    DataDeletionRequestRepo,
     IdempotencyConflict,
     IdempotencyRepo,
     TalentContractRepo,
     UsageRepo,
     VoiceConsentRecordRepo,
     VoiceRepo,
+    lifecycle_state,
 )
 
 from .admin import admin_router
@@ -89,6 +91,8 @@ from .result_stream import (
     consume_result_stream,
 )
 from .schemas import (
+    DataDeletionRequestCreate,
+    DataDeletionRequestPublic,
     DeleteResponse,
     EnrollResponse,
     ErrorResponse,
@@ -106,6 +110,7 @@ from .schemas import (
     TTSStreamAliasRequest,
     TTSStreamRequest,
     VoiceListResponse,
+    VoiceNotSynthesizableError,
     VoicePublic,
     VoiceUpdateRequest,
 )
@@ -177,6 +182,43 @@ async def _assert_voice_accessible_or_404(
             status.HTTP_404_NOT_FOUND, detail=f"voice '{voice_id}' not found"
         )
     return voice
+
+
+async def _ensure_voice_synthesizable(voice, session: AsyncSession) -> None:
+    """Synthesis-time lifecycle + consent gate (ADR-11).
+
+    Read-only routes (GET /v1/voices/{id}) intentionally bypass this —
+    a frozen voice still surfaces in the catalog with
+    ``lifecycle_state='frozen'``. Synthesis routes call this AFTER
+    ``_assert_voice_accessible_or_404`` to confirm the voice is in a
+    usable state. Raises ``VoiceNotSynthesizableError``, mapped by the
+    global handler to HTTP 410 Gone (or WS close 1008 on the WebSocket
+    path).
+    """
+    state = lifecycle_state(voice)
+    if state != "active":
+        raise VoiceNotSynthesizableError(
+            reason=f"voice_{state.replace('-', '_')}",
+            detail=(
+                f"voice '{voice.voice_id}' is {state}; synthesis is no "
+                "longer accepted for this voice"
+            ),
+        )
+
+    # Active voice — also require an unrevoked consent record on file.
+    # This catches the case where consent was revoked but no operator
+    # has yet frozen the voice (the cascade is route-orchestrated, so
+    # there is a window where these two states drift; gate closes it).
+    latest = await VoiceConsentRecordRepo(session).latest_active(voice.id)
+    if latest is None:
+        raise VoiceNotSynthesizableError(
+            reason="voice_no_active_consent",
+            detail=(
+                f"voice '{voice.voice_id}' has no active consent on "
+                "file; synthesis is blocked until a consent record is "
+                "added"
+            ),
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -299,6 +341,21 @@ app.add_middleware(
 app.include_router(admin_router)
 
 
+# ADR-11 — map the synthesis-gate domain exception to RFC 7231's 410
+# Gone. The resource exists but is no longer usable for synthesis,
+# which is distinct from 404 (not found) and 409 (state conflict on
+# write). The shape mirrors ErrorResponse so SDKs see a uniform
+# envelope.
+@app.exception_handler(VoiceNotSynthesizableError)
+async def _voice_not_synthesizable_handler(
+    request: Request, exc: VoiceNotSynthesizableError,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_410_GONE,
+        content={"error": exc.reason, "detail": exc.detail},
+    )
+
+
 # --------------------------------------------------------------------------- #
 # /health — unauthenticated liveness (gateway only, no engine state)
 # --------------------------------------------------------------------------- #
@@ -419,6 +476,12 @@ def _voice_to_public(v, viewer_tenant_id: uuid.UUID | None = None) -> VoicePubli
         license_kind=v.license_kind,
         license_ref=v.license_ref,
         visibility=v.visibility,
+        lifecycle_state=lifecycle_state(v),
+        frozen_reason=getattr(v, "frozen_reason", None),
+        purge_after_at=(
+            v.purge_after_at.isoformat()
+            if getattr(v, "purge_after_at", None) is not None else None
+        ),
         created_at=v.created_at.isoformat(),
         created_by=created_by,
         description=getattr(v, "description", None),
@@ -970,6 +1033,137 @@ async def delete_voice(
 
 
 # --------------------------------------------------------------------------- #
+# Data deletion requests (KVKK md. 11 / GDPR art. 17 — ADR-11)
+# --------------------------------------------------------------------------- #
+def _data_deletion_request_to_public(r) -> DataDeletionRequestPublic:
+    return DataDeletionRequestPublic(
+        id=str(r.id),
+        voice_slugs=list(r.voice_slugs or []),
+        jurisdiction=r.jurisdiction,
+        status=r.status,
+        requested_at=r.requested_at.isoformat(),
+        requested_by_actor_id=(
+            str(r.requested_by_actor_id) if r.requested_by_actor_id else None
+        ),
+        reason=r.reason,
+        completed_at=r.completed_at.isoformat() if r.completed_at else None,
+        completion_notes=r.completion_notes,
+    )
+
+
+@app.post(
+    "/v1/data-deletion-requests",
+    response_model=DataDeletionRequestPublic,
+    status_code=status.HTTP_201_CREATED,
+    tags=["voices"],
+)
+async def create_data_deletion_request(
+    body: DataDeletionRequestCreate,
+    ctx: Annotated[AuthContext, Depends(require_auth("voice:write"))],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> DataDeletionRequestPublic:
+    """Tenant-initiated erasure ticket — KVKK md. 11 / GDPR art. 17.
+
+    Creates the audit ticket AND immediately freezes the named voices
+    with a 30-day purge schedule (ADR-11 default). Empty `voice_slugs`
+    expands to every voice this tenant owns. An operator then executes
+    the purge out-of-band via the admin endpoint; status updates
+    accordingly.
+    """
+    voice_repo = VoiceRepo(session, ctx.tenant_id)
+
+    if body.voice_slugs:
+        resolved = []
+        for slug in body.voice_slugs:
+            v = await voice_repo.get_owned(slug)
+            if v is None:
+                raise HTTPException(
+                    status.HTTP_404_NOT_FOUND,
+                    detail=f"voice '{slug}' not owned by this tenant",
+                )
+            resolved.append(v)
+    else:
+        # Empty list → every owned voice that isn't already a tombstone.
+        accessible = await voice_repo.list_accessible(include_deleted=False)
+        resolved = [
+            v for v in accessible
+            if v.owner_tenant_id == ctx.tenant_id and v.purged_at is None
+        ]
+
+    # Freeze + schedule purge on each non-tombstoned voice.
+    pending_count = 0
+    for v in resolved:
+        if v.purged_at is not None:
+            continue
+        await voice_repo.schedule_purge(v.id)
+        pending_count += 1
+
+    slugs_for_ticket = [v.voice_id for v in resolved]
+    ticket = await DataDeletionRequestRepo(session, ctx.tenant_id).create(
+        voice_slugs=slugs_for_ticket,
+        requested_by_actor_id=ctx.api_key_id,
+        jurisdiction=body.jurisdiction,
+        reason=body.reason,
+    )
+
+    if pending_count == 0:
+        # Nothing actionable left — either the request named only
+        # tombstones, or the tenant owned no voices. Close the ticket.
+        ticket.status = "completed"
+        ticket.completed_at = datetime.now(timezone.utc)
+        ticket.completion_notes = (
+            "no synthesizable voices remained for this request"
+        )
+    else:
+        ticket.status = "in-progress"
+    await session.flush()
+
+    await AuditRepo(session).record(
+        actor_type="api_key",
+        actor_id=ctx.api_key_id,
+        actor_label=ctx.api_key.prefix,
+        action="data_deletion.request",
+        result="success",
+        tenant_id=ctx.tenant_id,
+        target_type="tenant",
+        target_id=str(ctx.tenant_id),
+        payload={
+            "request_id": str(ticket.id),
+            "voice_count": len(slugs_for_ticket),
+            "voice_slugs": slugs_for_ticket,
+            "pending_count": pending_count,
+            "jurisdiction": body.jurisdiction,
+        },
+    )
+    await session.commit()
+    return _data_deletion_request_to_public(ticket)
+
+
+@app.get(
+    "/v1/data-deletion-requests/{request_id}",
+    response_model=DataDeletionRequestPublic,
+    tags=["voices"],
+)
+async def get_data_deletion_request(
+    request_id: uuid.UUID,
+    ctx: Annotated[AuthContext, Depends(require_auth("voice:read"))],
+    session: Annotated[AsyncSession, Depends(get_session)],
+) -> DataDeletionRequestPublic:
+    """Read the audit ticket for a previously-created deletion request.
+    Tenant-scoped: a request from another tenant returns 404 (no
+    existence leak)."""
+    ticket = await DataDeletionRequestRepo(
+        session, ctx.tenant_id,
+    ).get(request_id)
+    if ticket is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            detail=f"data deletion request '{request_id}' not found",
+        )
+    return _data_deletion_request_to_public(ticket)
+
+
+# --------------------------------------------------------------------------- #
 # Synthesis
 # --------------------------------------------------------------------------- #
 def _request_id_for(request: Request) -> uuid.UUID:
@@ -1076,6 +1270,7 @@ async def synthesize(
     db_voice = await _assert_voice_accessible_or_404(
         body.voice_id, ctx.tenant_id, session,
     )
+    await _ensure_voice_synthesizable(db_voice, session)
 
     # validate model_id early so the client gets
     # a clean 400 instead of a worker-side PoisonJob. Resolves to the
@@ -1272,6 +1467,7 @@ async def synthesize_stream(
     db_voice = await _assert_voice_accessible_or_404(
         body.voice_id, ctx.tenant_id, session,
     )
+    await _ensure_voice_synthesizable(db_voice, session)
 
     # validate model_id early (400 instead of poison).
     try:
@@ -1782,6 +1978,7 @@ async def create_tts_job(
     db_voice = await _assert_voice_accessible_or_404(
         body.voice_id, ctx.tenant_id, session,
     )
+    await _ensure_voice_synthesizable(db_voice, session)
 
     # model_id validation up front.
     try:

@@ -206,6 +206,14 @@ class VoicePublic(BaseModel):
     ]
     license_ref: str | None = None
     visibility: Literal["private", "shared", "public"] = "private"
+    # ADR-11 — derived from voices.{deleted_at, frozen_at,
+    # purge_after_at, purged_at} on the way out. Tenants can see a
+    # frozen voice in the catalog listing but synthesis returns 410.
+    lifecycle_state: Literal[
+        "active", "frozen", "purge-pending", "deleted", "purged",
+    ] = "active"
+    frozen_reason: str | None = None
+    purge_after_at: str | None = None
     created_at: str
     created_by: str
     # Vendor-parity metadata fields:
@@ -455,5 +463,71 @@ class VoiceConsentRecordPublic(BaseModel):
     recorded_by_actor_id: str | None = None
     revoked_at: str | None = None
     revoked_reason: str | None = None
+
+
+# --------------------------------------------------------------------------- #
+# Lifecycle + data deletion (ADR-11)
+# --------------------------------------------------------------------------- #
+class VoiceNotSynthesizableError(Exception):
+    """Domain exception raised by the synthesis gate.
+
+    HTTP routes map this to 410 Gone (the voice exists but is no
+    longer usable — RFC 7231). The WebSocket synthesis path maps it
+    to a close frame with code 1008 + reason string. The `reason`
+    attribute is a stable kebab/snake identifier suitable for error
+    code surfacing; `detail` carries a human-readable explanation.
+    """
+
+    def __init__(self, reason: str, detail: str) -> None:
+        super().__init__(detail)
+        self.reason = reason
+        self.detail = detail
+
+
+class DataDeletionRequestCreate(BaseModel):
+    """Tenant-side body for POST /v1/data-deletion-requests.
+
+    `voice_slugs` empty (or omitted) means "every voice this tenant
+    owns". `jurisdiction` is optional (ISO 3166-1 alpha-2 or "EU")
+    and informs operator-side handling for jurisdiction-specific
+    retention overrides (future ADR).
+    """
+    model_config = ConfigDict(protected_namespaces=())
+
+    voice_slugs: list[str] = Field(default_factory=list)
+    jurisdiction: str | None = Field(default=None, max_length=8)
+    reason: str | None = Field(default=None, max_length=2048)
+
+
+class DataDeletionRequestPublic(BaseModel):
+    """Audit ticket. Visible to the requesting tenant on the native
+    `GET /v1/data-deletion-requests/{id}` endpoint and to operators on
+    the admin inbox."""
+    id: str
+    voice_slugs: list[str]
+    jurisdiction: str | None = None
+    status: Literal["pending", "in-progress", "completed", "rejected"]
+    requested_at: str
+    requested_by_actor_id: str | None = None
+    reason: str | None = None
+    completed_at: str | None = None
+    completion_notes: str | None = None
+
+
+class VoiceFreezeRequest(BaseModel):
+    """Operator body for POST /admin/voices/{id}/freeze."""
+    reason: str = Field(min_length=1, max_length=2048)
+    # Optional purge schedule. NULL → frozen indefinitely. When set,
+    # purge_after_at = now() + purge_after_days. Cannot shorten an
+    # already-scheduled earlier purge (see VoiceRepo.freeze).
+    purge_after_days: int | None = Field(default=None, ge=0, le=3650)
+
+
+class VoicePurgeRequest(BaseModel):
+    """Operator body for POST /admin/voices/{id}/purge. Confirmation
+    field guards against accidental purge calls; the operator must
+    pass `confirm=True` for the route to actually scrub the row."""
+    confirm: bool = False
+    notes: str | None = Field(default=None, max_length=2048)
 
 

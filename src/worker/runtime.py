@@ -140,6 +140,11 @@ async def _warmup_voices_from_env(engine: BaseSynthEngine) -> None:
     from db.models import Voice
     from storage.reference_resolver import resolve_reference_uri
 
+    # ADR-11 — skip warming voices that aren't in the active lifecycle
+    # state. Importing lifecycle_state lazily keeps the worker boot
+    # path independent of the repo layer's other dependencies.
+    from repos import lifecycle_state
+
     for voice_id in voice_ids:
         try:
             async with AsyncSessionLocal() as s:
@@ -151,6 +156,12 @@ async def _warmup_voices_from_env(engine: BaseSynthEngine) -> None:
                 )).scalar_one_or_none()
             if row is None:
                 logger.warning("warmup skip: voice_id=%s not found", voice_id)
+                continue
+            if lifecycle_state(row) != "active":
+                logger.warning(
+                    "warmup skip: voice_id=%s state=%s",
+                    voice_id, lifecycle_state(row),
+                )
                 continue
             # Resolve the reference too so a stub R2 download error
             # surfaces at warmup time, not on the first request.

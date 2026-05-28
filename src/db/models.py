@@ -293,6 +293,14 @@ class Voice(Base, TimestampMixin):
     )
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
+    # ADR-11 — lifecycle columns. lifecycle_state is DERIVED in app code
+    # from these four timestamps + deleted_at; no stored enum, no
+    # Postgres GENERATED column (kept portable for SQLite-backed tests).
+    frozen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    frozen_reason: Mapped[str | None] = mapped_column(Text)
+    purge_after_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    purged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
     owner: Mapped[Tenant] = relationship(back_populates="voices")
     access_grants: Mapped[list[VoiceAccess]] = relationship(
         back_populates="voice", cascade="all, delete-orphan", passive_deletes=True,
@@ -347,6 +355,27 @@ class Voice(Base, TimestampMixin):
         Index(
             "ix_voices_release", "owner_tenant_id", "release_status",
             postgresql_where="deleted_at IS NULL",
+        ),
+        # ADR-11 lifecycle ordering invariants. Either timestamp can be
+        # independently NULL; the order check only fires when both
+        # endpoints are populated.
+        CheckConstraint(
+            "purge_after_at IS NULL OR frozen_at IS NULL "
+            "OR purge_after_at >= frozen_at",
+            name="voices_purge_after_frozen",
+        ),
+        CheckConstraint(
+            "purged_at IS NULL OR purge_after_at IS NULL "
+            "OR purged_at >= purge_after_at",
+            name="voices_purged_after_purge_after",
+        ),
+        Index(
+            "ix_voices_frozen", "frozen_at",
+            postgresql_where="frozen_at IS NOT NULL AND purged_at IS NULL",
+        ),
+        Index(
+            "ix_voices_purge_pending", "purge_after_at",
+            postgresql_where="purge_after_at IS NOT NULL AND purged_at IS NULL",
         ),
     )
 
@@ -737,4 +766,79 @@ class VoiceConsentRecord(Base):
         return (
             f"<VoiceConsentRecord voice={self.voice_id} kind={self.consent_kind} "
             f"recorded_at={self.recorded_at}>"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Data deletion requests — KVKK/GDPR Article 17 audit trail (ADR-11)
+# --------------------------------------------------------------------------- #
+# A tenant-initiated erasure ticket. Creating one DOES NOT immediately
+# delete data — it freezes the named voices and sets purge_after_at on
+# them. An operator then executes purge via the admin endpoint, which
+# scrubs reference audio + adapter weights from R2 and anonymises the
+# voice rows (tombstone state). The request row stays as a permanent
+# audit record.
+class DataDeletionRequest(Base):
+    __tablename__ = "data_deletion_requests"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        _UUIDPortable, primary_key=True, default=new_uuid,
+    )
+    # RESTRICT — a tenant with deletion requests on file cannot be
+    # hard-deleted (tenants.status='deleted' soft is the canonical
+    # lifecycle).
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        _UUIDPortable, ForeignKey("tenants.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    # Empty list = "delete every voice this tenant owns". Slugs (not
+    # FKs) so requests stay meaningful after voices are deleted/purged.
+    voice_slugs: Mapped[list[str]] = mapped_column(
+        _StringArrayPortable, nullable=False, default=list,
+    )
+    jurisdiction: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    requested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow,
+    )
+    # Polymorphic: api_keys.id (tenant-side) on creation, operators.id
+    # on operator-driven processing. No FK; mirrors ADR-10
+    # voice_consent_records.recorded_by_actor_id pattern.
+    requested_by_actor_id: Mapped[uuid.UUID | None] = mapped_column(_UUIDPortable)
+    reason: Mapped[str | None] = mapped_column(Text)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completion_notes: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending','in-progress','completed','rejected')",
+            name="data_deletion_requests_status_enum",
+        ),
+        CheckConstraint(
+            "jurisdiction IS NULL OR jurisdiction = 'EU' "
+            r"OR jurisdiction ~ '^[A-Z]{2}$'",
+            name="data_deletion_requests_jurisdiction_format",
+        ),
+        CheckConstraint(
+            "completed_at IS NULL OR completed_at >= requested_at",
+            name="data_deletion_requests_completed_after_requested",
+        ),
+        CheckConstraint(
+            "(status = 'completed' AND completed_at IS NOT NULL) "
+            "OR (status <> 'completed' AND completed_at IS NULL)",
+            name="data_deletion_requests_completed_at_consistency",
+        ),
+        Index(
+            "ix_data_deletion_pending", "status", "requested_at",
+            postgresql_where="status IN ('pending','in-progress')",
+        ),
+        Index(
+            "ix_data_deletion_tenant", "tenant_id", "requested_at",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"<DataDeletionRequest tenant={self.tenant_id} status={self.status} "
+            f"voices={len(self.voice_slugs)}>"
         )

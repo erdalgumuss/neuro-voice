@@ -40,10 +40,13 @@ from db.session import get_session
 from repos import (
     ApiKeyRepo,
     AuditRepo,
+    DataDeletionRequestRepo,
     OperatorRepo,
     TenantRepo,
     UsageRepo,
+    VoiceRepo,
 )
+from storage.r2 import get_r2_storage
 from server.security import (
     decode_operator_jwt,
     generate_api_key,
@@ -306,7 +309,7 @@ async def usage_summary(
     op = Depends(_current_operator),
     session: Annotated[AsyncSession, Depends(get_session)] = ...,
 ):
-    """Per-tenant aggregate. Inexpensive at the current scale; 
+    """Per-tenant aggregate. Inexpensive at the current scale;
     materialized view if needed."""
     tenants = await TenantRepo(session).list_active()
     out = {}
@@ -314,3 +317,283 @@ async def usage_summary(
         ur = UsageRepo(session, t.id)
         out[t.slug] = await ur.summary_last_n_days(days)
     return {"days": days, "tenants": out}
+
+
+# --------------------------------------------------------------------------- #
+# Voice lifecycle (ADR-11) — operator-only freeze / unfreeze / purge
+# --------------------------------------------------------------------------- #
+# Operator routes address voices by their internal UUID (voices.id),
+# not the tenant-scoped slug — admin context is cross-tenant. The
+# tenant-side flow goes through POST /v1/data-deletion-requests.
+def _voice_or_404(voice, voice_db_id: uuid.UUID):
+    if voice is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            detail=f"voice id='{voice_db_id}' not found",
+        )
+
+
+@admin_router.post("/voices/{voice_db_id}/freeze")
+async def admin_freeze_voice(
+    voice_db_id: uuid.UUID,
+    reason: Annotated[str, Form(min_length=1, max_length=2048)],
+    purge_after_days: Annotated[int | None, Form(ge=0, le=3650)] = None,
+    op = Depends(_current_operator),
+    session: Annotated[AsyncSession, Depends(get_session)] = ...,
+):
+    """Operator manual freeze. Idempotent — re-freezing an already-
+    frozen voice updates the reason. `purge_after_days` schedules
+    purge eligibility N days out (typically 30); omit to freeze
+    indefinitely.
+
+    Use cases: abuse / incident response, talent withdrawal, partner
+    revocation. The route does NOT cascade across tenants; operator
+    can issue one freeze per voice or script a batch loop.
+    """
+    # Use an operator-mode VoiceRepo (tenant_id arg required by the
+    # repo constructor; operator just passes a sentinel — VoiceRepo
+    # only uses the tenant filter on the *accessibility* methods, and
+    # the lifecycle methods (get_by_id, freeze, ...) operate on the
+    # voice's UUID directly). Pass uuid.uuid4() so the repo invariant
+    # holds; the value is unused by the lifecycle methods.
+    repo = VoiceRepo(session, uuid.uuid4())
+    voice = await repo.freeze(
+        voice_db_id, reason=reason, purge_after_days=purge_after_days,
+    )
+    _voice_or_404(voice, voice_db_id)
+    await AuditRepo(session).record(
+        actor_type="operator",
+        actor_id=op.id,
+        actor_label=op.email,
+        action="voice.freeze",
+        result="success",
+        tenant_id=voice.owner_tenant_id,
+        target_type="voice",
+        target_id=str(voice.id),
+        payload={
+            "voice_slug": voice.voice_id,
+            "reason": reason,
+            "purge_after_days": purge_after_days,
+        },
+    )
+    await session.commit()
+    return {
+        "voice_id": voice.voice_id,
+        "frozen_at": voice.frozen_at.isoformat() if voice.frozen_at else None,
+        "purge_after_at": (
+            voice.purge_after_at.isoformat() if voice.purge_after_at else None
+        ),
+        "reason": voice.frozen_reason,
+    }
+
+
+@admin_router.post("/voices/{voice_db_id}/unfreeze")
+async def admin_unfreeze_voice(
+    voice_db_id: uuid.UUID,
+    op = Depends(_current_operator),
+    session: Annotated[AsyncSession, Depends(get_session)] = ...,
+):
+    """Clear the frozen flag. Operator MUST verify the underlying
+    cause is cleared (e.g. a fresh consent record has landed) before
+    calling; the repo does not enforce that. Purged voices cannot be
+    unfrozen (terminal). `purge_after_at` is NOT cleared by this call
+    — once a purge is scheduled, an operator who wants to unschedule
+    it must do so via direct SQL (rare; v0 has no API for that)."""
+    repo = VoiceRepo(session, uuid.uuid4())
+    voice = await repo.unfreeze(voice_db_id)
+    _voice_or_404(voice, voice_db_id)
+    await AuditRepo(session).record(
+        actor_type="operator",
+        actor_id=op.id,
+        actor_label=op.email,
+        action="voice.unfreeze",
+        result="success",
+        tenant_id=voice.owner_tenant_id,
+        target_type="voice",
+        target_id=str(voice.id),
+        payload={"voice_slug": voice.voice_id},
+    )
+    await session.commit()
+    return {"voice_id": voice.voice_id, "frozen_at": None}
+
+
+@admin_router.post("/voices/{voice_db_id}/purge")
+async def admin_purge_voice(
+    voice_db_id: uuid.UUID,
+    confirm: Annotated[bool, Form()] = False,
+    notes: Annotated[str | None, Form(max_length=2048)] = None,
+    op = Depends(_current_operator),
+    session: Annotated[AsyncSession, Depends(get_session)] = ...,
+):
+    """Hard-delete reference audio + adapter weights from R2; anonymise
+    the row. Terminal state — the voice becomes a tombstone (kept for
+    usage_records / audit_log referential integrity). Requires
+    `confirm=true` to guard against accidental triggers.
+
+    R2 errors on individual artifact deletes are logged + counted but
+    do NOT abort the purge — operator can re-run after fixing storage
+    state; the DB row still gets scrubbed."""
+    if not confirm:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "purge requires confirm=true; this operation is "
+                "irreversible (reference audio + adapter weights "
+                "are deleted, row anonymised)"
+            ),
+        )
+    repo = VoiceRepo(session, uuid.uuid4())
+    voice = await repo.get_by_id(voice_db_id)
+    _voice_or_404(voice, voice_db_id)
+    if voice.purged_at is not None:
+        # Idempotent — return the tombstone state.
+        return {
+            "voice_id": voice.voice_id,
+            "purged_at": voice.purged_at.isoformat(),
+            "already_purged": True,
+        }
+
+    # Try R2 deletes; record what happened. Don't abort on per-object
+    # failure — the DB scrub is the irreversible part and we want to
+    # land it deterministically.
+    r2_deletes: list[dict] = []
+    storage = get_r2_storage()
+    for label, uri in (
+        ("reference", voice.reference_uri),
+        ("adapter", voice.adapter_uri),
+    ):
+        if not uri or not uri.startswith("s3://"):
+            r2_deletes.append({"label": label, "uri": uri, "skipped": True})
+            continue
+        try:
+            storage.delete(uri)
+            r2_deletes.append({"label": label, "uri": uri, "ok": True})
+        except Exception as e:  # noqa: BLE001 — log + continue
+            r2_deletes.append(
+                {"label": label, "uri": uri, "ok": False, "error": str(e)},
+            )
+
+    purged = await repo.execute_purge(voice_db_id)
+    await AuditRepo(session).record(
+        actor_type="operator",
+        actor_id=op.id,
+        actor_label=op.email,
+        action="voice.purge",
+        result="success",
+        tenant_id=purged.owner_tenant_id,
+        target_type="voice",
+        target_id=str(purged.id),
+        payload={
+            "voice_slug": purged.voice_id,
+            "notes": notes,
+            "r2_deletes": r2_deletes,
+        },
+    )
+    await session.commit()
+    return {
+        "voice_id": purged.voice_id,
+        "purged_at": purged.purged_at.isoformat(),
+        "r2_deletes": r2_deletes,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Data deletion request operator inbox (ADR-11)
+# --------------------------------------------------------------------------- #
+@admin_router.get("/data-deletion-requests")
+async def admin_list_deletion_requests(
+    op = Depends(_current_operator),
+    session: Annotated[AsyncSession, Depends(get_session)] = ...,
+):
+    """Pending + in-progress deletion requests across all tenants,
+    oldest first. Operator inbox for KVKK md. 11 / GDPR art. 17
+    fulfillment."""
+    tickets = await DataDeletionRequestRepo.as_operator(session).list_pending()
+    return {
+        "requests": [
+            {
+                "id": str(r.id),
+                "tenant_id": str(r.tenant_id),
+                "voice_slugs": list(r.voice_slugs or []),
+                "jurisdiction": r.jurisdiction,
+                "status": r.status,
+                "requested_at": r.requested_at.isoformat(),
+                "reason": r.reason,
+            }
+            for r in tickets
+        ],
+    }
+
+
+@admin_router.post("/data-deletion-requests/{request_id}/complete")
+async def admin_complete_deletion_request(
+    request_id: uuid.UUID,
+    notes: Annotated[str | None, Form(max_length=2048)] = None,
+    op = Depends(_current_operator),
+    session: Annotated[AsyncSession, Depends(get_session)] = ...,
+):
+    """Mark the deletion request as completed. Operator MUST have
+    already executed purge on the named voices via
+    POST /admin/voices/{id}/purge — this endpoint only updates the
+    audit ticket. The split keeps the destructive R2 + DB action
+    separate from the bookkeeping mutation."""
+    ticket = await DataDeletionRequestRepo.as_operator(
+        session,
+    ).mark_completed(request_id, notes=notes)
+    if ticket is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            detail=f"data deletion request '{request_id}' not found",
+        )
+    await AuditRepo(session).record(
+        actor_type="operator",
+        actor_id=op.id,
+        actor_label=op.email,
+        action="data_deletion.complete",
+        result="success",
+        tenant_id=ticket.tenant_id,
+        target_type="data_deletion_request",
+        target_id=str(ticket.id),
+        payload={"notes": notes},
+    )
+    await session.commit()
+    return {
+        "id": str(ticket.id),
+        "status": ticket.status,
+        "completed_at": (
+            ticket.completed_at.isoformat() if ticket.completed_at else None
+        ),
+    }
+
+
+@admin_router.post("/data-deletion-requests/{request_id}/reject")
+async def admin_reject_deletion_request(
+    request_id: uuid.UUID,
+    reason: Annotated[str, Form(min_length=1, max_length=2048)],
+    op = Depends(_current_operator),
+    session: Annotated[AsyncSession, Depends(get_session)] = ...,
+):
+    """Reject a deletion request — e.g. legal hold, retention
+    obligation, dispute under review. Reason is mandatory and is
+    captured in completion_notes for audit."""
+    ticket = await DataDeletionRequestRepo.as_operator(
+        session,
+    ).mark_rejected(request_id, reason=reason)
+    if ticket is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            detail=f"data deletion request '{request_id}' not found",
+        )
+    await AuditRepo(session).record(
+        actor_type="operator",
+        actor_id=op.id,
+        actor_label=op.email,
+        action="data_deletion.reject",
+        result="success",
+        tenant_id=ticket.tenant_id,
+        target_type="data_deletion_request",
+        target_id=str(ticket.id),
+        payload={"reason": reason},
+    )
+    await session.commit()
+    return {"id": str(ticket.id), "status": ticket.status}

@@ -74,7 +74,13 @@ from fastapi import HTTPException, WebSocket, WebSocketDisconnect, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from observability import TTS_REQUESTS
-from repos import AuditRepo, IdempotencyRepo, VoiceRepo
+from repos import (
+    AuditRepo,
+    IdempotencyRepo,
+    VoiceConsentRecordRepo,
+    VoiceRepo,
+    lifecycle_state,
+)
 
 from .auth import authenticate_bearer
 from .config import settings
@@ -493,6 +499,32 @@ async def stream_input_endpoint(
                 str(auth_ctx.tenant_id), "unknown", "error",
             )
             await websocket.close(code=1008, reason="voice not found")
+            return
+
+        # ADR-11 — lifecycle + active-consent gate (parallel of the
+        # HTTP `_ensure_voice_synthesizable` helper). Frozen / pending-
+        # purge / purged voices close with 1008 + a domain-specific
+        # reason string. RFC 6455 reason length cap is 123 bytes; keep
+        # the reason short.
+        ls = lifecycle_state(db_voice)
+        if ls != "active":
+            _emit_tts_request_metric(
+                str(auth_ctx.tenant_id), db_voice.voice_id, "error",
+            )
+            await websocket.close(
+                code=1008, reason=f"voice {ls}",
+            )
+            return
+        latest_consent = await VoiceConsentRecordRepo(
+            ws_session,
+        ).latest_active(db_voice.id)
+        if latest_consent is None:
+            _emit_tts_request_metric(
+                str(auth_ctx.tenant_id), db_voice.voice_id, "error",
+            )
+            await websocket.close(
+                code=1008, reason="voice no active consent",
+            )
             return
 
         await websocket.accept()
