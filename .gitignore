@@ -10,6 +10,7 @@ venv/
 .env
 .env.*
 
+old_tests/
 # Data — ses dosyaları ve model ağırlıkları repo'ya girmez
 data/raw/*
 !data/raw/.gitkeep
