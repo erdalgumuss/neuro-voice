@@ -1,4 +1,4 @@
-"""Operator JWT (HS256 v1, RS256 + rotation Faz D).
+"""Operator JWT (HS256 v1, RS256 + rotation ).
 
 Per docs/architecture/auth-multi-tenant.md §2:
     - access token TTL: 1 hour
@@ -18,7 +18,7 @@ import jwt
 
 ACCESS_TTL_SECONDS = 60 * 60          # 1h
 REFRESH_TTL_SECONDS = 60 * 60 * 24 * 7  # 7d
-ISSUER = "nqai-voice"
+ISSUER = "neurovoice"
 ALGORITHM = "HS256"
 
 
@@ -42,10 +42,10 @@ class OperatorClaims:
 
 
 def _signing_key() -> str:
-    key = os.environ.get("NQAI_JWT_SECRET")
+    key = os.environ.get("NEUROVOICE_JWT_SECRET")
     if not key or len(key) < 32:
         raise RuntimeError(
-            "NQAI_JWT_SECRET must be set and at least 32 chars. "
+            "NEUROVOICE_JWT_SECRET must be set and at least 32 chars. "
             "Generate via: python -c \"import secrets; print(secrets.token_urlsafe(48))\""
         )
     return key

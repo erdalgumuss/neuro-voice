@@ -1,4 +1,4 @@
-"""NQAI Voice observability package.
+"""NeuroVoice observability package.
 
 Public surface re-exported from :mod:`observability.metrics`. Import sites
 should target the package root, not the submodule, so we can later swap the

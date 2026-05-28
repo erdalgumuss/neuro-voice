@@ -167,7 +167,7 @@ class IdempotencyRepo:
         row.status = "complete"
         if response_uri is not None:
             row.response_uri = response_uri
-        # Faz B.5 Dalga 3.2 — only write the column when the worker
+        # only write the column when the worker
         # actually computed alignment (long-form path). Shorter jobs
         # leave it NULL so the response payload stays small.
         if sentence_alignment is not None:

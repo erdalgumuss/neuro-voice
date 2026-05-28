@@ -1,4 +1,4 @@
-"""WebSocket input-streaming TTS — Faz B.5 Dalga 3.1.
+"""WebSocket input-streaming TTS —  .
 
 Endpoint
 --------
@@ -19,9 +19,9 @@ implement that pattern can flip base URLs and keep working:
          "audio_format": "pcm16", "seed": 42,
          "previous_text": "...", "pronunciation_dict": {...}}``
     * Append text:
-      ``{"text": "Merhaba "}``
+      ``{"text": "Hello "}``
     * Append + flush:
-      ``{"text": " son cümle.", "flush": true}``
+      ``{"text": "world.", "flush": true}``
     * Force flush (no new text):
       ``{"flush": true}``
     * Close:
@@ -30,10 +30,10 @@ implement that pattern can flip base URLs and keep working:
 * Outbound messages (JSON):
 
     * Audio chunk:
-      ``{"audio": "<base64 pcm16>", "alignment": {"text": "İlk cümle.",
+      ``{"audio": "<base64 pcm16>", "alignment": {"text": "First sentence.",
         "seq": 0}, "audio_format": "pcm16", "sample_rate": 48000}``
     * Sentence boundary:
-      ``{"event": "sentence_end", "seq": 0, "text": "İlk cümle."}``
+      ``{"event": "sentence_end", "seq": 0, "text": "First sentence."}``
     * Error:
       ``{"event": "error", "code": "voice_not_found", "detail": "..."}``
     * Done:
@@ -83,7 +83,7 @@ from .queue import TtsJobPayload, TtsJobQueue
 from .result_stream import ResultStreamTimeout, consume_result_stream
 from .schemas import VoiceSettings, _validate_pronunciation_dict
 
-logger = logging.getLogger("nqai_voice.server.ws")
+logger = logging.getLogger("neurovoice.server.ws")
 
 # Buffer floor: never flush an utterance shorter than this without an
 # explicit `flush=true`. Stops a noisy stream of single-char appends
@@ -111,9 +111,9 @@ _SENTENCE_END = re.compile(r"[.!?](?=\s|$)")
 
 
 def _emit_tts_request_metric(tenant: str, voice: str, st: str) -> None:
-    """Faz B.5 hotfix — bump `TTS_REQUESTS` with the correct labelnames.
+    """ hotfix — bump `TTS_REQUESTS` with the correct labelnames.
 
-    The Dalga 3.1 commit used the wrong label keys here (`endpoint=...`
+    The  commit used the wrong label keys here (`endpoint=...`
     instead of the real `(tenant, voice, status)`) which made the
     `prometheus_client` call raise ValueError, swallowed by
     `contextlib.suppress(Exception)`. The metric never incremented on
@@ -278,7 +278,7 @@ async def _flush_segment(
     unchanged. Idempotency is reserved server-side because the client
     can't realistically supply a stable key for partial-text flushes.
 
-    Faz B.5 hotfix (2026-05-25 audit): three admission gates kick in
+     hotfix (2026-05-25 audit): three admission gates kick in
     BEFORE the XADD so the WS surface behaves identically to HTTP:
 
       1. **Per-segment max_chars** — the segment must not exceed
@@ -412,7 +412,7 @@ async def _flush_segment(
     # After a clean segment finish, treat its text as `previous_text`
     # for the next segment so prosody hints carry forward without the
     # client having to re-send. Forward-compat: engine ignores it today
-    # (Dalga 2.6 leaves previous_text/next_text as no-ops) but the
+    # ( leaves previous_text/next_text as no-ops) but the
     # protocol shape is right when engine support lands.
     state.previous_text = segment
 
@@ -451,7 +451,7 @@ async def stream_input_endpoint(
     # so a bad bearer / missing voice closes with a sane reason.
     async with session_factory() as ws_session:
         # auth runs the same DB-backed pipeline as HTTP — we get the
-        # tenant + scope without inventing a parallel auth path. Faz B.5
+        # tenant + scope without inventing a parallel auth path. 
         # hotfix (2026-05-25): preserve the 401-vs-403 distinction the
         # HTTP path makes — `authenticate_bearer` raises HTTPException
         # with the right status_code, we just need to map it through.
@@ -496,21 +496,20 @@ async def stream_input_endpoint(
             return
 
         await websocket.accept()
-        # Faz B.5 hotfix — Dalga 3.1 sürümü `TTS_REQUESTS.labels(
-        # endpoint=..., status=...)` ile yanlış label kullanıyor ve
-        # `contextlib.suppress(Exception)` sayesinde silent fail ediyordu;
-        # WS happy-path SLO sayaç'ından düşüyordu. Düzelttik: gerçek
-        # labelnames (tenant, voice, status) ile sayalım.
+        # Earlier revisions called `TTS_REQUESTS.labels(endpoint=..., status=...)`
+        # with the wrong label set, and `contextlib.suppress(Exception)` silenced
+        # the resulting ValueError — so the WS happy-path was missing from the
+        # SLO counter. Count it with the real labelnames (tenant, voice, status).
         _emit_tts_request_metric(
             str(auth_ctx.tenant_id), db_voice.voice_id, "success",
         )
 
         state = _WsState()
         # Most-recent app label wins; clients can set it via header on the
-        # upgrade or `X-NQAI-App` in the initial config message.
+        # upgrade or `X-NV-App` in the initial config message.
         app_label = (
-            websocket.headers.get("x-nqai-app")
-            or websocket.headers.get("X-NQAI-App")
+            websocket.headers.get("x-nv-app")
+            or websocket.headers.get("X-NV-App")
         )
 
         # ---------- Inbound loop ----------------------------------------

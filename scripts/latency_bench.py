@@ -1,4 +1,4 @@
-"""Real-engine latency benchmark for NQAI Voice TTS (Faz C v1 item 2).
+"""Real-engine latency benchmark for NeuroVoice TTS.
 
 Drives N concurrent `/v1/tts/stream` calls against a running gateway,
 captures client-observed time-to-first-byte + total wall time per
@@ -19,14 +19,14 @@ Usage:
 
     python scripts/latency_bench.py \\
         --base-url http://localhost:8000 \\
-        --api-key "nqai_dev_..." \\
+        --api-key "nv_dev_..." \\
         --voice neeko-v01 \\
         --requests 30 \\
         --concurrency 4 \\
         --hardware-label "L4-runpod" \\
         --out experiments/2026-XX-XX-latency-bench
 
-Add ``--db-url postgresql+asyncpg://...`` (or set ``NQAI_DATABASE_URL``)
+Add ``--db-url postgresql+asyncpg://...`` (or set ``NEUROVOICE_DATABASE_URL``)
 to also pull the worker-side waterfall from Postgres after the run.
 Without it the report contains client-observed numbers only.
 
@@ -305,7 +305,7 @@ def _compute_percentiles(samples: list[CallSample]) -> dict[str, dict[str, float
 
 def _format_markdown(summary: RunSummary) -> str:
     lines: list[str] = []
-    lines.append(f"# NQAI Voice latency benchmark — {summary.hardware_label}")
+    lines.append(f"# NeuroVoice latency benchmark — {summary.hardware_label}")
     lines.append("")
     lines.append(f"- **Started:** {summary.started_at}")
     lines.append(f"- **Finished:** {summary.finished_at}")
@@ -382,10 +382,10 @@ async def _amain(args: argparse.Namespace) -> int:
     success = sum(1 for s in samples if s.ok)
 
     notes: list[str] = []
-    if args.db_url or os.environ.get("NQAI_DATABASE_URL"):
-        # Set NQAI_DATABASE_URL via env so db.models loads cleanly.
-        db_url = args.db_url or os.environ["NQAI_DATABASE_URL"]
-        os.environ.setdefault("NQAI_DATABASE_URL", db_url)
+    if args.db_url or os.environ.get("NEUROVOICE_DATABASE_URL"):
+        # Set NEUROVOICE_DATABASE_URL via env so db.models loads cleanly.
+        db_url = args.db_url or os.environ["NEUROVOICE_DATABASE_URL"]
+        os.environ.setdefault("NEUROVOICE_DATABASE_URL", db_url)
         # Give the worker pipeline a moment to commit usage rows before
         # we query. The worker commits BEFORE publishing final, so by
         # the time the client sees end-of-stream the row should already
@@ -398,7 +398,7 @@ async def _amain(args: argparse.Namespace) -> int:
         )
     else:
         notes.append(
-            "No --db-url / NQAI_DATABASE_URL — waterfall columns are NULL. "
+            "No --db-url / NEUROVOICE_DATABASE_URL — waterfall columns are NULL. "
             "Client-side first-byte / total are still populated."
         )
 
@@ -456,7 +456,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--db-url",
         default=None,
-        help="SQLAlchemy async DB URL. Falls back to NQAI_DATABASE_URL env var.",
+        help="SQLAlchemy async DB URL. Falls back to NEUROVOICE_DATABASE_URL env var.",
     )
     p.add_argument(
         "--db-settle-s",

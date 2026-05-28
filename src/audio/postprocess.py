@@ -38,7 +38,7 @@ def apply_speed(
     Linear interp is voice-grade for the schema-bounded 0.7–1.2x
     range — pitch drifts slightly but acoustically the result is what
     ElevenLabs/MiniMax users expect from a `speed` knob. For
-    pitch-preserving time stretch see Dalga 2.6 (librosa /
+    pitch-preserving time stretch see  (librosa /
     rubberband — adds a real dep, deferred until measured demand).
 
     Empty input → empty output. Engine-yielded chunks may be empty in
@@ -242,7 +242,7 @@ def apply_voice_settings(
 ) -> bytes:
     """Apply all PCM-side transforms from a voice_settings dict in
     one call. Currently only `speed`; other fields (pitch, loudness)
-    are documented hooks for Dalga 2.6.
+    are documented hooks for .
 
     Pipeline order (matters):
       1. DC-offset removal — center the buffer around zero so the

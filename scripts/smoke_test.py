@@ -1,4 +1,4 @@
-"""End-to-end smoke test against a running nqai-voice server.
+"""End-to-end smoke test against a running neurovoice server.
 
 Synthesizes the 10-sentence mini eval set with every enrolled voice, writes
 WAVs into experiments/<date>-platform-smoke/output/<voice_id>/ and prints
@@ -118,8 +118,8 @@ def main(argv: list[str] | None = None) -> int:
                 wav_bytes = resp.content
                 out_path = v_out / f"{sid}_{cat}.wav"
                 out_path.write_bytes(wav_bytes)
-                rtf_hdr = resp.headers.get("X-NQAI-RTF", "n/a")
-                dur_hdr = resp.headers.get("X-NQAI-Duration-Seconds", "n/a")
+                rtf_hdr = resp.headers.get("X-NV-RTF", "n/a")
+                dur_hdr = resp.headers.get("X-NV-Duration-Seconds", "n/a")
                 print(f"  [{vid}] {sid} {cat:12s} {elapsed:.2f}s call · dur={dur_hdr}s · server-RTF={rtf_hdr}")
                 per_voice.append({
                     "id": sid, "cat": cat, "text": text, "ok": True,

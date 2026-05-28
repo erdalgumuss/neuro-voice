@@ -1,7 +1,7 @@
 """VoiceAccessRepo — explicit cross-tenant grants for shared voices.
 
 Refactor R (2026-05-24): admin-operator side of the voice access model.
-Used by future `POST /v1/voices/{id}/share` and admin UI flows (Faz B+);
+Used by future `POST /v1/voices/{id}/share` and admin UI flows ;
 gateway request path does not write here — only reads via VoiceRepo's
 joined accessibility query.
 

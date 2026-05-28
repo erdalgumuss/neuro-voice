@@ -5,7 +5,7 @@
 # discovery (Kubernetes, Consul) instead of static configs.
 #
 # The gateway exposes /metrics on the same port as the FastAPI app.
-# Each worker exposes /metrics on NQAI_WORKER_METRICS_PORT (default 9100).
+# Each worker exposes /metrics on NEUROVOICE_WORKER_METRICS_PORT (default 9100).
 
 global:
   scrape_interval: 30s
@@ -15,20 +15,20 @@ rule_files:
   - "alerts.yml"
 
 scrape_configs:
-  - job_name: nqai-voice-gateway
+  - job_name: neurovoice-gateway
     metrics_path: /metrics
     static_configs:
       - targets: ["gateway:8000"]
         labels:
-          service: nqai-voice
+          service: neurovoice
           component: gateway
 
-  - job_name: nqai-voice-worker
+  - job_name: neurovoice-worker
     metrics_path: /metrics
     static_configs:
       - targets: ["worker:9100"]
         labels:
-          service: nqai-voice
+          service: neurovoice
           component: worker
     # prometheus_client.start_http_server serves the registry on any
     # path (including /metrics) so the scrape works either way; we use

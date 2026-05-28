@@ -3,13 +3,13 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "nqai-voice"
+name = "neurovoice"
 version = "0.2.0"
-description = "NQAI Türkçe TTS platformu — VoxCPM2 üstüne voice catalog + streaming API"
+description = "NeuroVoice — multilingual TTS API platform (VoxCPM2 base + language/character LoRA adapters)"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
 license = { text = "Proprietary" }
-authors = [{ name = "NeuroQubit / NQAI" }]
+authors = [{ name = "NeuroQubit" }]
 
 dependencies = [
     # HTTP framework + ASGI
@@ -52,11 +52,11 @@ dependencies = [
     "soundfile>=0.12",
     "librosa>=0.11",
 
-    # Model runtime (worker process; gateway doesn't need these but we keep
-    # them in the umbrella package while the split is fresh — Faz B'de
-    # ayrı `nqai-voice-worker` paketine taşınır)
+    # Model runtime (worker process; gateway doesn't strictly need these
+    # but the umbrella package keeps them until the worker is split into
+    # its own distribution).
     #
-    # MLOps PR #1 (2026-05-25) — minor-pinned so `pip install -U` cannot
+    # Minor-pinned so `pip install -U` cannot
     # silently jump a major torch version under the model. cuDNN /
     # transformers / voxcpm changes between minors can shift inference
     # outputs even with the same seed; same-minor patch upgrades are
@@ -91,8 +91,8 @@ client = [
 ]
 
 [project.scripts]
-nqai-voice-server = "server.main:run"
-nqai-voice-smoke = "scripts.smoke_test:main"
+neurovoice-server = "server.main:run"
+neurovoice-smoke = "scripts.smoke_test:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

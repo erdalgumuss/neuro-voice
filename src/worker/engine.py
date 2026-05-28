@@ -1,17 +1,18 @@
 """Synth engine — VoxCPM2 backend with per-voice reference audio.
 
-VoxCPM2 (Apache 2.0, OpenBMB) is the canonical base model for NQAI Voice v0.1.
+VoxCPM2 (Apache 2.0, OpenBMB) is the canonical base model for NeuroVoice v0.1.
 The engine is shaped as a `BaseSynthEngine` protocol so future swaps (e.g. a
-Türkçe-SFT'd checkpoint or a tenant-specific LoRA) drop in without touching
+language-SFT'd checkpoint or a tenant-specific LoRA) drop in without touching
 the API layer.
 
 Key VoxCPM2 traits we lean on:
     * Native chunk streaming via `model.generate_streaming(...)` — no need
       to glue per-sentence pieces ourselves, the model already paces it.
     * Voice cloning via `reference_wav_path` — 16 kHz mono WAV preferred.
-    * Built-in TN (`normalize=True`) we **disable**, because our Türkçe
-      frontend (`src/frontend/`) handles abbreviations, numerals, code-mix
-      and apostrophe suffixes more reliably for our dar domain.
+    * Built-in TN (`normalize=True`) we **disable**, because our
+      language-pluggable frontend (`src/frontend/`) handles
+      abbreviations, numerals, code-mix, and apostrophe suffixes more
+      reliably for the languages we target.
     * 48 kHz output via AudioVAE V2.
 """
 
@@ -33,7 +34,7 @@ import numpy as np
 from frontend import normalize_text, segment_sentences
 from registry import Voice
 
-logger = logging.getLogger("nqai_voice.engine")
+logger = logging.getLogger("neurovoice.engine")
 
 
 @dataclass
@@ -110,8 +111,8 @@ DEFAULT_SAMPLE_RATE = 48000
 # (base + adapter) consumes ~4 GB VRAM on bfloat16; 3 active adapters fit
 # on an L4 (24 GB) with headroom for batched inference. Adapters beyond
 # this threshold get evicted in least-recently-used order. Override via
-# NQAI_LORA_CACHE_SIZE if you serve more voices on a single worker.
-DEFAULT_LORA_CACHE_SIZE = int(os.environ.get("NQAI_LORA_CACHE_SIZE", "3"))
+# NEUROVOICE_LORA_CACHE_SIZE if you serve more voices on a single worker.
+DEFAULT_LORA_CACHE_SIZE = int(os.environ.get("NEUROVOICE_LORA_CACHE_SIZE", "3"))
 
 
 @dataclass(frozen=True)
@@ -200,7 +201,7 @@ class VoxCPM2Engine:
         if hf_revision in (None, "", "main"):
             logger.warning(
                 "VoxCPM2 model_id=%s loaded WITHOUT a pinned hf_revision "
-                "(value=%r). Set NQAI_MODEL_HF_REVISION to a commit SHA "
+                "(value=%r). Set NEUROVOICE_MODEL_HF_REVISION to a commit SHA "
                 "for reproducible production deploys.",
                 model_id, hf_revision,
             )
@@ -217,7 +218,7 @@ class VoxCPM2Engine:
         )
         # LRU: most recent at the end. dict-of-models, bounded by cache_size.
         self._models: OrderedDict[VoxCPM2Engine._CacheKey, object] = OrderedDict()
-        self._evictions_total = 0  # exposed for tests + metrics (Faz C)
+        self._evictions_total = 0  # exposed for tests + metrics 
         self._model = None  # compatibility hook used by /health and old tests
         self._load_lock = threading.Lock()
         self._inference_lock = threading.Lock()
@@ -243,12 +244,12 @@ class VoxCPM2Engine:
         self._load()
 
     def warmup_voice(self, voice: Voice) -> None:
-        """Faz B.5 Dalga 1.3 — eager-load a specific voice's adapter
+        """eager-load a specific voice's adapter
         into the cache so the FIRST inference for that voice doesn't
         pay cold-load latency.
 
         Called by the worker boot path for every voice listed in
-        `NQAI_WORKER_WARMUP_VOICES`. The cold-load metric fires from
+        `NEUROVOICE_WORKER_WARMUP_VOICES`. The cold-load metric fires from
         inside `_model_for_adapter` so warmups show up in the same
         histogram as in-band cache misses — operators see both."""
         self._load()  # base model first
@@ -269,7 +270,7 @@ class VoxCPM2Engine:
         evicted_key, evicted_model = self._models.popitem(last=False)
         self._evictions_total += 1
         # MLOps PR #4 (A.6) — global eviction counter for Prometheus.
-        # Frequent evictions signal NQAI_LORA_CACHE_SIZE is too small
+        # Frequent evictions signal NEUROVOICE_LORA_CACHE_SIZE is too small
         # for the active voice set. Best-effort: metric failure must
         # not block the eviction itself (cache integrity > telemetry).
         try:
@@ -408,7 +409,7 @@ class VoxCPM2Engine:
                 self._inference_timesteps,
                 adapter_label,
             )
-            # Faz B.5 Dalga 1.3 — cold-load metric. Label voice=_base_
+            # cold-load metric. Label voice=_base_
             # for the no-voice warmup path so the series stays bounded
             # (catalog voice slugs + "_base_" is the full label domain).
             try:
@@ -509,7 +510,7 @@ class VoxCPM2Engine:
         preset at the worker pipeline). See `server.models` for the
         registry.
 
-        `request_meta` (Faz B.5 Dalga 2.6) bundles vendor-parity per-
+        `request_meta` bundles vendor-parity per-
         request hints that aren't engine knobs:
           * `seed`              — best-effort torch RNG seed
           * `pronunciation_dict`— per-request Turkish-frontend overrides

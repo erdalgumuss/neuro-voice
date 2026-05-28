@@ -34,10 +34,10 @@ import os
 import time
 from dataclasses import dataclass
 
-logger = logging.getLogger("nqai_voice.server.heartbeat")
+logger = logging.getLogger("neurovoice.server.heartbeat")
 
 DEFAULT_STALE_MS = 5_000
-DEFAULT_PREFIX = "nqai.worker.heartbeat"
+DEFAULT_PREFIX = "neurovoice.worker.heartbeat"
 _SCAN_COUNT = 100
 
 
@@ -137,10 +137,10 @@ async def read_cluster_capacity(
     Args:
         redis: ``redis.asyncio.Redis`` (real or fakeredis).
         stale_ms: heartbeats older than this many ms are dropped.
-            Defaults to env ``NQAI_GATEWAY_HEARTBEAT_STALE_MS`` or 5000.
+            Defaults to env ``NEUROVOICE_GATEWAY_HEARTBEAT_STALE_MS`` or 5000.
         key_prefix: heartbeat key prefix (must match worker side).
-            Defaults to env ``NQAI_WORKER_HEARTBEAT_PREFIX`` or
-            ``nqai.worker.heartbeat``.
+            Defaults to env ``NEUROVOICE_WORKER_HEARTBEAT_PREFIX`` or
+            ``neurovoice.worker.heartbeat``.
 
     Returns:
         ClusterCapacity. ``worker_count == 0`` signals the caller to
@@ -153,12 +153,12 @@ async def read_cluster_capacity(
     threshold = (
         stale_ms
         if stale_ms is not None
-        else _env_int("NQAI_GATEWAY_HEARTBEAT_STALE_MS", DEFAULT_STALE_MS)
+        else _env_int("NEUROVOICE_GATEWAY_HEARTBEAT_STALE_MS", DEFAULT_STALE_MS)
     )
     prefix = (
         key_prefix
         if key_prefix is not None
-        else _env_str("NQAI_WORKER_HEARTBEAT_PREFIX", DEFAULT_PREFIX)
+        else _env_str("NEUROVOICE_WORKER_HEARTBEAT_PREFIX", DEFAULT_PREFIX)
     )
     match = f"{prefix}.*"
     now = _now_ms()

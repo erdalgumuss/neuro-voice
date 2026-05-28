@@ -1,13 +1,13 @@
 """TTS job queue — Redis Streams wrapper.
 
 The gateway enqueues TtsJobPayload messages on a Redis Stream; GPU
-workers (Faz B+, src/worker/) consume via XREADGROUP and ack with XACK.
+workers ( src/worker/) consume via XREADGROUP and ack with XACK.
 This module is the gateway-side surface — no consumer logic lives here.
 
 Stream layout:
-    nqai.tts.jobs               primary job queue
-    nqai.tts.jobs.dlq           Faz B+: poisoned messages after N retries
-    nqai.tts.results.<rid>      per-request result chunk channel (TTL 600s)
+    neurovoice.tts.jobs               primary job queue
+    neurovoice.tts.jobs.dlq           poisoned messages after N retries
+    neurovoice.tts.results.<rid>      per-request result chunk channel (TTL 600s)
 
 Each XADD entry on the job stream carries a JSON-encoded TtsJobPayload.
 Workers parse, run inference, and XADD chunks back onto the per-request
@@ -35,14 +35,14 @@ from typing import Any
 
 from redis.asyncio import Redis
 
-logger = logging.getLogger("nqai_voice.queue")
+logger = logging.getLogger("neurovoice.queue")
 
-DEFAULT_STREAM = "nqai.tts.jobs"
-DEFAULT_DLQ_STREAM = "nqai.tts.jobs.dlq"
+DEFAULT_STREAM = "neurovoice.tts.jobs"
+DEFAULT_DLQ_STREAM = "neurovoice.tts.jobs.dlq"
 DEFAULT_CONSUMER_GROUP = "tts-workers"
 DEFAULT_MAXLEN = 10_000  # XADD MAXLEN ~ trims the stream to this approx size
 
-RESULTS_STREAM_PREFIX = "nqai.tts.results."
+RESULTS_STREAM_PREFIX = "neurovoice.tts.results."
 DEFAULT_RESULTS_TTL_SECONDS = 600  # safety net if gateway never DELs
 
 
@@ -70,17 +70,17 @@ class TtsJobPayload:
     text: str
     language: str = "tr"
     audio_format: str = "wav"
-    # Faz B.5 Dalga 1.2 — preset knob, resolved against server.models
+    # preset knob, resolved against server.models
     # at worker pickup. None = registry default.
     model_id: str | None = None
-    # Faz B.5 Dalga 2.1 — per-request voice tuning (stability,
+    # per-request voice tuning (stability,
     # similarity_boost, style, use_speaker_boost, speed, pitch). Dict
     # rather than VoiceSettings dataclass keeps the wire format JSON-
     # friendly without a forward-references import dance. Schema is
     # validated by pydantic on the gateway before reaching here.
     voice_settings: dict[str, Any] | None = None
     params: dict[str, Any] | None = None  # cfg_value, inference_timesteps overrides
-    # Faz B.5 Dalga 2.6 — vendor-parity context / determinism / pronunciation
+    # vendor-parity context / determinism / pronunciation
     # surface. See `src/server/schemas.py:TTSRequest` docstring for the field
     # semantics; the wire format keeps them as plain JSON-friendly types so
     # decode is symmetric with the gateway request body shape.
@@ -88,8 +88,8 @@ class TtsJobPayload:
     previous_text: str | None = None
     next_text: str | None = None
     pronunciation_dict: dict[str, str] | None = None
-    app_label: str | None = None  # product attribution from X-NQAI-App header
-    callback_url: str | None = None  # Faz B+: server-to-server completion hook
+    app_label: str | None = None  # product attribution from X-NV-App header
+    callback_url: str | None = None  # server-to-server completion hook
     # `attempt` previously lived here as a job-level field but was never
     # read by any producer or consumer (audit L2 medium 2026-05-25 +
     # audit L3 drift). Retry authority is Redis PEL `times_delivered`
@@ -242,8 +242,8 @@ class TtsJobQueue:
 
     @property
     def redis(self) -> Redis:
-        """Underlying Redis client. Used by Faz C heartbeat + /metrics gauges
-        to issue SCAN/HGETALL on `nqai.worker.heartbeat.*` keys."""
+        """Underlying Redis client. Used by  heartbeat + /metrics gauges
+        to issue SCAN/HGETALL on `neurovoice.worker.heartbeat.*` keys."""
         return self._redis
 
     async def submit(self, job: TtsJobPayload) -> str:

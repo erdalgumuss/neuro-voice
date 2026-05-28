@@ -8,17 +8,17 @@ round-trip / repository contract tests. Integration tests that need
 real Postgres semantics (RLS, advisory locks, JSONB ops) use
 testcontainers and call `get_engine()` directly with a temp DSN.
 
-Pool sizing (Faz C v1 item 4)
+Pool sizing
 =============================
 
 Two distinct knobs:
 
-1. **SQLAlchemy pool** (`NQAI_DB_POOL_SIZE` + `NQAI_DB_MAX_OVERFLOW`):
+1. **SQLAlchemy pool** (`NEUROVOICE_DB_POOL_SIZE` + `NEUROVOICE_DB_MAX_OVERFLOW`):
    how many DB connections each *process* opens.
 2. **pgBouncer** (transaction pool mode): how many *server* connections
    pgBouncer multiplexes those onto.
 
-When `NQAI_DB_PGBOUNCER=true`:
+When `NEUROVOICE_DB_PGBOUNCER=true`:
    * SQLAlchemy pool stays small (default 5+5) — pgBouncer is the real
      pool, the process-local pool is a thin handle.
    * asyncpg's prepared-statement cache is disabled (`statement_cache_
@@ -29,7 +29,7 @@ When `NQAI_DB_PGBOUNCER=true`:
    * Pre-ping stays ON so a server-side connection drop doesn't take
      out the next request.
 
-Direct Postgres (`NQAI_DB_PGBOUNCER=false`, default):
+Direct Postgres (`NEUROVOICE_DB_PGBOUNCER=false`, default):
    * Bigger SQLAlchemy pool (10+10).
    * Default asyncpg statement cache (better single-process latency).
 
@@ -58,8 +58,8 @@ _sessionmaker: async_sessionmaker[AsyncSession] | None = None
 
 def _default_database_url() -> str:
     return os.environ.get(
-        "NQAI_DATABASE_URL",
-        "postgresql+asyncpg://nqai:nqai@localhost:5432/nqai_voice",
+        "NEUROVOICE_DATABASE_URL",
+        "postgresql+asyncpg://neurovoice:neurovoice@localhost:5432/neurovoice",
     )
 
 
@@ -80,20 +80,20 @@ def _pool_kwargs_for(url: str) -> dict:
       between client transactions, breaking the prepared-statement
       cache contract).
     """
-    pgbouncer = _env_bool("NQAI_DB_PGBOUNCER")
+    pgbouncer = _env_bool("NEUROVOICE_DB_PGBOUNCER")
     # Defaults tuned per mode; env vars override if operator knows better.
     if pgbouncer:
-        pool_size = int(os.environ.get("NQAI_DB_POOL_SIZE", "5"))
-        max_overflow = int(os.environ.get("NQAI_DB_MAX_OVERFLOW", "5"))
+        pool_size = int(os.environ.get("NEUROVOICE_DB_POOL_SIZE", "5"))
+        max_overflow = int(os.environ.get("NEUROVOICE_DB_MAX_OVERFLOW", "5"))
     else:
-        pool_size = int(os.environ.get("NQAI_DB_POOL_SIZE", "10"))
-        max_overflow = int(os.environ.get("NQAI_DB_MAX_OVERFLOW", "10"))
+        pool_size = int(os.environ.get("NEUROVOICE_DB_POOL_SIZE", "10"))
+        max_overflow = int(os.environ.get("NEUROVOICE_DB_MAX_OVERFLOW", "10"))
 
     kwargs: dict = {
         "pool_size": pool_size,
         "max_overflow": max_overflow,
-        "pool_timeout": int(os.environ.get("NQAI_DB_POOL_TIMEOUT_S", "30")),
-        "pool_recycle": int(os.environ.get("NQAI_DB_POOL_RECYCLE_S", "1800")),
+        "pool_timeout": int(os.environ.get("NEUROVOICE_DB_POOL_TIMEOUT_S", "30")),
+        "pool_recycle": int(os.environ.get("NEUROVOICE_DB_POOL_RECYCLE_S", "1800")),
         "pool_pre_ping": True,
     }
 
@@ -117,7 +117,7 @@ def get_engine(database_url: str | None = None) -> AsyncEngine:
         if _engine is None or database_url is not None:
             url = database_url or _default_database_url()
             kwargs: dict = {
-                "echo": os.environ.get("NQAI_DB_ECHO", "false").lower() == "true",
+                "echo": os.environ.get("NEUROVOICE_DB_ECHO", "false").lower() == "true",
                 "future": True,
             }
             # Sensible pool defaults — see D-07 in scale-roadmap.md.

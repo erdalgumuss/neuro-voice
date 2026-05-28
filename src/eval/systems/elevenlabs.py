@@ -26,7 +26,7 @@ import httpx
 
 from . import SystemMetadata, SystemOutput
 
-logger = logging.getLogger("nqai_voice.eval.systems.elevenlabs")
+logger = logging.getLogger("neurovoice.eval.systems.elevenlabs")
 
 
 @dataclass

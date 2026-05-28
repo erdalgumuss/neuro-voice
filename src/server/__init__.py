@@ -1,4 +1,4 @@
-"""NQAI Voice — FastAPI TTS server.
+"""NeuroVoice — FastAPI TTS server.
 
 Endpoints:
     POST /v1/tts            non-streaming WAV synthesis

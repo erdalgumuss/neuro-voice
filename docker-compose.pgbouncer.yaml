@@ -8,7 +8,7 @@
 #         -f docker-compose.pgbouncer.yaml \
 #         up -d
 #
-# The gateway + worker get NQAI_DB_PGBOUNCER=true and a routed
+# The gateway + worker get NEUROVOICE_DB_PGBOUNCER=true and a routed
 # DATABASE_URL pointing at the pgBouncer service (port 6432). The
 # application then disables asyncpg's prepared-statement cache and
 # uses a smaller SQLAlchemy pool because pgBouncer is the real pool.
@@ -29,11 +29,11 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      DB_USER: nqai
-      DB_PASSWORD: nqai
+      DB_USER: neurovoice
+      DB_PASSWORD: neurovoice
       DB_HOST: postgres
       DB_PORT: "5432"
-      DB_NAME: nqai_voice
+      DB_NAME: neurovoice
       POOL_MODE: transaction
       DEFAULT_POOL_SIZE: "20"
       RESERVE_POOL_SIZE: "5"
@@ -44,7 +44,7 @@ services:
     ports:
       - "127.0.0.1:6432:6432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 6432 -U nqai"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 6432 -U neurovoice"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -54,13 +54,13 @@ services:
       pgbouncer:
         condition: service_healthy
     environment:
-      NQAI_DATABASE_URL: "postgresql+asyncpg://nqai:nqai@pgbouncer:6432/nqai_voice"
-      NQAI_DB_PGBOUNCER: "true"
+      NEUROVOICE_DATABASE_URL: "postgresql+asyncpg://neurovoice:neurovoice@pgbouncer:6432/neurovoice"
+      NEUROVOICE_DB_PGBOUNCER: "true"
 
   worker:
     depends_on:
       pgbouncer:
         condition: service_healthy
     environment:
-      NQAI_DATABASE_URL: "postgresql+asyncpg://nqai:nqai@pgbouncer:6432/nqai_voice"
-      NQAI_DB_PGBOUNCER: "true"
+      NEUROVOICE_DATABASE_URL: "postgresql+asyncpg://neurovoice:neurovoice@pgbouncer:6432/neurovoice"
+      NEUROVOICE_DB_PGBOUNCER: "true"

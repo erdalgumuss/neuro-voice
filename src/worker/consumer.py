@@ -5,8 +5,8 @@ consumption pattern:
 
     boot         → XGROUP CREATE MKSTREAM (idempotent — BUSYGROUP ok)
     each tick    → XREADGROUP group=tts-workers consumer=<name>
-                              streams={nqai.tts.jobs: ">"}
-                              count=1 block=NQAI_WORKER_BLOCK_MS
+                              streams={neurovoice.tts.jobs: ">"}
+                              count=1 block=NEUROVOICE_WORKER_BLOCK_MS
     on a job     → process_one_job(...) → see XACK matrix below
     on no jobs   → XAUTOCLAIM scan for stale messages from dead workers
 
@@ -53,7 +53,7 @@ from .pipeline import (
     process_one_job,
 )
 
-logger = logging.getLogger("nqai_voice.worker.consumer")
+logger = logging.getLogger("neurovoice.worker.consumer")
 
 DEFAULT_GROUP = "tts-workers"
 
@@ -61,7 +61,7 @@ DEFAULT_GROUP = "tts-workers"
 def _default_consumer_name() -> str:
     """`worker-<short-hostname>-<pid>` — distinguishable across replicas
     while staying readable in `XINFO CONSUMERS` output."""
-    base = os.environ.get("NQAI_WORKER_CONSUMER_NAME")
+    base = os.environ.get("NEUROVOICE_WORKER_CONSUMER_NAME")
     if base:
         return base
     host = socket.gethostname().split(".")[0][:24]
@@ -91,7 +91,7 @@ async def ensure_consumer_group(
         msg = str(e)
         if "BUSYGROUP" not in msg:
             raise
-        # Group already exists — that's fine. Faz B.0 worker restarts
+        # Group already exists — that's fine. worker restarts
         # hit this path on every boot.
 
 
@@ -153,10 +153,10 @@ class WorkerConsumer:
         self._xautoclaim_period_s = xautoclaim_period_s
         self._last_xautoclaim_at = 0.0
         self._max_retries = max_retries or int(
-            os.environ.get("NQAI_WORKER_MAX_RETRIES", "3")
+            os.environ.get("NEUROVOICE_WORKER_MAX_RETRIES", "3")
         )
         self._dlq_stream = dlq_stream or os.environ.get(
-            "NQAI_WORKER_DLQ_STREAM", DEFAULT_DLQ_STREAM
+            "NEUROVOICE_WORKER_DLQ_STREAM", DEFAULT_DLQ_STREAM
         )
         self._resolve_reference = resolve_reference
         self._archive_to_r2 = archive_to_r2
@@ -168,11 +168,11 @@ class WorkerConsumer:
         self.unknown_failures = 0
         self.claimed = 0
         self.dlqed = 0
-        # Faz C heartbeat state — gateway aggregates these via Redis HSET
+        # heartbeat state — gateway aggregates these via Redis HSET
         # to decide capacity-aware admission. Single-process consumer:
-        # capacity is 1 (one job in-flight at a time). NQAI_WORKER_CAPACITY
+        # capacity is 1 (one job in-flight at a time). NEUROVOICE_WORKER_CAPACITY
         # lets ops bump it later if/when concurrent dispatch lands.
-        self.capacity: int = int(os.environ.get("NQAI_WORKER_CAPACITY", "1"))
+        self.capacity: int = int(os.environ.get("NEUROVOICE_WORKER_CAPACITY", "1"))
         self.in_flight: int = 0
         self.last_pickup_ms: int = int(time.time() * 1000)
         self.started_at_ms: int = int(time.time() * 1000)
@@ -254,7 +254,7 @@ class WorkerConsumer:
             return False
 
         # response = [(stream_name, [(entry_id, {field: value, ...}), ...])]
-        # Faz C heartbeat: mark pickup time on every successful read so the
+        # heartbeat: mark pickup time on every successful read so the
         # gateway can detect stuck workers (last_pickup_ms not advancing).
         self.last_pickup_ms = int(time.time() * 1000)
         for _stream_name, entries in response:
@@ -291,7 +291,7 @@ class WorkerConsumer:
             _safe_metric(WORKER_DLQ)
             return
 
-        # Faz C step 1: capture the worker-pickup latency at the
+        # capture the worker-pickup latency at the
         # boundary where the consumer first owns the message. The
         # gateway stamped `enqueued_at_ms` onto the payload when it
         # XADD'd the job; the difference between then and now is how

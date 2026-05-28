@@ -49,7 +49,7 @@ def write_report(*, plan: RunPlan, rows: list[EvalRow], report_path: Path) -> No
         metric_dir[m.name] = "lower" if m.name in ("whisper_wer",) else "higher"
 
     lines: list[str] = []
-    lines.append(f"# NQAI Voice Eval — {plan.slug}")
+    lines.append(f"# NeuroVoice Eval — {plan.slug}")
     lines.append("")
     lines.append(f"- **Test set**: `{plan.test_set.slug}` "
                  f"({len(plan.test_set.sentences)} sentences from "

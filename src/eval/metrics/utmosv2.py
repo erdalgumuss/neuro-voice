@@ -23,7 +23,7 @@ from dataclasses import dataclass
 
 from . import MetricResult
 
-logger = logging.getLogger("nqai_voice.eval.utmosv2")
+logger = logging.getLogger("neurovoice.eval.utmosv2")
 
 
 @dataclass

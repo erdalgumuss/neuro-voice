@@ -124,7 +124,7 @@ base_model:
 adapter:
   type: lora
   adapter_id: neeko-lora-v1.2.0
-  storage_uri: s3://nqai-voice-models/neeko/v1.2.0/adapter.safetensors
+  storage_uri: s3://neurovoice-models/neeko/v1.2.0/adapter.safetensors
   encrypted: true
   checksum: sha256:...
 voice_dataset:

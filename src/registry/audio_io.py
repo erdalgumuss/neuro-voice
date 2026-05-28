@@ -9,7 +9,7 @@ The `target_sr` default is intentionally 16000 — drift here causes
 silent reference-contract violation downstream (VoxCPM2 will either
 fail to clone the voice or produce off-pitch output). Audit 2026-05-24
 (F3) caught a 24000 default that diverged from VoxCPM2's expectation
-and from `NQAI_REF_SR` env (also 16000).
+and from `NEUROVOICE_REF_SR` env (also 16000).
 """
 
 from __future__ import annotations

@@ -20,7 +20,7 @@ from server.config import settings
 
 from .engine import BaseSynthEngine, get_engine
 
-logger = logging.getLogger("nqai_voice.worker.runtime")
+logger = logging.getLogger("neurovoice.worker.runtime")
 
 
 # MLOps PR #4 (A.4) — worker_id is generated once per process boot. The
@@ -50,8 +50,8 @@ def build_engine() -> BaseSynthEngine:
 
 
 def build_redis() -> Redis:
-    """Async Redis client targeting `NQAI_REDIS_URL`."""
-    url = os.environ.get("NQAI_REDIS_URL", "redis://localhost:6379/0")
+    """Async Redis client targeting `NEUROVOICE_REDIS_URL`."""
+    url = os.environ.get("NEUROVOICE_REDIS_URL", "redis://localhost:6379/0")
     return Redis.from_url(url, decode_responses=False)
 
 
@@ -60,16 +60,16 @@ def build_archive_to_r2():
 
     Wraps `R2Storage.upload_bytes` (boto3 sync) inside `asyncio.to_thread`
     so a multi-second R2 PUT doesn't block the worker's event loop —
-    important once we add concurrent job handling (Faz B.1.5).
+    important once we add concurrent job handling .
 
     Returns None when R2 env is unset (dev mode without R2 creds) —
     pipeline will then raise TransientFailure rather than silently
     completing without an artifact. Operators must wire R2 OR use a
     local archiver injected by tests.
     """
-    if not (os.environ.get("NQAI_R2_ACCOUNT_ID") and os.environ.get("NQAI_R2_BUCKET")):
+    if not (os.environ.get("NEUROVOICE_R2_ACCOUNT_ID") and os.environ.get("NEUROVOICE_R2_BUCKET")):
         logger.warning(
-            "R2 env not set (NQAI_R2_ACCOUNT_ID / NQAI_R2_BUCKET); "
+            "R2 env not set (NEUROVOICE_R2_ACCOUNT_ID / NEUROVOICE_R2_BUCKET); "
             "worker has no archive callable — pipeline will fail-loud"
         )
         return None
@@ -81,7 +81,7 @@ def build_archive_to_r2():
     async def _archive(rid: uuid.UUID, pcm: bytes, sample_rate: int) -> str:
         # PCM int16 mono → WAV (RIFF header) so the artifact is directly
         # playable. Object key is date-prefixed for cheap retention
-        # sweeps later (Faz C lifecycle policy).
+        # sweeps later under a lifecycle policy.
         wav = pcm16_to_wav_bytes(pcm, sample_rate=sample_rate)
         today = datetime.now(timezone.utc).strftime("%Y/%m/%d")
         key = f"tts-outputs/{today}/{rid}.wav"
@@ -96,7 +96,7 @@ def build_archive_to_r2():
 
 
 def _parse_warmup_voice_list(raw: str | None) -> list[str]:
-    """Parse NQAI_WORKER_WARMUP_VOICES — comma-separated voice_id
+    """Parse NEUROVOICE_WORKER_WARMUP_VOICES — comma-separated voice_id
     slugs. Empty / unset → []. Whitespace trimmed, empties dropped.
     """
     if not raw:
@@ -105,12 +105,12 @@ def _parse_warmup_voice_list(raw: str | None) -> list[str]:
 
 
 async def _warmup_voices_from_env(engine: BaseSynthEngine) -> None:
-    """Faz B.5 Dalga 1.3 — eager-load any voice_ids listed in
-    NQAI_WORKER_WARMUP_VOICES so the first inference for each is hot.
+    """eager-load any voice_ids listed in
+    NEUROVOICE_WORKER_WARMUP_VOICES so the first inference for each is hot.
 
     Each voice's LoRA adapter is loaded into the engine's per-voice
     cache (the LRU eviction policy still applies — if the list is
-    longer than NQAI_LORA_CACHE_SIZE the later entries evict the
+    longer than NEUROVOICE_LORA_CACHE_SIZE the later entries evict the
     earlier ones, defeating the purpose; operators must size the
     cache to fit the list).
 
@@ -119,7 +119,7 @@ async def _warmup_voices_from_env(engine: BaseSynthEngine) -> None:
     fires from inside _model_for_adapter so an operator can see what
     succeeded vs failed."""
     voice_ids = _parse_warmup_voice_list(
-        os.environ.get("NQAI_WORKER_WARMUP_VOICES"),
+        os.environ.get("NEUROVOICE_WORKER_WARMUP_VOICES"),
     )
     if not voice_ids:
         return
@@ -183,10 +183,10 @@ async def boot_worker(
     the first job a worker handles doesn't pay the 30-60s cold-load
     cost on the user-visible critical path.
 
-    Faz B.5 Dalga 1.3 — additionally pre-loads any voice_id slugs
-    listed in NQAI_WORKER_WARMUP_VOICES so per-voice LoRA adapters
+    — additionally pre-loads any voice_id slugs
+    listed in NEUROVOICE_WORKER_WARMUP_VOICES so per-voice LoRA adapters
     are hot on the first inference. The cold-load Prometheus metric
-    (nqai_worker_cold_load_seconds{voice}) fires for each preload."""
+    (neurovoice_worker_cold_load_seconds{voice}) fires for each preload."""
     engine = engine or build_engine()
     redis = redis or build_redis()
     if archive_to_r2 is None:
@@ -221,6 +221,6 @@ async def boot_worker(
     # of hanging on the first XREADGROUP.
     pong = await redis.ping()
     if not pong:
-        raise RuntimeError("NQAI_REDIS_URL unreachable")
+        raise RuntimeError("NEUROVOICE_REDIS_URL unreachable")
 
     return engine, redis, archive_to_r2

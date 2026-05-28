@@ -100,7 +100,7 @@ surface should be:
 - `request-id`;
 - `x-nqai-character-count`;
 - `x-nqai-usage-characters`;
-- `x-nqai-voice-id`;
+- `x-neurovoice-id`;
 - `x-nqai-sample-rate`;
 - `x-nqai-duration-seconds`;
 - `x-nqai-rtf` when known;

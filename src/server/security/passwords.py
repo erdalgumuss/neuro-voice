@@ -51,7 +51,7 @@ def verify_secret(stored_hash: str, plain: str) -> None:
 def needs_rehash(stored_hash: str) -> bool:
     """Returns True when the stored hash was produced with parameters that
     differ from our current defaults — caller should re-hash on next
-    successful login (Faz D cron also picks up the slack)."""
+    successful login ( cron also picks up the slack)."""
     try:
         return _HASHER.check_needs_rehash(stored_hash)
     except InvalidHashError:

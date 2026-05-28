@@ -1,9 +1,9 @@
-# NQAI Voice — Prometheus alert rules.
+# NeuroVoice — Prometheus alert rules.
 #
-# Pairs with deploy/grafana/dashboards/nqai-voice.json. The thresholds
+# Pairs with deploy/grafana/dashboards/neurovoice.json. The thresholds
 # here are starter values: tune them after the first real-traffic week
 # and after `scripts/latency_bench.py` produces per-hardware baseline
-# numbers (Faz C v1 item 2).
+# numbers.
 #
 # Severity convention:
 #   critical  — pager-worthy, customer-affecting
@@ -11,15 +11,15 @@
 #   info      — record in dashboards, no page
 
 groups:
-  - name: nqai-voice-availability
+  - name: neurovoice-availability
     interval: 30s
     rules:
       - alert: NqaiVoiceNoHealthyWorkers
-        expr: max(nqai_worker_count) == 0
+        expr: max(neurovoice_worker_count) == 0
         for: 1m
         labels:
           severity: critical
-          service: nqai-voice
+          service: neurovoice
         annotations:
           summary: "No NQAI Voice workers are healthy"
           description: |
@@ -30,35 +30,35 @@ groups:
       - alert: NqaiVoiceHighErrorRate
         expr: |
           (
-            sum(rate(nqai_tts_requests_total{status="error"}[5m]))
+            sum(rate(neurovoice_tts_requests_total{status="error"}[5m]))
             /
-            sum(rate(nqai_tts_requests_total[5m]))
+            sum(rate(neurovoice_tts_requests_total[5m]))
           ) > 0.05
         for: 10m
         labels:
           severity: critical
-          service: nqai-voice
+          service: neurovoice
         annotations:
           summary: "TTS error rate >5% for 10 minutes"
           description: |
             More than 5% of TTS requests are terminating in error.
-            Check nqai_tts_errors_total by type for the dominant failure
+            Check neurovoice_tts_errors_total by type for the dominant failure
             mode (poison / transient / unknown / dlq).
 
       - alert: NqaiVoiceDlqGrowing
-        expr: increase(nqai_worker_dlq_total[15m]) > 0
+        expr: increase(neurovoice_worker_dlq_total[15m]) > 0
         for: 15m
         labels:
           severity: warning
-          service: nqai-voice
+          service: neurovoice
         annotations:
           summary: "Jobs landing in DLQ"
           description: |
             One or more jobs have moved to the dead-letter queue in the
-            last 15 minutes. Inspect `nqai.tts.jobs.dlq` Redis stream
+            last 15 minutes. Inspect `neurovoice.tts.jobs.dlq` Redis stream
             and reprocess after fixing the underlying failure.
 
-  - name: nqai-voice-saturation
+  - name: neurovoice-saturation
     interval: 30s
     rules:
       - alert: NqaiVoiceQueueBacklogHigh
@@ -66,7 +66,7 @@ groups:
         for: 5m
         labels:
           severity: warning
-          service: nqai-voice
+          service: neurovoice
         annotations:
           summary: "Job queue depth >150 for 5 minutes"
           description: |
@@ -76,20 +76,20 @@ groups:
             inference latency p95.
 
       - alert: NqaiVoiceBackpressureRate
-        expr: sum(rate(nqai_tts_requests_total{status="backpressure"}[5m])) > 0.1
+        expr: sum(rate(neurovoice_tts_requests_total{status="backpressure"}[5m])) > 0.1
         for: 10m
         labels:
           severity: warning
-          service: nqai-voice
+          service: neurovoice
         annotations:
           summary: "Backpressure 503s being issued at >0.1 req/s"
           description: |
             The gateway is denying requests via capacity-aware
             backpressure (or XLEN-only fallback). If sustained, scale
-            workers OR raise NQAI_QUEUE_DEPTH_LIMIT (only if the cluster
+            workers OR raise NEUROVOICE_QUEUE_DEPTH_LIMIT (only if the cluster
             can actually drain it).
 
-  - name: nqai-voice-latency
+  - name: neurovoice-latency
     interval: 30s
     rules:
       # Tune these on first real-traffic week. Starter values target
@@ -98,31 +98,31 @@ groups:
         expr: |
           histogram_quantile(
             0.95,
-            sum by (le) (rate(nqai_tts_first_audio_seconds_bucket[5m]))
+            sum by (le) (rate(neurovoice_tts_first_audio_seconds_bucket[5m]))
           ) > 2.0
         for: 10m
         labels:
           severity: warning
-          service: nqai-voice
+          service: neurovoice
         annotations:
           summary: "First-audio p95 >2s for 10 minutes"
           description: |
             Worker-side first-audio latency p95 is above 2 seconds.
-            Compare nqai_tts_inference_seconds (model) vs
-            nqai_tts_reference_resolve_seconds (R2 cache) vs
-            nqai_tts_worker_pickup_seconds (queue health) to isolate.
+            Compare neurovoice_tts_inference_seconds (model) vs
+            neurovoice_tts_reference_resolve_seconds (R2 cache) vs
+            neurovoice_tts_worker_pickup_seconds (queue health) to isolate.
 
       - alert: NqaiVoiceGatewayTransportOverhead
         expr: |
           (
-            histogram_quantile(0.95, sum by (le) (rate(nqai_tts_gateway_first_byte_seconds_bucket[5m])))
+            histogram_quantile(0.95, sum by (le) (rate(neurovoice_tts_gateway_first_byte_seconds_bucket[5m])))
             -
-            histogram_quantile(0.95, sum by (le) (rate(nqai_tts_first_audio_seconds_bucket[5m])))
+            histogram_quantile(0.95, sum by (le) (rate(neurovoice_tts_first_audio_seconds_bucket[5m])))
           ) > 0.2
         for: 10m
         labels:
           severity: warning
-          service: nqai-voice
+          service: neurovoice
         annotations:
           summary: "Gateway/transport adding >200ms on top of worker first-audio (p95)"
           description: |
@@ -139,16 +139,16 @@ groups:
   # see: the model produces SOMETHING (no exception, no DLQ) but that
   # something is silent, clipping, or wrong-length. Failure mode is
   # invisible without these; first signal is a customer ticket.
-  - name: nqai-voice-quality
+  - name: neurovoice-quality
     interval: 30s
     rules:
       - alert: NqaiVoiceSilentOutput
         expr: |
-          histogram_quantile(0.5, sum by (le) (rate(nqai_tts_output_rms_normalized_bucket[5m]))) < 0.005
+          histogram_quantile(0.5, sum by (le) (rate(neurovoice_tts_output_rms_normalized_bucket[5m]))) < 0.005
         for: 5m
         labels:
           severity: critical
-          service: nqai-voice
+          service: neurovoice
         annotations:
           summary: "Median TTS output RMS < 0.005 (effectively silent) for 5m"
           description: |
@@ -161,11 +161,11 @@ groups:
 
       - alert: NqaiVoiceHighSilenceRatio
         expr: |
-          histogram_quantile(0.95, sum by (le) (rate(nqai_tts_output_silence_ratio_bucket[5m]))) > 0.5
+          histogram_quantile(0.95, sum by (le) (rate(neurovoice_tts_output_silence_ratio_bucket[5m]))) > 0.5
         for: 10m
         labels:
           severity: warning
-          service: nqai-voice
+          service: neurovoice
         annotations:
           summary: "p95 of output silence_ratio > 0.5 for 10m"
           description: |
@@ -177,11 +177,11 @@ groups:
 
       - alert: NqaiVoiceClippingDetected
         expr: |
-          histogram_quantile(0.95, sum by (le) (rate(nqai_tts_output_clipping_ratio_bucket[5m]))) > 0.001
+          histogram_quantile(0.95, sum by (le) (rate(neurovoice_tts_output_clipping_ratio_bucket[5m]))) > 0.001
         for: 10m
         labels:
           severity: warning
-          service: nqai-voice
+          service: neurovoice
         annotations:
           summary: "p95 of clipping_ratio > 0.1% for 10m"
           description: |
@@ -192,16 +192,16 @@ groups:
       - alert: NqaiVoiceAbnormalDurationPerChar
         expr: |
           (
-            histogram_quantile(0.95, sum by (le) (rate(nqai_tts_output_seconds_per_char_bucket[5m]))) > 0.25
+            histogram_quantile(0.95, sum by (le) (rate(neurovoice_tts_output_seconds_per_char_bucket[5m]))) > 0.25
           )
           or
           (
-            histogram_quantile(0.5, sum by (le) (rate(nqai_tts_output_seconds_per_char_bucket[5m]))) < 0.03
+            histogram_quantile(0.5, sum by (le) (rate(neurovoice_tts_output_seconds_per_char_bucket[5m]))) < 0.03
           )
         for: 15m
         labels:
           severity: warning
-          service: nqai-voice
+          service: neurovoice
         annotations:
           summary: "Output seconds-per-char out of [0.03, 0.25] envelope for 15m"
           description: |
@@ -214,16 +214,16 @@ groups:
       - alert: NqaiVoiceLoudnessOutOfRange
         expr: |
           (
-            histogram_quantile(0.95, sum by (le) (rate(nqai_tts_output_integrated_lufs_bucket[5m]))) > -10
+            histogram_quantile(0.95, sum by (le) (rate(neurovoice_tts_output_integrated_lufs_bucket[5m]))) > -10
           )
           or
           (
-            histogram_quantile(0.95, sum by (le) (rate(nqai_tts_output_integrated_lufs_bucket[5m]))) < -30
+            histogram_quantile(0.95, sum by (le) (rate(neurovoice_tts_output_integrated_lufs_bucket[5m]))) < -30
           )
         for: 10m
         labels:
           severity: warning
-          service: nqai-voice
+          service: neurovoice
         annotations:
           summary: "p95 integrated LUFS outside [-30, -10] for 10m"
           description: |
@@ -236,17 +236,17 @@ groups:
 
       - alert: NqaiWorkerRevisionSpread
         expr: |
-          count(count by (revision) (nqai_worker_model_info == 1)) > 1
+          count(count by (revision) (neurovoice_worker_model_info == 1)) > 1
         for: 30m
         labels:
           severity: warning
-          service: nqai-voice
+          service: neurovoice
         annotations:
           summary: "Workers split across >1 model revision for 30m (stuck rollout)"
           description: |
             More than one distinct `revision` label is active in
-            nqai_worker_model_info. A rollout that takes >30m to
+            neurovoice_worker_model_info. A rollout that takes >30m to
             converge means at least one pod is wedged on the old
             revision. Use `count by (revision)
-            (nqai_worker_model_info == 1)` to see the split and
+            (neurovoice_worker_model_info == 1)` to see the split and
             check kubectl rollout status / unhealthy pods.

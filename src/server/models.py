@@ -1,4 +1,4 @@
-"""TTS model preset registry — `model_id` knob (Faz B.5 Dalga 1.2).
+"""TTS model preset registry — `model_id` request field.
 
 ElevenLabs and MiniMax both expose a `model_id` request field that
 selects among low-latency / standard / expressive variants. We have
@@ -7,16 +7,15 @@ maps to **quality/latency presets** on the same engine — different
 `cfg_value` + `inference_timesteps` combos — rather than separate
 weight files.
 
-This is honest naming: we're not pretending to ship 5 different
-trained models. We're surfacing 3 well-tuned operating points on the
-single base, picked so the latency/quality tradeoff lines up with what
-NEEKO (low-latency mobile playback), NeuroCourse (HD long-form), and
-NIVA (character voice consistency) actually need.
+This is honest naming: we're not pretending to ship multiple trained
+models. We surface well-tuned operating points on the single base,
+picked so the latency/quality tradeoff covers low-latency mobile
+playback, balanced HD synthesis, and high-fidelity character
+consistency.
 
-Pre-fix, the only knob was per-voice `engine_params` baked into the
-voice catalog at enrollment time — a request couldn't ask the same
-voice to run in turbo vs HD mode. With `model_id`, the SAME enrolled
-voice can be driven through different presets per request.
+`engine_params` baked into the voice catalog at enrollment time is the
+voice-level default; `model_id` lets the same enrolled voice be driven
+through different presets per request.
 
 Resolution order at request time:
     explicit `params.cfg_value` / `params.inference_timesteps`
@@ -41,8 +40,8 @@ class ModelPreset:
 
     The combos here are calibrated empirically on VoxCPM2 multilingual
     against Turkish reference voices. Numbers will move once the
-    Faz C v1 latency_bench operator tour produces hardware-specific
-    data — treat them as starting points, not commitments.
+    latency_bench operator tour produces hardware-specific data —
+    treat them as starting points, not commitments.
     """
 
     model_id: str
@@ -55,8 +54,8 @@ class ModelPreset:
 
 _PRESETS: tuple[ModelPreset, ...] = (
     ModelPreset(
-        model_id="nqai-voxcpm2-tr-turbo",
-        display_name="NQAI VoxCPM2 Turkish — Turbo",
+        model_id="voxcpm2-tr-turbo",
+        display_name="VoxCPM2 Turkish — Turbo",
         description=(
             "Lowest-latency preset. Fewer diffusion steps + lower CFG. "
             "Good for real-time conversation / quick UI feedback. "
@@ -66,19 +65,19 @@ _PRESETS: tuple[ModelPreset, ...] = (
         inference_timesteps=8,
     ),
     ModelPreset(
-        model_id="nqai-voxcpm2-tr-hd",
-        display_name="NQAI VoxCPM2 Turkish — HD",
+        model_id="voxcpm2-tr-hd",
+        display_name="VoxCPM2 Turkish — HD",
         description=(
             "Default. Balanced latency/quality. Production target for "
-            "NEEKO storytelling + NeuroCourse instructor reads."
+            "short-form mobile playback and long-form HD synthesis."
         ),
         cfg_value=2.0,
         inference_timesteps=16,
         is_default=True,
     ),
     ModelPreset(
-        model_id="nqai-voxcpm2-tr-character",
-        display_name="NQAI VoxCPM2 Turkish — Character",
+        model_id="voxcpm2-tr-character",
+        display_name="VoxCPM2 Turkish — Character",
         description=(
             "Highest CFG + more steps. Maximum reference-voice fidelity, "
             "best for character voices where consistency across sentences "
@@ -87,12 +86,11 @@ _PRESETS: tuple[ModelPreset, ...] = (
         cfg_value=2.5,
         inference_timesteps=24,
     ),
-    # Research-finding A.3 (2026-05-25): industry-shaped fast / standard /
-    # studio lanes that map onto the same VoxCPM2 base. The `tr-*` triplet
-    # above stays because external clients have already picked them up; the
-    # `voxcpm2-*` triplet below is the new product-shaped surface for
-    # NEEKO live chat (fast) vs NeuroCourse long-form (studio), citing
-    # F5-TTS / EPSS inference-timestep work. cfg+timesteps are the only
+    # Industry-shaped fast / standard / studio lanes that map onto the
+    # same VoxCPM2 base. The `tr-*` triplet above is preserved so
+    # existing clients don't break; the `voxcpm2-*` triplet below is the
+    # product-shaped surface for live-chat (fast), default (standard),
+    # and long-form studio narration. cfg+timesteps are the only
     # difference per preset; the underlying HF weight is identical.
     ModelPreset(
         model_id="voxcpm2-fast",
@@ -100,9 +98,9 @@ _PRESETS: tuple[ModelPreset, ...] = (
         description=(
             "Live-chat tier. 7 diffusion steps, cfg=2.0. ~4x faster wall "
             "time than studio with minimal perceptual quality drop on "
-            "Turkish reference voices (per F5-TTS / EPSS prior art). "
-            "Pick this for NEEKO live conversation and any latency-"
-            "sensitive duplex surface."
+            "reference voices (per F5-TTS / EPSS prior art). Pick this "
+            "for live conversation and any latency-sensitive duplex "
+            "surface."
         ),
         cfg_value=2.0,
         inference_timesteps=7,
@@ -123,9 +121,9 @@ _PRESETS: tuple[ModelPreset, ...] = (
         display_name="VoxCPM2 — Studio",
         description=(
             "Long-form studio tier. 16 diffusion steps, cfg=2.5. "
-            "Highest fidelity for NeuroCourse instructor reads, audiobook "
-            "narration, and other async jobs where wall time is acceptable "
-            "in exchange for maximum reference adherence."
+            "Highest fidelity for instructor reads, audiobook narration, "
+            "and other async jobs where wall time is acceptable in "
+            "exchange for maximum reference adherence."
         ),
         cfg_value=2.5,
         inference_timesteps=16,

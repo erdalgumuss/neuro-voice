@@ -13,7 +13,7 @@
 #   docker compose -f docker-compose.dev.yaml exec gateway \
 #       alembic upgrade head
 #   docker compose -f docker-compose.dev.yaml exec gateway \
-#       python scripts/seed_operator.py --email you@nqai.com
+#       python scripts/seed_operator.py --email you@example.com
 #
 # Then visit http://localhost:8000/admin/ — create a tenant + key,
 # then issue API calls. See README.md for the API surface.
@@ -23,15 +23,15 @@ services:
     image: postgres:16-alpine
     restart: unless-stopped
     environment:
-      POSTGRES_USER: nqai
-      POSTGRES_PASSWORD: nqai
-      POSTGRES_DB: nqai_voice
+      POSTGRES_USER: neurovoice
+      POSTGRES_PASSWORD: neurovoice
+      POSTGRES_DB: neurovoice
     volumes:
-      - nqai_pgdata:/var/lib/postgresql/data
+      - neurovoice_pgdata:/var/lib/postgresql/data
     ports:
       - "127.0.0.1:5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U nqai -d nqai_voice"]
+      test: ["CMD-SHELL", "pg_isready -U neurovoice -d neurovoice"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -48,7 +48,7 @@ services:
       - --maxmemory-policy
       - "allkeys-lru"
     volumes:
-      - nqai_redisdata:/data
+      - neurovoice_redisdata:/data
     ports:
       - "127.0.0.1:6379:6379"
     healthcheck:
@@ -61,7 +61,7 @@ services:
     build:
       context: .
       dockerfile: deploy/gateway.Dockerfile
-    image: nqai-voice-gateway:dev
+    image: neurovoice-gateway:dev
     restart: unless-stopped
     depends_on:
       postgres:
@@ -69,29 +69,29 @@ services:
       redis:
         condition: service_healthy
     environment:
-      NQAI_DATABASE_URL: "postgresql+asyncpg://nqai:nqai@postgres:5432/nqai_voice"
-      NQAI_REDIS_URL: "redis://redis:6379/0"
-      NQAI_DEVICE: cpu                     # GPU work runs in the worker (gpu profile)
-      NQAI_REQUIRE_AUTH: "true"
-      NQAI_JWT_SECRET: "${NQAI_JWT_SECRET:?must be set in .env, at least 32 chars}"
-      NQAI_COOKIE_SECURE: "false"          # local HTTP — production keeps default true
-      NQAI_VOICES_DIR: "/srv/nqai/configs/voices"
-      NQAI_REFERENCE_DIR: "/srv/nqai/data/reference-audio"
-      NQAI_QUEUE_DEPTH_LIMIT: "${NQAI_QUEUE_DEPTH_LIMIT:-200}"
+      NEUROVOICE_DATABASE_URL: "postgresql+asyncpg://neurovoice:neurovoice@postgres:5432/neurovoice"
+      NEUROVOICE_REDIS_URL: "redis://redis:6379/0"
+      NEUROVOICE_DEVICE: cpu                     # GPU work runs in the worker (gpu profile)
+      NEUROVOICE_REQUIRE_AUTH: "true"
+      NEUROVOICE_JWT_SECRET: "${NEUROVOICE_JWT_SECRET:?must be set in .env, at least 32 chars}"
+      NEUROVOICE_COOKIE_SECURE: "false"          # local HTTP — production keeps default true
+      NEUROVOICE_VOICES_DIR: "/srv/neurovoice/configs/voices"
+      NEUROVOICE_REFERENCE_DIR: "/srv/neurovoice/data/reference-audio"
+      NEUROVOICE_QUEUE_DEPTH_LIMIT: "${NEUROVOICE_QUEUE_DEPTH_LIMIT:-200}"
       # R2 (optional in dev — gateway falls back to file:// references):
-      NQAI_R2_ACCOUNT_ID: "${NQAI_R2_ACCOUNT_ID:-}"
-      NQAI_R2_BUCKET: "${NQAI_R2_BUCKET:-}"
-      NQAI_R2_ACCESS_KEY_ID: "${NQAI_R2_ACCESS_KEY_ID:-}"
-      NQAI_R2_SECRET_ACCESS_KEY: "${NQAI_R2_SECRET_ACCESS_KEY:-}"
-      PYTHONPATH: "/srv/nqai/src"
+      NEUROVOICE_R2_ACCOUNT_ID: "${NEUROVOICE_R2_ACCOUNT_ID:-}"
+      NEUROVOICE_R2_BUCKET: "${NEUROVOICE_R2_BUCKET:-}"
+      NEUROVOICE_R2_ACCESS_KEY_ID: "${NEUROVOICE_R2_ACCESS_KEY_ID:-}"
+      NEUROVOICE_R2_SECRET_ACCESS_KEY: "${NEUROVOICE_R2_SECRET_ACCESS_KEY:-}"
+      PYTHONPATH: "/srv/neurovoice/src"
       PYTHONUNBUFFERED: "1"
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
-      - ./configs:/srv/nqai/configs:rw
-      - ./data:/srv/nqai/data:rw
-      - ./migrations:/srv/nqai/migrations:ro
-      - ./alembic.ini:/srv/nqai/alembic.ini:ro
+      - ./configs:/srv/neurovoice/configs:rw
+      - ./data:/srv/neurovoice/data:rw
+      - ./migrations:/srv/neurovoice/migrations:ro
+      - ./alembic.ini:/srv/neurovoice/alembic.ini:ro
     command: ["uvicorn", "server.main:app", "--host", "0.0.0.0", "--port", "8000"]
 
   # --------------------------------------------------------------------- #
@@ -105,15 +105,15 @@ services:
   # GPU passthrough varies by host:
   #   * Linux + NVIDIA Container Toolkit: uncomment the `deploy.resources`
   #     stanza below.
-  #   * Apple Silicon / Windows / no GPU: set NQAI_DEVICE=cpu and use the
-  #     stub engine (NQAI_WORKER_MODE=stub in Faz B.2).
+  #   * Apple Silicon / Windows / no GPU: set NEUROVOICE_DEVICE=cpu and use the
+  #     stub engine (NEUROVOICE_WORKER_MODE=stub).
   # --------------------------------------------------------------------- #
   worker:
     profiles: ["gpu"]
     build:
       context: .
       dockerfile: deploy/worker.Dockerfile
-    image: nqai-voice-worker:dev
+    image: neurovoice-worker:dev
     restart: unless-stopped
     depends_on:
       postgres:
@@ -121,28 +121,28 @@ services:
       redis:
         condition: service_healthy
     environment:
-      NQAI_DATABASE_URL: "postgresql+asyncpg://nqai:nqai@postgres:5432/nqai_voice"
-      NQAI_REDIS_URL: "redis://redis:6379/0"
-      NQAI_DEVICE: "${NQAI_WORKER_DEVICE:-cuda}"
-      NQAI_WORKER_CONSUMER_NAME: "worker-${HOSTNAME:-local}"
-      NQAI_WORKER_BLOCK_MS: "5000"
-      NQAI_WORKER_XAUTOCLAIM_INTERVAL_S: "30"
-      NQAI_WORKER_MAX_RETRIES: "3"
-      NQAI_WORKER_DLQ_STREAM: "nqai.tts.jobs.dlq"
-      NQAI_WARMUP_ON_BOOT: "true"
-      NQAI_RESULT_STREAM_TTL_S: "600"
-      NQAI_LORA_CACHE_SIZE: "${NQAI_LORA_CACHE_SIZE:-3}"
+      NEUROVOICE_DATABASE_URL: "postgresql+asyncpg://neurovoice:neurovoice@postgres:5432/neurovoice"
+      NEUROVOICE_REDIS_URL: "redis://redis:6379/0"
+      NEUROVOICE_DEVICE: "${NEUROVOICE_WORKER_DEVICE:-cuda}"
+      NEUROVOICE_WORKER_CONSUMER_NAME: "worker-${HOSTNAME:-local}"
+      NEUROVOICE_WORKER_BLOCK_MS: "5000"
+      NEUROVOICE_WORKER_XAUTOCLAIM_INTERVAL_S: "30"
+      NEUROVOICE_WORKER_MAX_RETRIES: "3"
+      NEUROVOICE_WORKER_DLQ_STREAM: "neurovoice.tts.jobs.dlq"
+      NEUROVOICE_WARMUP_ON_BOOT: "true"
+      NEUROVOICE_RESULT_STREAM_TTL_S: "600"
+      NEUROVOICE_LORA_CACHE_SIZE: "${NEUROVOICE_LORA_CACHE_SIZE:-3}"
       # Worker fails-loud at boot if R2 env missing — kept as soft
       # defaults here so `docker compose config` works without R2 set.
-      NQAI_R2_ACCOUNT_ID: "${NQAI_R2_ACCOUNT_ID:-}"
-      NQAI_R2_BUCKET: "${NQAI_R2_BUCKET:-}"
-      NQAI_R2_ACCESS_KEY_ID: "${NQAI_R2_ACCESS_KEY_ID:-}"
-      NQAI_R2_SECRET_ACCESS_KEY: "${NQAI_R2_SECRET_ACCESS_KEY:-}"
-      PYTHONPATH: "/srv/nqai/src"
+      NEUROVOICE_R2_ACCOUNT_ID: "${NEUROVOICE_R2_ACCOUNT_ID:-}"
+      NEUROVOICE_R2_BUCKET: "${NEUROVOICE_R2_BUCKET:-}"
+      NEUROVOICE_R2_ACCESS_KEY_ID: "${NEUROVOICE_R2_ACCESS_KEY_ID:-}"
+      NEUROVOICE_R2_SECRET_ACCESS_KEY: "${NEUROVOICE_R2_SECRET_ACCESS_KEY:-}"
+      PYTHONPATH: "/srv/neurovoice/src"
       PYTHONUNBUFFERED: "1"
     volumes:
-      - ./configs:/srv/nqai/configs:ro
-      - ./data:/srv/nqai/data:ro
+      - ./configs:/srv/neurovoice/configs:ro
+      - ./data:/srv/neurovoice/data:ro
       - nqai_model_cache:/root/.cache/huggingface
     command: ["python", "-m", "worker.main"]
     # Uncomment on a Linux host with the NVIDIA Container Toolkit:
@@ -155,6 +155,6 @@ services:
     #           capabilities: ["gpu"]
 
 volumes:
-  nqai_pgdata:
-  nqai_redisdata:
+  neurovoice_pgdata:
+  neurovoice_redisdata:
   nqai_model_cache:

@@ -18,7 +18,7 @@ Design notes
   `asyncio.wait_for(stop_event.wait(), timeout=interval_s)` instead of
   sleeping blindly.
 
-Spec: Faz C step 3 — heartbeat-based backpressure helpers.
+Spec: heartbeat-based backpressure helpers.
 """
 
 from __future__ import annotations
@@ -30,11 +30,11 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
-logger = logging.getLogger("nqai_voice.worker.heartbeat")
+logger = logging.getLogger("neurovoice.worker.heartbeat")
 
 DEFAULT_INTERVAL_S = 1.0
 DEFAULT_TTL_S = 3.0
-DEFAULT_PREFIX = "nqai.worker.heartbeat"
+DEFAULT_PREFIX = "neurovoice.worker.heartbeat"
 
 _WARN_THROTTLE_S = 60.0
 
@@ -133,17 +133,17 @@ async def start_heartbeat_loop(
     interval = (
         interval_s
         if interval_s is not None
-        else _env_float("NQAI_WORKER_HEARTBEAT_INTERVAL_S", DEFAULT_INTERVAL_S)
+        else _env_float("NEUROVOICE_WORKER_HEARTBEAT_INTERVAL_S", DEFAULT_INTERVAL_S)
     )
     ttl = (
         ttl_s
         if ttl_s is not None
-        else _env_float("NQAI_WORKER_HEARTBEAT_TTL_S", DEFAULT_TTL_S)
+        else _env_float("NEUROVOICE_WORKER_HEARTBEAT_TTL_S", DEFAULT_TTL_S)
     )
     prefix = (
         key_prefix
         if key_prefix is not None
-        else _env_str("NQAI_WORKER_HEARTBEAT_PREFIX", DEFAULT_PREFIX)
+        else _env_str("NEUROVOICE_WORKER_HEARTBEAT_PREFIX", DEFAULT_PREFIX)
     )
 
     if interval <= 0:

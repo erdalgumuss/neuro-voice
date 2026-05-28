@@ -47,7 +47,7 @@ from dataclasses import dataclass
 
 from . import MetricResult
 
-logger = logging.getLogger("nqai_voice.eval.whisper_wer")
+logger = logging.getLogger("neurovoice.eval.whisper_wer")
 
 
 _PREAMBLE_RE = re.compile(

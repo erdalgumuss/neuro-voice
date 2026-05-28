@@ -98,7 +98,7 @@ def get_redis() -> Redis:
     """
     global _redis_client
     if _redis_client is None:
-        url = os.environ.get("NQAI_REDIS_URL", "redis://localhost:6379/0")
+        url = os.environ.get("NEUROVOICE_REDIS_URL", "redis://localhost:6379/0")
         _redis_client = Redis.from_url(url, decode_responses=False)
     return _redis_client
 
@@ -159,7 +159,7 @@ async def authenticate_bearer(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=GENERIC_AUTH_ERROR,
-            headers={"WWW-Authenticate": 'Bearer realm="nqai-voice"'},
+            headers={"WWW-Authenticate": 'Bearer realm="neurovoice"'},
         )
 
     token = authorization[len("bearer "):].strip()
@@ -174,7 +174,7 @@ async def authenticate_bearer(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=GENERIC_AUTH_ERROR,
-            headers={"WWW-Authenticate": 'Bearer realm="nqai-voice"'},
+            headers={"WWW-Authenticate": 'Bearer realm="neurovoice"'},
         ) from e
 
     # ---- 3. DB lookup by prefix -------------------------------------------
@@ -188,7 +188,7 @@ async def authenticate_bearer(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=GENERIC_AUTH_ERROR,
-            headers={"WWW-Authenticate": 'Bearer realm="nqai-voice"'},
+            headers={"WWW-Authenticate": 'Bearer realm="neurovoice"'},
         )
     key, tenant = found
 
@@ -204,7 +204,7 @@ async def authenticate_bearer(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail=GENERIC_AUTH_ERROR,
-            headers={"WWW-Authenticate": 'Bearer realm="nqai-voice"'},
+            headers={"WWW-Authenticate": 'Bearer realm="neurovoice"'},
         ) from e
 
     # ---- 5. Tenant status check -------------------------------------------
@@ -218,7 +218,7 @@ async def authenticate_bearer(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=GENERIC_AUTH_ERROR,
-            headers={"WWW-Authenticate": 'Bearer realm="nqai-voice"'},
+            headers={"WWW-Authenticate": 'Bearer realm="neurovoice"'},
         )
 
     # ---- 6. Scope check ---------------------------------------------------
@@ -276,7 +276,7 @@ async def authenticate_bearer(
     # ---- 8. Success — fire-and-forget side effects ------------------------
     # last_used touch is intentionally awaited here so it lands in the
     # same transaction; for ultra-low-latency we'd push to a Redis HSET
-    # and flush every N seconds (Faz C+).
+    # and flush every N seconds .
     await kr.touch_last_used(key.id)
     await _audit_async(session, action="auth.success", result="success",
                        tenant_id=tenant.id, actor_id=key.id,

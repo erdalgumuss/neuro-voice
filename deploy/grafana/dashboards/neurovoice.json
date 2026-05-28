@@ -1,0 +1,300 @@
+{
+  "title": "NQAI Voice — TTS overview",
+  "uid": "nqai-voice-overview",
+  "tags": ["nqai", "voice", "tts"],
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {"from": "now-30m", "to": "now"},
+  "timezone": "",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {"text": "Prometheus", "value": "Prometheus"}
+      },
+      {
+        "name": "tenant",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "${datasource}"},
+        "query": "label_values(neurovoice_tts_requests_total, tenant)",
+        "includeAll": true,
+        "multi": true,
+        "refresh": 2
+      },
+      {
+        "name": "voice",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "${datasource}"},
+        "query": "label_values(neurovoice_tts_requests_total{tenant=~\"$tenant\"}, voice)",
+        "includeAll": true,
+        "multi": true,
+        "refresh": 2
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Healthy workers",
+      "gridPos": {"h": 4, "w": 4, "x": 0, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value"},
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "yellow", "value": 1},
+              {"color": "green", "value": 2}
+            ]
+          },
+          "unit": "none"
+        }
+      },
+      "targets": [{
+        "refId": "A",
+        "expr": "max(neurovoice_worker_count)",
+        "legendFormat": "workers"
+      }]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Cluster capacity",
+      "gridPos": {"h": 4, "w": 4, "x": 4, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value"},
+      "fieldConfig": {"defaults": {"unit": "none"}},
+      "targets": [{"refId": "A", "expr": "max(neurovoice_worker_capacity_total)"}]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "In-flight jobs",
+      "gridPos": {"h": 4, "w": 4, "x": 8, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value"},
+      "fieldConfig": {"defaults": {"unit": "none"}},
+      "targets": [{"refId": "A", "expr": "max(neurovoice_worker_inflight_total)"}]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Queue depth (jobs)",
+      "gridPos": {"h": 4, "w": 4, "x": 12, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value"},
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 50},
+              {"color": "red", "value": 150}
+            ]
+          },
+          "unit": "none"
+        }
+      },
+      "targets": [{
+        "refId": "A",
+        "expr": "max(nqai_queue_depth{stream=\"jobs\"})"
+      }]
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Success rate (5m)",
+      "gridPos": {"h": 4, "w": 4, "x": 16, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value"},
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "yellow", "value": 0.95},
+              {"color": "green", "value": 0.99}
+            ]
+          },
+          "unit": "percentunit"
+        }
+      },
+      "targets": [{
+        "refId": "A",
+        "expr": "sum(rate(neurovoice_tts_requests_total{status=\"success\",tenant=~\"$tenant\",voice=~\"$voice\"}[5m])) / sum(rate(neurovoice_tts_requests_total{tenant=~\"$tenant\",voice=~\"$voice\"}[5m]))"
+      }]
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "DLQ count (1h)",
+      "gridPos": {"h": 4, "w": 4, "x": 20, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value"},
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 1}
+            ]
+          }
+        }
+      },
+      "targets": [{
+        "refId": "A",
+        "expr": "increase(neurovoice_worker_dlq_total[1h])"
+      }]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "TTS request rate by status",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {"defaults": {"unit": "reqps"}},
+      "targets": [{
+        "refId": "A",
+        "expr": "sum by (status) (rate(neurovoice_tts_requests_total{tenant=~\"$tenant\",voice=~\"$voice\"}[1m]))",
+        "legendFormat": "{{status}}"
+      }]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Errors by type (rate / 1m)",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {"defaults": {"unit": "reqps"}},
+      "targets": [{
+        "refId": "A",
+        "expr": "sum by (type) (rate(neurovoice_tts_errors_total[1m]))",
+        "legendFormat": "{{type}}"
+      }]
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "First audio (worker-side, inference → publish_chunk)",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "targets": [
+        {"refId": "p50", "expr": "histogram_quantile(0.50, sum by (le) (rate(neurovoice_tts_first_audio_seconds_bucket{tenant=~\"$tenant\",voice=~\"$voice\"}[5m])))", "legendFormat": "p50"},
+        {"refId": "p95", "expr": "histogram_quantile(0.95, sum by (le) (rate(neurovoice_tts_first_audio_seconds_bucket{tenant=~\"$tenant\",voice=~\"$voice\"}[5m])))", "legendFormat": "p95"},
+        {"refId": "p99", "expr": "histogram_quantile(0.99, sum by (le) (rate(neurovoice_tts_first_audio_seconds_bucket{tenant=~\"$tenant\",voice=~\"$voice\"}[5m])))", "legendFormat": "p99"}
+      ]
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Gateway first byte (client-facing TTFB on /v1/tts/stream)",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "targets": [
+        {"refId": "p50", "expr": "histogram_quantile(0.50, sum by (le) (rate(neurovoice_tts_gateway_first_byte_seconds_bucket{tenant=~\"$tenant\",voice=~\"$voice\"}[5m])))", "legendFormat": "p50"},
+        {"refId": "p95", "expr": "histogram_quantile(0.95, sum by (le) (rate(neurovoice_tts_gateway_first_byte_seconds_bucket{tenant=~\"$tenant\",voice=~\"$voice\"}[5m])))", "legendFormat": "p95"},
+        {"refId": "p99", "expr": "histogram_quantile(0.99, sum by (le) (rate(neurovoice_tts_gateway_first_byte_seconds_bucket{tenant=~\"$tenant\",voice=~\"$voice\"}[5m])))", "legendFormat": "p99"}
+      ]
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Inference duration (model only)",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 20},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "targets": [
+        {"refId": "p50", "expr": "histogram_quantile(0.50, sum by (le) (rate(neurovoice_tts_inference_seconds_bucket{tenant=~\"$tenant\",voice=~\"$voice\"}[5m])))", "legendFormat": "p50"},
+        {"refId": "p95", "expr": "histogram_quantile(0.95, sum by (le) (rate(neurovoice_tts_inference_seconds_bucket{tenant=~\"$tenant\",voice=~\"$voice\"}[5m])))", "legendFormat": "p95"}
+      ]
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Total wall time (worker-side)",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 20},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "targets": [
+        {"refId": "p50", "expr": "histogram_quantile(0.50, sum by (le) (rate(neurovoice_tts_total_seconds_bucket{tenant=~\"$tenant\",voice=~\"$voice\"}[5m])))", "legendFormat": "p50"},
+        {"refId": "p95", "expr": "histogram_quantile(0.95, sum by (le) (rate(neurovoice_tts_total_seconds_bucket{tenant=~\"$tenant\",voice=~\"$voice\"}[5m])))", "legendFormat": "p95"}
+      ]
+    },
+    {
+      "id": 30,
+      "type": "timeseries",
+      "title": "Queue wait p95 vs worker pickup p95",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 28},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "targets": [
+        {"refId": "A", "expr": "histogram_quantile(0.95, sum by (le) (rate(neurovoice_tts_queue_wait_seconds_bucket{tenant=~\"$tenant\",voice=~\"$voice\"}[5m])))", "legendFormat": "queue_wait p95"},
+        {"refId": "B", "expr": "histogram_quantile(0.95, sum by (le) (rate(neurovoice_tts_worker_pickup_seconds_bucket{tenant=~\"$tenant\",voice=~\"$voice\"}[5m])))", "legendFormat": "worker_pickup p95"}
+      ]
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Reference resolve p95 (R2 / cache)",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 28},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "targets": [
+        {"refId": "p50", "expr": "histogram_quantile(0.50, sum by (le) (rate(neurovoice_tts_reference_resolve_seconds_bucket{tenant=~\"$tenant\",voice=~\"$voice\"}[5m])))", "legendFormat": "p50"},
+        {"refId": "p95", "expr": "histogram_quantile(0.95, sum by (le) (rate(neurovoice_tts_reference_resolve_seconds_bucket{tenant=~\"$tenant\",voice=~\"$voice\"}[5m])))", "legendFormat": "p95"}
+      ]
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "First PCM (engine TTFA only)",
+      "description": "Engine-internal latency: inference start → first SynthChunk yielded. Subtract from `first_audio_seconds` to isolate the bridge / publish overhead.",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 36},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "targets": [
+        {"refId": "p50", "expr": "histogram_quantile(0.50, sum by (le) (rate(neurovoice_tts_first_pcm_seconds_bucket{tenant=~\"$tenant\",voice=~\"$voice\"}[5m])))", "legendFormat": "p50"},
+        {"refId": "p95", "expr": "histogram_quantile(0.95, sum by (le) (rate(neurovoice_tts_first_pcm_seconds_bucket{tenant=~\"$tenant\",voice=~\"$voice\"}[5m])))", "legendFormat": "p95"}
+      ]
+    },
+    {
+      "id": 33,
+      "type": "timeseries",
+      "title": "Deprecated endpoint hits (rate / 1m)",
+      "description": "Sunset readiness — watch this trend to 0 before the published Sunset date. Non-zero close to sunset = migration comms didn't land.",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 36},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {"defaults": {"unit": "reqps"}},
+      "targets": [{
+        "refId": "A",
+        "expr": "sum by (endpoint) (rate(neurovoice_tts_deprecated_endpoint_total[1m]))",
+        "legendFormat": "{{endpoint}}"
+      }]
+    },
+    {
+      "id": 34,
+      "type": "timeseries",
+      "title": "Voice cold-load p95 (per-voice cache miss)",
+      "description": "Time spent loading a voice's adapter into VRAM on a cache miss. Sustained p95 > 5s for a voice → consider adding it to NEUROVOICE_WORKER_WARMUP_VOICES or bumping NEUROVOICE_LORA_CACHE_SIZE.",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 44},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "fieldConfig": {"defaults": {"unit": "s"}},
+      "targets": [{
+        "refId": "A",
+        "expr": "histogram_quantile(0.95, sum by (le, voice) (rate(neurovoice_worker_cold_load_seconds_bucket[5m])))",
+        "legendFormat": "{{voice}} p95"
+      }]
+    }
+  ]
+}

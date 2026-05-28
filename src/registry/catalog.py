@@ -9,7 +9,7 @@ Manifest schema (v0):
     display_name: str       # human-readable
     language: str           # ISO 639-1, "tr" default
     gender: str             # "neutral" | "female" | "male"
-    style_tags: [str]       # ["warm", "child-directed", ...]
+    style_tags: [str]       # ["warm", "narrative", "professional", ...]
     reference_audio: str    # filename inside reference_audio_dir
     reference_seconds: float
     source: str             # "elevenlabs" | "voice-talent" | "user-enroll" | "synthetic"

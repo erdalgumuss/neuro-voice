@@ -1,4 +1,4 @@
-"""NQAI Voice — database layer (PostgreSQL 16 + SQLAlchemy 2 async).
+"""NeuroVoice — database layer (PostgreSQL 16 + SQLAlchemy 2 async).
 
 Public surface:
     Base                 declarative base for all ORM models

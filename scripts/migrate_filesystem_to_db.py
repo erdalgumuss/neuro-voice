@@ -10,9 +10,9 @@ Idempotent: re-running is a no-op when (tenant_slug, voice_id) already
 exists. Use --dry-run to print the plan without writing.
 
 Pre-requisites:
-    NQAI_DATABASE_URL points at a migrated Postgres
-    R2 creds (boto3 conventions): NQAI_R2_ACCOUNT_ID, NQAI_R2_ACCESS_KEY_ID,
-    NQAI_R2_SECRET_ACCESS_KEY, NQAI_R2_BUCKET (or pass --skip-upload)
+    NEUROVOICE_DATABASE_URL points at a migrated Postgres
+    R2 creds (boto3 conventions): NEUROVOICE_R2_ACCOUNT_ID, NEUROVOICE_R2_ACCESS_KEY_ID,
+    NEUROVOICE_R2_SECRET_ACCESS_KEY, NEUROVOICE_R2_BUCKET (or pass --skip-upload)
 """
 
 from __future__ import annotations
@@ -58,13 +58,13 @@ def _upload_to_r2(path: Path, bucket: str, key: str) -> str:
     import boto3
     from botocore.client import Config
 
-    account_id = os.environ["NQAI_R2_ACCOUNT_ID"]
+    account_id = os.environ["NEUROVOICE_R2_ACCOUNT_ID"]
     endpoint = f"https://{account_id}.r2.cloudflarestorage.com"
     s3 = boto3.client(
         "s3",
         endpoint_url=endpoint,
-        aws_access_key_id=os.environ["NQAI_R2_ACCESS_KEY_ID"],
-        aws_secret_access_key=os.environ["NQAI_R2_SECRET_ACCESS_KEY"],
+        aws_access_key_id=os.environ["NEUROVOICE_R2_ACCESS_KEY_ID"],
+        aws_secret_access_key=os.environ["NEUROVOICE_R2_SECRET_ACCESS_KEY"],
         config=Config(signature_version="s3v4"),
         region_name="auto",
     )
@@ -146,7 +146,7 @@ async def _migrate(args) -> int:
             if args.skip_upload:
                 ref_uri = f"file://{ref_path.resolve()}"
             else:
-                bucket = os.environ["NQAI_R2_BUCKET"]
+                bucket = os.environ["NEUROVOICE_R2_BUCKET"]
                 key = f"voices/{tenant.slug}/{ref_filename}"
                 ref_uri = _upload_to_r2(ref_path, bucket, key)
 

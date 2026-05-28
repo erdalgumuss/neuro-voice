@@ -26,14 +26,14 @@ from .consumer import WorkerConsumer
 from .heartbeat import WorkerHeartbeatState, start_heartbeat_loop
 from .runtime import boot_worker
 
-logger = logging.getLogger("nqai_voice.worker")
+logger = logging.getLogger("neurovoice.worker")
 
 
 _metrics_server_started = False
 
 
 def _start_metrics_server() -> None:
-    """Bind Prometheus exposition on NQAI_WORKER_METRICS_PORT (default 9100).
+    """Bind Prometheus exposition on NEUROVOICE_WORKER_METRICS_PORT (default 9100).
 
     Skip if the env var is '0' / 'off' (single-box dev, tests).
     Idempotent: only the first call actually binds; subsequent calls in
@@ -44,18 +44,18 @@ def _start_metrics_server() -> None:
     global _metrics_server_started
     if _metrics_server_started:
         return
-    raw = os.environ.get("NQAI_WORKER_METRICS_PORT", "9100").strip()
+    raw = os.environ.get("NEUROVOICE_WORKER_METRICS_PORT", "9100").strip()
     if raw in {"0", "off", "false", "no", ""}:
-        logger.info("worker metrics http server disabled (NQAI_WORKER_METRICS_PORT=%r)", raw)
+        logger.info("worker metrics http server disabled (NEUROVOICE_WORKER_METRICS_PORT=%r)", raw)
         _metrics_server_started = True
         return
     try:
         port = int(raw)
     except ValueError:
-        logger.warning("invalid NQAI_WORKER_METRICS_PORT=%r — disabling", raw)
+        logger.warning("invalid NEUROVOICE_WORKER_METRICS_PORT=%r — disabling", raw)
         _metrics_server_started = True
         return
-    addr = os.environ.get("NQAI_WORKER_METRICS_BIND", "0.0.0.0")
+    addr = os.environ.get("NEUROVOICE_WORKER_METRICS_BIND", "0.0.0.0")
     try:
         start_http_server(port, addr=addr, registry=REGISTRY)
         logger.info("worker metrics http server listening on %s:%d", addr, port)
@@ -88,7 +88,7 @@ async def _run_async() -> int:
             # The container orchestrator can still kill the process.
             logger.warning("signal handler for %s unavailable", sig.name)
 
-    warmup = os.environ.get("NQAI_WARMUP_ON_BOOT", "true").lower() != "false"
+    warmup = os.environ.get("NEUROVOICE_WARMUP_ON_BOOT", "true").lower() != "false"
     engine, redis, archive = await boot_worker(warmup=warmup)
 
     consumer = WorkerConsumer(
@@ -97,17 +97,17 @@ async def _run_async() -> int:
         archive_to_r2=archive,
         stop_event=stop,
         # Production-ish defaults — env override for ops tuning.
-        block_ms=int(os.environ.get("NQAI_WORKER_BLOCK_MS", "5000")),
+        block_ms=int(os.environ.get("NEUROVOICE_WORKER_BLOCK_MS", "5000")),
         # Two distinct knobs (audit L2 H2 2026-05-25):
         #   * `xautoclaim_min_idle_ms` — how long a PEL message must
         #     sit idle before another worker claims it. Sets the
         #     "another worker assumes you're dead" threshold.
-        #     env: NQAI_WORKER_XAUTOCLAIM_IDLE_S (default 30 s)
+        #     env: NEUROVOICE_WORKER_XAUTOCLAIM_IDLE_S (default 30 s)
         #   * `xautoclaim_period_s` — how often a healthy worker
         #     proactively sweeps for stale PEL entries even while
         #     busy. Sets the "look for orphan work" cadence.
-        #     env: NQAI_WORKER_XAUTOCLAIM_PERIOD_S (default 5 s)
-        # Pre-fix the single `NQAI_WORKER_XAUTOCLAIM_INTERVAL_S` env
+        #     env: NEUROVOICE_WORKER_XAUTOCLAIM_PERIOD_S (default 5 s)
+        # Pre-fix the single `NEUROVOICE_WORKER_XAUTOCLAIM_INTERVAL_S` env
         # var bled into the idle threshold but operators read it as
         # the sweep cadence — opposite semantics. We keep the OLD name
         # as a back-compat alias for the idle threshold so any
@@ -115,12 +115,12 @@ async def _run_async() -> int:
         # meaning.
         xautoclaim_min_idle_ms=int(
             os.environ.get(
-                "NQAI_WORKER_XAUTOCLAIM_IDLE_S",
-                os.environ.get("NQAI_WORKER_XAUTOCLAIM_INTERVAL_S", "30"),
+                "NEUROVOICE_WORKER_XAUTOCLAIM_IDLE_S",
+                os.environ.get("NEUROVOICE_WORKER_XAUTOCLAIM_INTERVAL_S", "30"),
             )
         ) * 1000,
         xautoclaim_period_s=float(
-            os.environ.get("NQAI_WORKER_XAUTOCLAIM_PERIOD_S", "5.0")
+            os.environ.get("NEUROVOICE_WORKER_XAUTOCLAIM_PERIOD_S", "5.0")
         ),
     )
 
@@ -130,7 +130,7 @@ async def _run_async() -> int:
         consumer._block_ms, consumer.capacity,
     )
 
-    # Faz C heartbeat: publish capacity/in_flight to Redis so the gateway
+    # heartbeat: publish capacity/in_flight to Redis so the gateway
     # can do capacity-aware admission instead of XLEN-only backpressure.
     def _get_heartbeat_state() -> WorkerHeartbeatState:
         return WorkerHeartbeatState(
@@ -179,7 +179,7 @@ def run() -> int:
     """Sync entry point — `python -m worker.main` and the
     docker-compose `command:` both call this. Returns process exit code."""
     logging.basicConfig(
-        level=os.environ.get("NQAI_LOG_LEVEL", "INFO"),
+        level=os.environ.get("NEUROVOICE_LOG_LEVEL", "INFO"),
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
     _start_metrics_server()

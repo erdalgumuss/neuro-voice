@@ -1,13 +1,13 @@
 """Bootstrap script: create the first admin operator (idempotent).
 
 Usage:
-    python scripts/seed_operator.py --email erdal@nqai.com --full-name "Erdal" \
+    python scripts/seed_operator.py --email you@example.com --full-name "Erdal" \
         [--password-stdin]
 
 Reads password from stdin if --password-stdin, else generates one and prints
 it to stdout exactly once.
 
-Requires NQAI_DATABASE_URL pointing at a migrated Postgres (alembic upgrade
+Requires NEUROVOICE_DATABASE_URL pointing at a migrated Postgres (alembic upgrade
 head already run).
 """
 

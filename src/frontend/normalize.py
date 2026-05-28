@@ -97,7 +97,7 @@ def _expand_code_mix(text: str) -> str:
 
 
 def _expand_user_pronunciation(text: str, mapping: dict[str, str]) -> str:
-    """Faz B.5 Dalga 2.6 — per-request pronunciation override.
+    """per-request pronunciation override.
 
     Applied BEFORE the built-in code-mix lexicon so a tenant can shadow
     "iPhone" → vendor-specific spelling, override a brand the global
@@ -162,7 +162,7 @@ def normalize_text(
 ) -> str:
     """Run the v0 normalization pipeline. Idempotent for normalized input.
 
-    `pronunciation_dict` (Faz B.5 Dalga 2.6) is an optional per-request
+    `pronunciation_dict` is an optional per-request
     override map applied BEFORE the built-in code-mix lexicon, so the
     caller's override always wins for a given token.
     """

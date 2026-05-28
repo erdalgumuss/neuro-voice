@@ -11,7 +11,7 @@ pushes each `SynthChunk` onto an asyncio queue. The pipeline coroutine
 consumes chunks one at a time and `publish_chunk`s each to the
 per-request result stream immediately. This module deliberately
 contains NO media-sink abstraction — the production "sink" is
-`worker.pipeline.publish_chunk` writing to `nqai.tts.results.{rid}`.
+`worker.pipeline.publish_chunk` writing to `neurovoice.tts.results.{rid}`.
 
 Cleanup (audit L3 medium 2026-05-25): pre-cleanup this file also
 hosted `iter_live_audio_frames`, `run_live_synthesis`, the
@@ -37,7 +37,7 @@ if TYPE_CHECKING:
     # at runtime, so we must NOT import VoiceView at module-load time.
     from .pipeline import VoiceView
 
-logger = logging.getLogger("nqai_voice.worker.live")
+logger = logging.getLogger("neurovoice.worker.live")
 
 
 async def iter_engine_chunks(
@@ -141,6 +141,6 @@ async def iter_engine_chunks(
 # WebRTC-style transport that we explicitly decided not to ship in
 # the TTS API surface (decision-log 2026-05-24, "WebRTC/LiveKit
 # scaffold drop"). When duplex voice-agent transports do come back
-# they will live in a separate product surface (NIVA call-center,
-# etc.) with their OWN sink type — re-introducing them here would
-# couple two unrelated product surfaces.
+# they will live in a separate product surface (call-center,
+# conversational agents, ...) with their own sink type — re-introducing
+# them here would couple two unrelated product surfaces.

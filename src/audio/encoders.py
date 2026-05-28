@@ -53,7 +53,7 @@ import logging
 import shutil
 from typing import Protocol
 
-logger = logging.getLogger("nqai_voice.audio.encoders")
+logger = logging.getLogger("neurovoice.audio.encoders")
 
 
 class EncoderError(Exception):
@@ -86,7 +86,7 @@ class StreamEncoder(Protocol):
 
 class Pcm16PassthroughEncoder:
     """Raw int16 PCM — no encoding. The client is responsible for
-    knowing the sample rate (we expose it via the `X-NQAI-Sample-Rate`
+    knowing the sample rate (we expose it via the `X-NV-Sample-Rate`
     response header)."""
 
     content_type = "application/octet-stream"

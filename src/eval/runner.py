@@ -26,7 +26,7 @@ from .dataset import TestSentence, TestSet
 from .metrics import Metric, MetricResult
 from .systems import SystemOutput, TTSSystem
 
-logger = logging.getLogger("nqai_voice.eval.runner")
+logger = logging.getLogger("neurovoice.eval.runner")
 
 
 @dataclass(frozen=True)

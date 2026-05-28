@@ -10,8 +10,8 @@ Pipeline contract (commit-before-final ordering):
     2.  resolve reference audio URI → local Path (R2 download in a
         thread so we don't block the event loop)
     3.  engine.synthesize_stream(...) — sync generator, run in thread,
-        yields one SynthChunk per Türkçe sentence
-    4.  publish each chunk to nqai.tts.results.{rid} as a TtsResult XADD
+        yields one SynthChunk per sentence
+    4.  publish each chunk to neurovoice.tts.results.{rid} as a TtsResult XADD
         (NO final marker yet)
     5.  archive concatenated PCM to artifact storage (R2 or local)
         → `response_uri` (REQUIRED for client GET — no audio_url
@@ -30,7 +30,7 @@ Failure semantics (D-06 at-least-once + D-05 idempotency):
 
     Transient errors (NO error chunk, NO idem.fail; raise
     TransientFailure; consumer does NOT XACK — XAUTOCLAIM retries on
-    another worker, or DLQ after N retries in Faz C):
+    another worker, or DLQ after N retries in ):
       *   engine.synthesize_stream raised
       *   archive_to_r2 raised (network blip, R2 throttled — retry
             re-generates + re-archives; same idempotency row, same
@@ -73,7 +73,7 @@ from server.queue import (
 from .engine import BaseSynthEngine
 from .live import iter_engine_chunks
 
-logger = logging.getLogger("nqai_voice.worker.pipeline")
+logger = logging.getLogger("neurovoice.worker.pipeline")
 
 
 # --------------------------------------------------------------------------- #
@@ -323,7 +323,7 @@ async def process_one_job(
     reference_uri = voice_row.reference_uri
 
     # ---------- 2. resolve reference audio (R2 download in a thread) -----
-    # Faz C step 1: time the reference-resolve hop so we can attribute
+    # time the reference-resolve hop so we can attribute
     # latency spikes to R2 cold reads vs engine vs archive separately.
     ref_resolve_started = time.monotonic()
     reference_resolve_ms: int | None = None
@@ -366,7 +366,7 @@ async def process_one_job(
     first_pcm_ms: int | None = None
     first_audio_ms: int | None = None
 
-    # Faz B.5 Dalga 1.2 — resolve model_id preset to engine_overrides.
+    # resolve model_id preset to engine_overrides.
     # Unknown model_ids surface as PoisonJob (no point retrying — the
     # client sent garbage and a retry would garbage-in/garbage-out).
     # Explicit `params` (cfg_value, inference_timesteps) override the
@@ -392,9 +392,9 @@ async def process_one_job(
         "inference_timesteps": preset.inference_timesteps,
     }
 
-    # Faz B.5 Dalga 2.1 + 2.4 — layered voice settings:
-    #   1. voice.voice_settings_defaults (catalog-level; Dalga 2.4)
-    #   2. job.voice_settings (per-request; Dalga 2.1) — wins per-field
+    # + 2.4 — layered voice settings:
+    #   1. voice.voice_settings_defaults (catalog-level; )
+    #   2. job.voice_settings (per-request; ) — wins per-field
     # Both vendor-shape dicts. The per-field override matches the
     # vendor mental model (ElevenLabs voice.settings defaults + the
     # request's voice_settings layered on top).
@@ -428,14 +428,14 @@ async def process_one_job(
             if v is not None:
                 engine_overrides[k] = v
 
-    # Faz B.5 Dalga 2.1 — speed post-process. We resample per-chunk
+    # speed post-process. We resample per-chunk
     # rather than at the end because /v1/tts/stream needs to forward
     # ALREADY-sped audio to the client in real time; concatenating
     # and resampling at the end would defeat streaming. Linear interp
     # is voice-grade for the 0.7–1.2x range the schema bounds.
     from audio.postprocess import apply_voice_settings as _apply_vs
 
-    # Faz B.5 Dalga 2.6 — bundle vendor-parity per-request hints into
+    # bundle vendor-parity per-request hints into
     # `request_meta`. The engine cherry-picks the fields it acts on
     # (`seed`, `pronunciation_dict`); `previous_text`/`next_text` are
     # forward-compat (validated + persisted on the payload, no-op in
@@ -450,7 +450,7 @@ async def process_one_job(
     if job.next_text is not None:
         request_meta["next_text"] = job.next_text
 
-    # Faz B.5 Dalga 3.2 — per-sentence alignment. Built incrementally
+    # per-sentence alignment. Built incrementally
     # alongside the chunk loop so playback timestamps reflect the
     # actual concatenated audio (PCM byte count → ms via sample_rate).
     # Zero-cost when text is single-sentence: alignment is just one
@@ -589,9 +589,9 @@ async def process_one_job(
             await IdempotencyRepo(s, tenant_id).complete(
                 rid,
                 response_uri=response_uri,
-                # Faz B.5 Dalga 3.2 — persist alignment so /v1/tts/jobs/{id}
+                # persist alignment so /v1/tts/jobs/{id}
                 # can surface subtitle / scrub-bar data. Workers built
-                # before Dalga 3.2 pass None and the column stays NULL —
+                # before this contract pass None and the column stays NULL —
                 # exactly the same shape the gateway expects for "no
                 # alignment available".
                 sentence_alignment=alignment if alignment else None,
@@ -613,7 +613,7 @@ async def process_one_job(
                 rtf=rtf,
                 status="ok",
                 worker_id=worker_id,
-                # Faz B.5 Dalga 2.3 — model_id (preset slug) persisted so
+                # model_id (preset slug) persisted so
                 # the status response can return which preset ran. Maps
                 # to UsageRecord.model_version. preset is the resolved
                 # ModelPreset from earlier in this function.
@@ -625,11 +625,11 @@ async def process_one_job(
     except Exception as e:
         # Transient — same retry path. The archive call may have left
         # an orphan object in R2 (TODO: garbage-collect by request_id
-        # in Faz C), but client correctness is preserved.
+        # in ), but client correctness is preserved.
         logger.exception("idempotency.complete + usage.record commit failed for %s", rid)
         raise TransientFailure(f"db_commit_failed: {e}") from e
 
-    # ---------- 6b. Prometheus waterfall histograms (Faz C step 2) -------
+    # ---------- 6b. Prometheus waterfall histograms ( step 2) -------
     # Observe each populated waterfall stage. None values are skipped
     # silently by record_waterfall so retries / partial failures don't
     # pollute the histograms with phantom zeros.

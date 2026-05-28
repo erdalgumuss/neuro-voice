@@ -76,7 +76,7 @@ class UsageRepo:
     async def update_gateway_first_byte_ms(
         self, request_id: uuid.UUID, gateway_first_byte_ms: int,
     ) -> int:
-        """Gateway-side waterfall stitching (Faz C v1 item 1).
+        """Gateway-side waterfall stitching.
 
         The worker writes the usage row when its pipeline completes. The
         gateway then UPDATEs the `gateway_first_byte_ms` column on the

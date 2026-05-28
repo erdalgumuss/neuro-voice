@@ -12,7 +12,7 @@ Cleanup (audit L3 medium 2026-05-25): `LiveAudioFrame`,
 `LiveLatencyWaterfall`, `WATERFALL_FIELDS`, `now_ms` were removed
 because no production code path read them. The waterfall observation
 the audit doc referred to lives in `usage_records` columns + the
-`nqai_tts_*_seconds` Prometheus histograms; the in-memory bag was
+`neurovoice_tts_*_seconds` Prometheus histograms; the in-memory bag was
 WebRTC-era scaffolding kept alive only by its own tests.
 """
 

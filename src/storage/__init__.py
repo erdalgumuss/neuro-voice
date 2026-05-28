@@ -7,7 +7,7 @@ service (R2, B2, AWS S3, MinIO, Wasabi) consumes the same path and
 boto3 doesn't care which one you're talking to as long as the
 endpoint_url is set correctly.
 
-Faz B step 3 wires this into:
+wires this into:
   • reference_resolver.py's s3:// branch  → R2Storage.download_to_cache
   • main.py voice enroll                  → R2Storage.upload_reference
   • async job output                      → R2Storage.upload_output

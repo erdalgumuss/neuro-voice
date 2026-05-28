@@ -6,29 +6,24 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-# Faz B.5 Dalga 1 — codec layer (audit 2026-05-25): mp3 + opus added
-# alongside the existing wav/pcm16. mp3 (~3-5x smaller than wav) and
-# opus (~10x smaller, voice-tuned) are the formats real product
-# clients want; wav stays for download/debug, pcm16 stays for
-# low-level / benchmark use.
+# mp3 (~3-5x smaller than wav) and opus (~10x smaller, voice-tuned)
+# are the formats production clients usually want; wav stays for
+# download/debug and pcm16 for low-level / benchmark use.
 AudioFormat = Literal["wav", "pcm16", "mp3", "opus"]
 StreamFormat = Literal["wav", "pcm16", "mp3", "opus"]
 
 
-# --------------------------------------------------------------------------- #
-# Voice settings — Dalga 2.1, per-request voice fine-tuning
-# --------------------------------------------------------------------------- #
 class VoiceSettings(BaseModel):
     """Per-request voice tuning knobs.
 
     Vendor parity layer: ElevenLabs ships
     ``{stability, similarity_boost, style, use_speaker_boost, speed}``;
     MiniMax ships ``{speed, vol, pitch}``. We accept the superset so
-    NEEKO/NIVA/NeuroCourse can use the same SDK shapes they're used to;
-    fields the engine doesn't act on YET are documented as forward-
-    compatible (validated + persisted but no-op on the model).
+    integrations that already use those SDK shapes keep working; fields
+    the engine doesn't act on YET are documented as forward-compatible
+    (validated + persisted but no-op on the model).
 
-    Field semantics (NQAI mapping):
+    Field semantics:
     * ``stability`` (0.0–1.0): more stable = more inference timesteps.
       Maps to ``inference_timesteps`` offset (-4 at 0.0, +8 at 1.0).
       0.5 means "use the model_id preset's default steps".
@@ -37,12 +32,12 @@ class VoiceSettings(BaseModel):
       +0.5 at 1.0). 0.5 = preset default.
     * ``style`` (0.0–1.0): emotional exaggeration. Currently
       forward-compatible (persisted on the request, no engine action
-      yet — wires into style_tag selection in Dalga 2.6 follow-up).
+      yet — wires into style_tag selection in a follow-up).
     * ``use_speaker_boost`` (bool): clarity boost. Forward-compatible
       until VoxCPM2 exposes a matching flag.
     * ``speed`` (0.7–1.2): playback rate. Worker-side PCM resample;
       pitch will shift slightly at extremes (acceptable for voice in
-      this range). Pitch-preserving time stretch is Dalga 2.6.
+      this range). Pitch-preserving time stretch is a follow-up.
     * ``pitch`` (-12.0–+12.0 semitones): MiniMax-style pitch shift.
       Forward-compatible.
 
@@ -59,9 +54,6 @@ class VoiceSettings(BaseModel):
     pitch: float | None = Field(default=None, ge=-12.0, le=12.0)
 
 
-# --------------------------------------------------------------------------- #
-# Faz B.5 Dalga 2.6 — context + pronunciation + seed (vendor parity)
-# --------------------------------------------------------------------------- #
 # Shared pronunciation_dict bounds. Centralised so every request shape
 # enforces the same envelope and the worker never has to defend against
 # unbounded text-frontend work.
@@ -117,37 +109,32 @@ class TTSRequest(BaseModel):
     voice_id: str = Field(..., min_length=3, max_length=64)
     language: Literal["tr"] = "tr"
     audio_format: AudioFormat = "wav"
-    # Faz B.5 Dalga 1.2 — preset knob (turbo / hd / character). Resolved
-    # at the worker against `server.models.resolve_model`; unknown ids
-    # surface as 400 from the gateway. None = registry default.
+    # Preset knob (turbo / hd / character). Resolved at the worker
+    # against `server.models.resolve_model`; unknown ids surface as 400
+    # from the gateway. None = registry default.
     model_id: str | None = Field(default=None, max_length=64)
-    # Faz B.5 Dalga 2.1 — per-request voice tuning. See VoiceSettings
-    # docstring for the field-by-field NQAI mapping.
     voice_settings: VoiceSettings | None = None
-    # Faz B.5 Dalga 2.6 — best-effort determinism. Seeded torch RNG
-    # at the worker just before `model.generate()`. Same seed +
-    # same text + same voice + same engine knobs → same waveform
-    # within a model build; cross-build replays are not guaranteed.
-    # Constrained to signed 31-bit so it round-trips through JSON
-    # safely on every SDK.
+    # Best-effort determinism. Seeded torch RNG at the worker just
+    # before `model.generate()`. Same seed + same text + same voice +
+    # same engine knobs → same waveform within a model build;
+    # cross-build replays are not guaranteed. Constrained to signed
+    # 31-bit so it round-trips through JSON safely on every SDK.
     seed: int | None = Field(default=None, ge=0, le=2147483647)
-    # Faz B.5 Dalga 2.6 — surrounding-context hints (ElevenLabs-style).
-    # Today they are forward-compat: validated, persisted on the job
-    # payload, surfaced in the audit log for downstream learning,
-    # but the worker does not yet thread them into the model context
-    # window. Wires into a prosody-continuity pass when the engine
-    # exposes a sliding text buffer; clients can already start
-    # sending them so audiobook / long-doc flows light up
-    # automatically when that ships.
+    # ElevenLabs-style surrounding-context hints. Today they are
+    # forward-compat: validated, persisted on the job payload, and
+    # surfaced in the audit log, but the worker does not yet thread
+    # them into the model context window. Wires into a prosody-
+    # continuity pass when the engine exposes a sliding text buffer;
+    # clients can already start sending them so audiobook / long-doc
+    # flows light up automatically when that ships.
     previous_text: str | None = Field(default=None, max_length=4000)
     next_text: str | None = Field(default=None, max_length=4000)
-    # Faz B.5 Dalga 2.6 — per-request pronunciation override map.
-    # Concrete behavior: every key is treated as a whole-word case-
-    # insensitive substitution applied in the Turkish frontend
-    # BEFORE the built-in code-mix lexicon, so a tenant can correct
-    # brand pronunciations on a per-request basis without touching
-    # the global lexicon. Capped at 64 entries × 64 chars each to
-    # bound text-frontend work.
+    # Per-request pronunciation override map. Every key is treated as
+    # a whole-word case-insensitive substitution applied in the text
+    # frontend BEFORE the built-in code-mix lexicon, so a tenant can
+    # correct brand pronunciations on a per-request basis without
+    # touching the global lexicon. Capped at 64 entries × 64 chars
+    # each to bound text-frontend work.
     pronunciation_dict: dict[str, str] | None = Field(default=None)
 
     @field_validator("pronunciation_dict")
@@ -160,13 +147,12 @@ class TTSStreamRequest(TTSRequest):
     audio_format: StreamFormat = "wav"
 
 
-# --------------------------------------------------------------------------- #
-# Vendor-compat URL aliases — Dalga 2.2
-# --------------------------------------------------------------------------- #
+# Vendor-compat URL aliases.
+#
 # ElevenLabs ships `POST /v1/text-to-speech/{voice_id}` and the
 # corresponding `/stream` variant. SDKs they generate (Python, Node,
-# Go) call those exact URLs. To let NEEKO/NIVA/NeuroCourse swap base
-# URL and keep their code, we accept the same shape. `voice_id` lives
+# Go) call those exact URLs. To let integrations swap base URL and
+# keep their client code, we accept the same shape. `voice_id` lives
 # in the URL path; the request body is the rest of `TTSRequest`
 # WITHOUT the voice_id field.
 class TTSAliasRequest(BaseModel):
@@ -181,7 +167,7 @@ class TTSAliasRequest(BaseModel):
     audio_format: AudioFormat = "wav"
     model_id: str | None = Field(default=None, max_length=64)
     voice_settings: VoiceSettings | None = None
-    # Dalga 2.6 fields — same semantics as TTSRequest.
+    # Vendor-parity fields — same semantics as TTSRequest.
     seed: int | None = Field(default=None, ge=0, le=2147483647)
     previous_text: str | None = Field(default=None, max_length=4000)
     next_text: str | None = Field(default=None, max_length=4000)
@@ -199,7 +185,7 @@ class TTSStreamAliasRequest(TTSAliasRequest):
 
 
 class VoicePublic(BaseModel):
-    """Voice catalog entry. Fields added in Faz B.5 Dalga 2.4 are
+    """Voice catalog entry. Fields added in are
     optional so old enrolled voices stay representable."""
     voice_id: str
     display_name: str
@@ -212,7 +198,7 @@ class VoicePublic(BaseModel):
     visibility: Literal["private", "shared", "public"] = "private"
     created_at: str
     created_by: str
-    # Dalga 2.4 — vendor-parity metadata
+    # Vendor-parity metadata fields:
     description: str | None = None
     labels: list[str] | None = None
     preview_url: str | None = None
@@ -222,7 +208,7 @@ class VoicePublic(BaseModel):
 class VoiceListResponse(BaseModel):
     voices: list[VoicePublic]
     count: int
-    # Faz B.5 Dalga 2.4 — pagination cursors. Cheap to add now so
+    # pagination cursors. Cheap to add now so
     # clients don't have to migrate when catalogs grow past one page.
     limit: int | None = None
     offset: int | None = None
@@ -246,7 +232,7 @@ class VoiceUpdateRequest(BaseModel):
 
 
 class EnrollResponse(BaseModel):
-    """Faz B.5 Dalga 2.5 — first-class voice clone response.
+    """first-class voice clone response.
 
     `requires_verification` mirrors ElevenLabs IVC: when True, the
     voice is enrolled but the platform expects the operator to confirm
@@ -319,11 +305,11 @@ class TTSJobParams(BaseModel):
 class TTSJobCreate(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
-    # Faz B.5 Dalga 3.2 — async surface accepts long-form text.
+    # async surface accepts long-form text.
     # ElevenLabs / MiniMax async paths take 100k–1M chars (full books).
     # The schema ceiling is generous (250 000 chars ≈ ~5h playback at
     # 14 chars/sec read rate); a tighter, env-tunable runtime cap
-    # (NQAI_ASYNC_MAX_CHARS, default 100 000) is enforced in the
+    # (NEUROVOICE_ASYNC_MAX_CHARS, default 100 000) is enforced in the
     # gateway so operators can lift it per deployment without a code
     # change. Sync `/v1/tts` stays at 4 000 chars (config.max_chars_per_request)
     # because the gateway → result-stream → response timeout (30s default)
@@ -335,7 +321,7 @@ class TTSJobCreate(BaseModel):
     model_id: str | None = Field(default=None, max_length=64)
     voice_settings: VoiceSettings | None = None
     params: TTSJobParams | None = None
-    # Dalga 2.6 fields — same semantics as TTSRequest.
+    # Vendor-parity fields — same semantics as TTSRequest.
     seed: int | None = Field(default=None, ge=0, le=2147483647)
     previous_text: str | None = Field(default=None, max_length=4000)
     next_text: str | None = Field(default=None, max_length=4000)
@@ -360,7 +346,7 @@ class TTSJobAccepted(BaseModel):
 class TTSJobMetrics(BaseModel):
     """Latency + billing metadata in the async job status response.
 
-    Faz B.5 Dalga 2.3 — fields added so the response shape lines up
+    — fields added so the response shape lines up
     with ElevenLabs raw-header metadata + MiniMax `extra_info` body.
     All fields nullable — the worker may not have written some yet
     (e.g. a job that errored before inference).
@@ -371,14 +357,14 @@ class TTSJobMetrics(BaseModel):
     inference_ms: int | None = None
     # `first_audio_ms`: worker-side inference-start → first-publish_chunk
     # XADD. Surfaced on the API now that the streaming endpoint also
-    # measures it (Faz C v1 item 1 wired the column; this just
+    # measures it ( v1 item 1 wired the column; this just
     # re-exposes it on the async status response).
     first_audio_ms: int | None = None
     generated_audio_ms: int | None = None
     rtf: float | None = None
     # Billing primary key — character count of the original text.
-    # Same value the gateway puts on the `X-NQAI-Character-Count`
-    # header for sync paths.
+    # Same value the gateway puts on the `X-NV-Character-Count`
+    # header for sync paths (header prefix pending brand-ADR).
     character_count: int | None = None
     # Preset that actually ran (registry-default when client sent None).
     model_id: str | None = None
@@ -391,7 +377,7 @@ class TTSJobOutput(BaseModel):
 
 
 class SentenceAlignment(BaseModel):
-    """Faz B.5 Dalga 3.2 — one row of the per-sentence alignment list
+    """one row of the per-sentence alignment list
     returned with long-form jobs. Timestamps are PLAYBACK milliseconds
     relative to the start of the rendered audio, so a client can map a
     scrub-bar position straight to a sentence."""
@@ -409,7 +395,7 @@ class TTSJobStatusResponse(BaseModel):
     created_at: str
     metrics: TTSJobMetrics | None = None
     output: TTSJobOutput | None = None
-    # Faz B.5 Dalga 3.2 — only present on completed long-form jobs.
+    # only present on completed long-form jobs.
     # Short jobs (or pre-Dalga-3.2 rows) leave this NULL so the response
     # payload doesn't balloon for the common single-sentence case.
     alignment: list[SentenceAlignment] | None = None

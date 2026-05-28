@@ -1,4 +1,4 @@
-"""Sustained-load + stability benchmark for NQAI Voice (Faz C v1 item 5).
+"""Sustained-load + stability benchmark for NeuroVoice.
 
 Differs from `scripts/latency_bench.py`:
 * latency_bench: small N, careful per-stage timing. Answers "what does
@@ -13,13 +13,13 @@ The output is the artifact for the Codex-listed checklist items:
   * 200-user target simulation
 
 Run separately for each load level; the produced raw.json + report.md
-become evidence for the Faz C closure doc.
+become evidence for the load-readiness closure doc.
 
 Usage:
 
     python scripts/load_bench.py \\
         --base-url http://localhost:8000 \\
-        --api-key "nqai_dev_..." \\
+        --api-key "nv_dev_..." \\
         --voice neeko-v01 \\
         --concurrency 20 \\
         --duration-s 60 \\
@@ -234,7 +234,7 @@ async def _worker_loop(
 
 def _format_markdown(report: RunReport) -> str:
     lines: list[str] = []
-    lines.append(f"# NQAI Voice load benchmark — {report.hardware_label}")
+    lines.append(f"# NeuroVoice load benchmark — {report.hardware_label}")
     lines.append("")
     lines.append(f"- **Started:** {report.started_at}")
     lines.append(f"- **Finished:** {report.finished_at}")

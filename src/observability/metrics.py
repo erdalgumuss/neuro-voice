@@ -1,4 +1,4 @@
-"""Prometheus metric registry for the NQAI Voice TTS platform.
+"""Prometheus metric registry for the NeuroVoice TTS platform.
 
 This module owns a *dedicated* ``CollectorRegistry`` (not the prometheus_client
 global default). Reasons:
@@ -69,7 +69,7 @@ WATERFALL_BUCKETS: tuple[float, ...] = (
 # ---------------------------------------------------------------------------
 
 TTS_REQUESTS: Counter = Counter(
-    "nqai_tts_requests_total",
+    "neurovoice_tts_requests_total",
     "Total TTS requests by tenant, voice and terminal status.",
     labelnames=("tenant", "voice", "status"),
     registry=REGISTRY,
@@ -81,14 +81,14 @@ dedicated counter (``TTS_DEPRECATED_ENDPOINT_TOTAL`` below) so it
 doesn't double-count with ``success`` for the same request.
 
 NOTE: ``app_label`` is intentionally NOT a Prometheus label — it's a
-user-controlled header (``X-NQAI-App``) and Prometheus cardinality must
+user-controlled header (``X-NV-App``) and Prometheus cardinality must
 stay bounded. Per-app breakdowns live in ``usage_records.app_label`` in
 Postgres, queried via a SQL exporter / Grafana datasource. See audit
 2026-05-24."""
 
 
 TTS_DEPRECATED_ENDPOINT_TOTAL: Counter = Counter(
-    "nqai_tts_deprecated_endpoint_total",
+    "neurovoice_tts_deprecated_endpoint_total",
     "Hits on a deprecated endpoint (RFC 8594 sunset clients still "
     "calling). Watch `rate(...[5m])` trend toward 0 before the "
     "sunset date — non-zero close to sunset means the migration "
@@ -101,7 +101,7 @@ deprecated endpoints add a label value here when they enter sunset."""
 
 
 TTS_ERRORS: Counter = Counter(
-    "nqai_tts_errors_total",
+    "neurovoice_tts_errors_total",
     "TTS error counter classified by failure type.",
     labelnames=("type",),
     registry=REGISTRY,
@@ -110,7 +110,7 @@ TTS_ERRORS: Counter = Counter(
 
 
 WORKER_DLQ: Counter = Counter(
-    "nqai_worker_dlq_total",
+    "neurovoice_worker_dlq_total",
     "Jobs XADDed to the dead-letter queue by the worker.",
     registry=REGISTRY,
 )
@@ -119,26 +119,26 @@ WORKER_DLQ: Counter = Counter(
 # MLOps PR #4 (A.6) — LoRA adapter cache effectiveness. The cold-load
 # histogram (WORKER_COLD_LOAD_SECONDS, below) tells us WHEN a load
 # happened, not how often it happened vs. cache hits. The counter pair
-# here closes that gap so operators can size NQAI_LORA_CACHE_SIZE
+# here closes that gap so operators can size NEUROVOICE_LORA_CACHE_SIZE
 # based on cache hit rate rather than a guess.
 WORKER_LORA_CACHE_HITS: Counter = Counter(
-    "nqai_worker_lora_cache_hits_total",
+    "neurovoice_worker_lora_cache_hits_total",
     "Per-voice LoRA adapter cache hits in _model_for_adapter — request "
     "found the adapter already loaded, no cold-load.",
     labelnames=("voice",),
     registry=REGISTRY,
 )
 WORKER_LORA_CACHE_MISSES: Counter = Counter(
-    "nqai_worker_lora_cache_misses_total",
+    "neurovoice_worker_lora_cache_misses_total",
     "Per-voice LoRA adapter cache misses — request triggered a cold load. "
     "Should match the WORKER_COLD_LOAD_SECONDS observe count.",
     labelnames=("voice",),
     registry=REGISTRY,
 )
 WORKER_LORA_CACHE_EVICTIONS: Counter = Counter(
-    "nqai_worker_lora_cache_evictions_total",
+    "neurovoice_worker_lora_cache_evictions_total",
     "LRU evictions from the per-worker LoRA cache (capacity reached). "
-    "Frequent evictions indicate NQAI_LORA_CACHE_SIZE is too small.",
+    "Frequent evictions indicate NEUROVOICE_LORA_CACHE_SIZE is too small.",
     registry=REGISTRY,
 )
 
@@ -151,7 +151,7 @@ _WATERFALL_LABELS = ("tenant", "voice")
 
 
 TTS_QUEUE_WAIT_SECONDS: Histogram = Histogram(
-    "nqai_tts_queue_wait_seconds",
+    "neurovoice_tts_queue_wait_seconds",
     "Time a TTS job spent waiting in Redis Streams before a worker picked it up.",
     labelnames=_WATERFALL_LABELS,
     buckets=WATERFALL_BUCKETS,
@@ -159,7 +159,7 @@ TTS_QUEUE_WAIT_SECONDS: Histogram = Histogram(
 )
 
 TTS_WORKER_PICKUP_SECONDS: Histogram = Histogram(
-    "nqai_tts_worker_pickup_seconds",
+    "neurovoice_tts_worker_pickup_seconds",
     "Worker-side pickup latency: XREADGROUP read time + payload parse.",
     labelnames=_WATERFALL_LABELS,
     buckets=WATERFALL_BUCKETS,
@@ -167,7 +167,7 @@ TTS_WORKER_PICKUP_SECONDS: Histogram = Histogram(
 )
 
 TTS_REFERENCE_RESOLVE_SECONDS: Histogram = Histogram(
-    "nqai_tts_reference_resolve_seconds",
+    "neurovoice_tts_reference_resolve_seconds",
     "Latency of reference-audio resolution (R2 fetch / file:// open / cache hit).",
     labelnames=_WATERFALL_LABELS,
     buckets=WATERFALL_BUCKETS,
@@ -175,7 +175,7 @@ TTS_REFERENCE_RESOLVE_SECONDS: Histogram = Histogram(
 )
 
 TTS_FIRST_PCM_SECONDS: Histogram = Histogram(
-    "nqai_tts_first_pcm_seconds",
+    "neurovoice_tts_first_pcm_seconds",
     "Time from worker pickup to the first PCM frame emitted by the engine.",
     labelnames=_WATERFALL_LABELS,
     buckets=WATERFALL_BUCKETS,
@@ -183,10 +183,10 @@ TTS_FIRST_PCM_SECONDS: Histogram = Histogram(
 )
 
 TTS_FIRST_AUDIO_SECONDS: Histogram = Histogram(
-    "nqai_tts_first_audio_seconds",
+    "neurovoice_tts_first_audio_seconds",
     "Worker-side latency: inference start to first publish_chunk XADD "
     "(when the gateway can first read a byte off the result stream). "
-    "Compare with nqai_tts_gateway_first_byte_seconds to isolate "
+    "Compare with neurovoice_tts_gateway_first_byte_seconds to isolate "
     "worker vs. gateway/transport contribution to client TTFB.",
     labelnames=_WATERFALL_LABELS,
     buckets=WATERFALL_BUCKETS,
@@ -194,13 +194,13 @@ TTS_FIRST_AUDIO_SECONDS: Histogram = Histogram(
 )
 
 WORKER_COLD_LOAD_SECONDS: Histogram = Histogram(
-    "nqai_worker_cold_load_seconds",
+    "neurovoice_worker_cold_load_seconds",
     "Time spent loading a voice's model + LoRA adapter into VRAM "
     "when the per-voice cache missed. Fires ONCE per voice per "
-    "worker process at boot (NQAI_WORKER_WARMUP_VOICES eager path) "
+    "worker process at boot (NEUROVOICE_WORKER_WARMUP_VOICES eager path) "
     "OR on the first inference for an un-cached voice. Watching p95 "
     "tells operators whether per-voice sticky routing or a bigger "
-    "NQAI_LORA_CACHE_SIZE is worth the engineering.",
+    "NEUROVOICE_LORA_CACHE_SIZE is worth the engineering.",
     labelnames=("voice",),
     buckets=(
         # Cold-load is dominated by VRAM I/O + safetensors mmap; for
@@ -214,10 +214,10 @@ WORKER_COLD_LOAD_SECONDS: Histogram = Histogram(
 
 
 TTS_GATEWAY_FIRST_BYTE_SECONDS: Histogram = Histogram(
-    "nqai_tts_gateway_first_byte_seconds",
+    "neurovoice_tts_gateway_first_byte_seconds",
     "Client-facing TTFB on /v1/tts/stream: time from gateway receiving "
     "the HTTP request to writing the first audio byte on the "
-    "StreamingResponse. Subtract `nqai_tts_first_audio_seconds` to get "
+    "StreamingResponse. Subtract `neurovoice_tts_first_audio_seconds` to get "
     "the gateway+transport overhead alone.",
     labelnames=_WATERFALL_LABELS,
     buckets=WATERFALL_BUCKETS,
@@ -225,7 +225,7 @@ TTS_GATEWAY_FIRST_BYTE_SECONDS: Histogram = Histogram(
 )
 
 TTS_INFERENCE_SECONDS: Histogram = Histogram(
-    "nqai_tts_inference_seconds",
+    "neurovoice_tts_inference_seconds",
     "Pure model inference duration (worker-side, first PCM to last PCM).",
     labelnames=_WATERFALL_LABELS,
     buckets=WATERFALL_BUCKETS,
@@ -233,7 +233,7 @@ TTS_INFERENCE_SECONDS: Histogram = Histogram(
 )
 
 TTS_TOTAL_SECONDS: Histogram = Histogram(
-    "nqai_tts_total_seconds",
+    "neurovoice_tts_total_seconds",
     "Worker-side wall time per TTS job (pipeline start to archive + "
     "DB commit done). Does NOT include gateway HTTP framing or "
     "client transport time.",
@@ -251,7 +251,7 @@ TTS_TOTAL_SECONDS: Histogram = Histogram(
 # RMS (root-mean-square amplitude) is the cheapest reliable signal of
 # "the model produced actual audio". A worker that loops on empty PCM,
 # crashes mid-segment, or returns silent floats will surface as
-# `nqai_tts_output_rms_normalized` near 0.0 — invisible today.
+# `neurovoice_tts_output_rms_normalized` near 0.0 — invisible today.
 #
 # silence_ratio catches the "audio with periodic dropouts" failure
 # mode (a stuck attention head produces partial silence) that RMS
@@ -277,7 +277,7 @@ TTS_TOTAL_SECONDS: Histogram = Histogram(
 # rarely sits above 0.3 RMS (we peak-normalize references to 0.95);
 # above 0.5 is almost certainly distortion territory.
 TTS_OUTPUT_RMS: Histogram = Histogram(
-    "nqai_tts_output_rms_normalized",
+    "neurovoice_tts_output_rms_normalized",
     "Output PCM RMS amplitude (0.0–1.0 of int16 full-scale). Near zero "
     "means the engine produced silence; near one means clipping.",
     labelnames=_WATERFALL_LABELS,
@@ -290,7 +290,7 @@ TTS_OUTPUT_RMS: Histogram = Histogram(
 # a 1 % full-scale threshold (~328 / 32767). 1.0 = pure silence; mid-
 # values indicate periodic dropouts inside otherwise-valid audio.
 TTS_OUTPUT_SILENCE_RATIO: Histogram = Histogram(
-    "nqai_tts_output_silence_ratio",
+    "neurovoice_tts_output_silence_ratio",
     "Fraction of int16 PCM samples below 1 % full-scale (near-silence). "
     "1.0 = silent; mid values = stutters / partial dropouts.",
     labelnames=_WATERFALL_LABELS,
@@ -301,7 +301,7 @@ TTS_OUTPUT_SILENCE_RATIO: Histogram = Histogram(
 # clipping_ratio: fraction of samples saturating at ±32767 (or 95 % of
 # it). Anything above ~0.001 is audible distortion.
 TTS_OUTPUT_CLIPPING_RATIO: Histogram = Histogram(
-    "nqai_tts_output_clipping_ratio",
+    "neurovoice_tts_output_clipping_ratio",
     "Fraction of int16 PCM samples at >= 95 %% full-scale. Above 0.001 "
     "is audible distortion the client will hear before this metric.",
     labelnames=_WATERFALL_LABELS,
@@ -313,7 +313,7 @@ TTS_OUTPUT_CLIPPING_RATIO: Histogram = Histogram(
 # Turkish steady-state read-rate ~70-80 ms/char in our domain; below 30
 # ms/char suggests truncation, above 200 ms/char suggests a stuck loop.
 TTS_DURATION_PER_CHAR_SECONDS: Histogram = Histogram(
-    "nqai_tts_output_seconds_per_char",
+    "neurovoice_tts_output_seconds_per_char",
     "Output audio duration divided by input character count. "
     "Sanity bound on truncation (too low) and stuck-loop (too high). "
     "Real-voice steady-state for Turkish in our domain is ~0.07-0.08.",
@@ -331,7 +331,7 @@ TTS_DURATION_PER_CHAR_SECONDS: Histogram = Histogram(
 # BS.1770 gated minimum) emit -70.0 as a sentinel so the bucket is
 # self-consistent.
 TTS_OUTPUT_INTEGRATED_LUFS: Histogram = Histogram(
-    "nqai_tts_output_integrated_lufs",
+    "neurovoice_tts_output_integrated_lufs",
     "Integrated loudness (ITU-R BS.1770-5 LUFS, dialog-gated). "
     "Voice-agent target -16 LUFS ±1 LU; broadcast-mix target -23 LUFS. "
     "Clips shorter than 400 ms emit -70.0 (BS.1770 gated minimum).",
@@ -347,25 +347,25 @@ TTS_OUTPUT_INTEGRATED_LUFS: Histogram = Histogram(
 # ---------------------------------------------------------------------------
 
 WORKER_CAPACITY: Gauge = Gauge(
-    "nqai_worker_capacity_total",
+    "neurovoice_worker_capacity_total",
     "Sum of declared per-worker capacity across all healthy workers.",
     registry=REGISTRY,
 )
 
 WORKER_INFLIGHT: Gauge = Gauge(
-    "nqai_worker_inflight_total",
+    "neurovoice_worker_inflight_total",
     "Sum of in-flight TTS jobs across all healthy workers.",
     registry=REGISTRY,
 )
 
 WORKER_COUNT: Gauge = Gauge(
-    "nqai_worker_count",
+    "neurovoice_worker_count",
     "Number of workers currently considered healthy (heartbeat fresh).",
     registry=REGISTRY,
 )
 
 WORKER_MODEL_INFO: Gauge = Gauge(
-    "nqai_worker_model_info",
+    "neurovoice_worker_model_info",
     "Active model + revision per worker. Value is constant 1; labels carry "
     "the variable. Use `count by (revision)` to see how many workers are on "
     "each revision during a rollout. Set to 0 on shutdown for clean counts.",

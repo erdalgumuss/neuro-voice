@@ -11,7 +11,7 @@ when ANY of:
 D-08 (tenant_id mandatory filter) is preserved — every accessibility
 query carries `self.tenant_id` either as owner check or as access-grant
 filter. There is no "list all voices" method; an admin operator that
-needs that should go through an operator-scoped repo (Faz B+).
+needs that should go through an operator-scoped repo .
 
 Mutation methods (create / soft_delete / set_release_status / set_visibility)
 are owner-only — the viewer must also be the owner. Cross-tenant mutation
@@ -184,7 +184,7 @@ class VoiceRepo:
         style_tags: list[str] | None = None,
         visibility: str | None = None,
     ) -> Voice | None:
-        """Faz B.5 Dalga 2.4 — owner-only metadata edit.
+        """owner-only metadata edit.
 
         Returns None if the voice is not owned by this repo's tenant
         (caller maps to 404 — same existence-leak rule as soft_delete).
@@ -240,7 +240,7 @@ class VoiceRepo:
         'private' → only owner; 'shared' → owner + voice_access grants;
         'public'  → every active tenant. Setting back to 'private' does
         NOT delete existing voice_access rows (they become latent — a
-        future flip to 'shared' restores those grants). Faz B+ admin
+        future flip to 'shared' restores those grants). future admin
         flow may add an explicit `revoke_all_access` op.
         """
         if visibility not in {"private", "shared", "public"}:

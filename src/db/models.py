@@ -1,16 +1,17 @@
-"""ORM models — kanonik şema [data-model.md](../../docs/architecture/data-model.md).
+"""ORM models — canonical schema for the platform DB.
 
-Tablolar:
-    tenants                outer customer (NEEKO/NIVA/NeuroCourse/NARO)
-    operators              NQAI staff (admin UI users)
+Tables:
+    tenants                outer customer (downstream product, integration,
+                           or external API consumer)
+    operators              platform staff (admin UI users)
     api_keys               tenant credentials (Bearer)
     voices                 tenant-scoped voice catalog
     usage_records          time-series TTS request log
     audit_log              append-only security-relevant events
     job_idempotency        24h dedup cache for request_id
 
-Tüm modeller `Base` üzerinden bağlanır; alembic --autogenerate'in tutarlı
-diff üretmesi için naming convention `Base.metadata`'ya işli.
+All models bind through `Base`; the naming convention is set on
+`Base.metadata` so alembic --autogenerate produces stable diffs.
 """
 
 from __future__ import annotations
@@ -258,21 +259,22 @@ class Voice(Base, TimestampMixin):
         _JSONBPortable, nullable=False, default=dict
     )
 
-    # Faz B.5 Dalga 2.4 — voice catalog enrichment (vendor parity).
+    # voice catalog enrichment (vendor parity).
     # All nullable so pre-existing rows stay valid; populated via
     # POST /v1/voices (enroll) or PATCH /v1/voices/{voice_id} (update).
     description: Mapped[str | None] = mapped_column(Text)
     labels: Mapped[list[str] | None] = mapped_column(_StringArrayPortable)
     preview_url: Mapped[str | None] = mapped_column(Text)
     # voice_settings_defaults: per-voice baseline that the per-request
-    # voice_settings (Dalga 2.1) layers on top of. Vendor-shape dict —
+    # voice_settings layers on top of. Vendor-shape dict —
     # {stability, similarity_boost, speed, style, ...}. Distinct from
     # `engine_params` which holds the internal cfg_value/timesteps.
     voice_settings_defaults: Mapped[dict[str, Any] | None] = mapped_column(
         _JSONBPortable,
     )
 
-    # Faz 3+ (NULL ile başlar)
+    # LoRA / adapter columns — NULL on plain catalog rows; populated
+    # once a voice ships with a fine-tuned adapter manifest.
     adapter_uri: Mapped[str | None] = mapped_column(Text)
     adapter_sha256: Mapped[str | None] = mapped_column(Text)
     adapter_type: Mapped[str | None] = mapped_column(Text)
@@ -345,7 +347,7 @@ class Voice(Base, TimestampMixin):
 # --------------------------------------------------------------------------- #
 # Public voices bypass this table (every active tenant sees them). Private
 # voices ignore this table entirely. Only when visibility='shared' do these
-# rows mediate access. Insertion is admin-operator territory (Faz B+
+# rows mediate access. Insertion is admin-operator territory (+
 # `POST /v1/voices/{id}/share` endpoint — out of scope for refactor R).
 class VoiceAccess(Base):
     __tablename__ = "voice_access"
@@ -424,7 +426,7 @@ class UsageRecord(Base):
     queue_wait_ms: Mapped[int | None] = mapped_column(Integer)
     inference_ms: Mapped[int | None] = mapped_column(Integer)
     ttfb_ms: Mapped[int | None] = mapped_column(Integer)
-    # Faz C step 1 — latency waterfall expansion (migration 0004).
+    # Latency waterfall (migration 0004):
     # `worker_pickup_ms`     = (worker start) - payload.enqueued_at_ms
     # `reference_resolve_ms` = resolve_reference_uri duration
     # `first_pcm_ms`         = inference start → first engine SynthChunk
@@ -433,7 +435,7 @@ class UsageRecord(Base):
     reference_resolve_ms: Mapped[int | None] = mapped_column(Integer)
     first_pcm_ms: Mapped[int | None] = mapped_column(Integer)
     first_audio_ms: Mapped[int | None] = mapped_column(Integer)
-    # Faz C v1 item 1 — gateway-side TTFB (migration 0005). Only populated
+    #  v1 item 1 — gateway-side TTFB (migration 0005). Only populated
     # for `/v1/tts/stream`; async jobs and sync `/v1/tts` leave NULL.
     # The gateway writes this via UPDATE after its streaming generator
     # emits its first chunk (the worker writes everything else).
@@ -443,10 +445,10 @@ class UsageRecord(Base):
     error_code: Mapped[str | None] = mapped_column(Text)
     worker_id: Mapped[str | None] = mapped_column(Text)
     model_version: Mapped[str | None] = mapped_column(Text)
-    # Product attribution from X-NQAI-App request header (refactor R,
-    # 2026-05-24). NULL when the header was absent — the field is
-    # advisory metadata, not a billing primary key (tenant_id stays the
-    # source of truth for who pays).
+    # Product attribution from the X-NV-App request header. NULL when
+    # the header was absent — the field is advisory metadata, not a
+    # billing primary key (tenant_id stays the source of truth for who
+    # pays). Header prefix pending brand-ADR.
     app_label: Mapped[str | None] = mapped_column(Text)
 
     # MLOps PR #1 (2026-05-25) — reproducibility audit trail. JSONB
@@ -578,7 +580,7 @@ class JobIdempotency(Base):
         DateTime(timezone=True), nullable=False,
     )
 
-    # Faz B.5 Dalga 3.2 — per-sentence alignment for long-form playback.
+    # per-sentence alignment for long-form playback.
     # The worker fills this when the job completes; a list of
     # `{seq, start_ms, end_ms, text}` dicts in playback order. Lets
     # async clients render subtitles + scrub-bar timestamps without

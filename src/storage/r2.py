@@ -37,7 +37,7 @@ except ImportError:  # pragma: no cover — only the test stub path needs this
     Config = None
     ClientError = Exception
 
-logger = logging.getLogger("nqai_voice.storage.r2")
+logger = logging.getLogger("neurovoice.storage.r2")
 
 DEFAULT_PRESIGN_TTL = 3600  # 1 hour; tune per call
 DEFAULT_CACHE_MAX_BYTES = 5 * 1024 * 1024 * 1024  # 5 GiB
@@ -98,12 +98,12 @@ class R2Storage:
     ) -> None:
         self.default_bucket = default_bucket
         self.cache_dir = cache_dir or Path(
-            os.environ.get("NQAI_R2_CACHE_DIR", "/tmp/nqai-r2-cache")
+            os.environ.get("NEUROVOICE_R2_CACHE_DIR", "/tmp/neurovoice-r2-cache")
         )
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         if cache_max_bytes is None:
             cache_max_bytes = int(
-                os.environ.get("NQAI_R2_CACHE_MAX_BYTES", str(DEFAULT_CACHE_MAX_BYTES))
+                os.environ.get("NEUROVOICE_R2_CACHE_MAX_BYTES", str(DEFAULT_CACHE_MAX_BYTES))
             )
         self.cache_max_bytes = cache_max_bytes
         self._client_lock = threading.Lock()
@@ -336,17 +336,17 @@ def get_r2_storage() -> R2Storage:
         return _singleton
     with _singleton_lock:
         if _singleton is None:
-            account_id = os.environ.get("NQAI_R2_ACCOUNT_ID")
-            bucket = os.environ.get("NQAI_R2_BUCKET")
+            account_id = os.environ.get("NEUROVOICE_R2_ACCOUNT_ID")
+            bucket = os.environ.get("NEUROVOICE_R2_BUCKET")
             if not (account_id and bucket):
                 raise RuntimeError(
-                    "R2 storage requires NQAI_R2_ACCOUNT_ID + NQAI_R2_BUCKET env"
+                    "R2 storage requires NEUROVOICE_R2_ACCOUNT_ID + NEUROVOICE_R2_BUCKET env"
                 )
             endpoint = f"https://{account_id}.r2.cloudflarestorage.com"
             _singleton = R2Storage(
                 default_bucket=bucket,
                 endpoint_url=endpoint,
-                access_key_id=os.environ.get("NQAI_R2_ACCESS_KEY_ID"),
-                secret_access_key=os.environ.get("NQAI_R2_SECRET_ACCESS_KEY"),
+                access_key_id=os.environ.get("NEUROVOICE_R2_ACCESS_KEY_ID"),
+                secret_access_key=os.environ.get("NEUROVOICE_R2_SECRET_ACCESS_KEY"),
             )
         return _singleton

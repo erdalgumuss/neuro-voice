@@ -168,7 +168,7 @@ class RateLimiter:
         per_minute: int,
     ) -> RateLimitResult:
         return await self.check(
-            f"nqai:rl:key:{key_id}",
+            f"neurovoice:rl:key:{key_id}",
             limit=per_minute,
             window_ms=60_000,
         )
@@ -180,7 +180,7 @@ class RateLimiter:
         per_minute: int = 600,
     ) -> RateLimitResult:
         return await self.check(
-            f"nqai:rl:tenant:{tenant_id}",
+            f"neurovoice:rl:tenant:{tenant_id}",
             limit=per_minute,
             window_ms=60_000,
         )

@@ -7,8 +7,8 @@ src/worker/ imports this.
 
 Flow (sync `/v1/tts` proxy, `/v1/tts/stream`):
 
-    1. Gateway XADD job to nqai.tts.jobs (already in main.py)
-    2. Gateway awaits chunks on nqai.tts.results.{rid} via XREAD BLOCK
+    1. Gateway XADD job to neurovoice.tts.jobs (already in main.py)
+    2. Gateway awaits chunks on neurovoice.tts.results.{rid} via XREAD BLOCK
     3. Each TtsResult chunk is yielded — caller can concat (sync) or
        push to client (WS / chunked HTTP)
     4. Final chunk OR error chunk ends the stream; gateway DELs the
@@ -34,7 +34,7 @@ from redis.asyncio import Redis
 
 from .queue import TtsResult, result_stream_name
 
-logger = logging.getLogger("nqai_voice.server.result_stream")
+logger = logging.getLogger("neurovoice.server.result_stream")
 
 
 class ResultStreamTimeout(Exception):

@@ -1,4 +1,4 @@
-"""NQAI Voice TTS — FastAPI application.
+"""NeuroVoice TTS — FastAPI application.
 
 Run with:
     uvicorn server.main:app --host 0.0.0.0 --port 8000
@@ -8,7 +8,7 @@ Auth surface:
     * JWT cookie (operator) on /admin/*
     * /health is unauthenticated (k8s liveness)
 
-Faz A.6 cutover (this revision): TTS endpoints switched off the legacy
+ cutover (this revision): TTS endpoints switched off the legacy
 env-list auth and the filesystem voice catalog onto the DB-backed
 auth pipeline + VoiceRepo. The legacy registry module still ships for
 the migration script but is no longer the source of truth at request
@@ -107,7 +107,7 @@ from .schemas import (
     VoiceUpdateRequest,
 )
 
-logger = logging.getLogger("nqai_voice.server")
+logger = logging.getLogger("neurovoice.server")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(name)s %(levelname)s %(message)s",
@@ -115,7 +115,7 @@ logging.basicConfig(
 
 VERSION = "0.4.0"
 
-# Faz B.1 step 3 cutover: the gateway no longer holds a VoxCPM2 engine.
+# cutover: the gateway no longer holds a VoxCPM2 engine.
 # Sync /v1/tts and /v1/tts/stream proxy through the same Redis queue
 # the async /v1/tts/jobs path uses. Engine + sentence streaming live
 # exclusively in `src/worker/`; the gateway is pure I/O + auth + DB.
@@ -132,7 +132,7 @@ VERSION = "0.4.0"
 # documented at the canonical migration URL below.
 SYNC_TTS_SUNSET = "Wed, 01 Jul 2026 00:00:00 GMT"
 _SYNC_DEPRECATION_LINK = (
-    '<https://docs.nqai.dev/migrations/v1-tts-streaming>; '
+    '<https://docs.neurovoice.dev/migrations/v1-tts-streaming>; '
     'rel="deprecation"; type="text/html"'
 )
 _SYNC_DEPRECATION_HEADERS = {
@@ -175,7 +175,7 @@ async def _assert_voice_accessible_or_404(
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     logger.info(
-        "nqai-voice gateway %s starting (model=%s device=%s)",
+        "neurovoice gateway %s starting (model=%s device=%s)",
         VERSION,
         settings.model_id,
         settings.device,
@@ -186,16 +186,16 @@ async def lifespan(_app: FastAPI):
         settings.tenant_rate_limit_per_minute,
     )
     yield
-    # Faz C SIGTERM graceful drain. uvicorn already stops accepting new
+    # SIGTERM graceful drain. uvicorn already stops accepting new
     # connections before invoking lifespan shutdown and waits for the
     # in-flight request handlers itself. This extra delay just gives
     # background tasks (audit writes, result-stream consumers) a chance
     # to flush before the loop tears down.
     #
     # Default 0 (opt-in): production deployments set
-    # `NQAI_GATEWAY_DRAIN_TIMEOUT_S=10`. CI/tests leave it unset so
+    # `NEUROVOICE_GATEWAY_DRAIN_TIMEOUT_S=10`. CI/tests leave it unset so
     # TestClient teardown stays fast and deterministic.
-    drain_s = float(os.environ.get("NQAI_GATEWAY_DRAIN_TIMEOUT_S", "0"))
+    drain_s = float(os.environ.get("NEUROVOICE_GATEWAY_DRAIN_TIMEOUT_S", "0"))
     if drain_s > 0:
         logger.info("gateway draining (timeout=%.1fs)", drain_s)
         try:
@@ -204,16 +204,16 @@ async def lifespan(_app: FastAPI):
             # Hard-kill (SIGKILL or second SIGTERM) — exit immediately.
             logger.warning("gateway drain cancelled — exiting")
             raise
-    logger.info("nqai-voice gateway shutting down")
+    logger.info("neurovoice gateway shutting down")
 
 
 app = FastAPI(
-    title="NQAI Voice — Türkçe TTS Platform",
+    title="NeuroVoice — Multilingual TTS API",
     description=(
-        "Türkçe + voice-cloning + streaming TTS API on VoxCPM2 (Apache 2.0). "
-        "Catalog-based voices (`/v1/voices`), HTTP synthesis (`/v1/tts`), and "
-        "sentence-chunked streaming (`/v1/tts/stream`). "
-        "Admin surface (DB-backed JWT) lives under `/admin`."
+        "Multilingual TTS API on VoxCPM2 (Apache 2.0) with per-language and "
+        "per-character LoRA adapters, voice cloning, and chunked streaming. "
+        "Catalog at `/v1/voices`, synthesis at `/v1/tts`, streaming at "
+        "`/v1/tts/stream`. Admin surface (DB-backed JWT) at `/admin`."
     ),
     version=VERSION,
     lifespan=lifespan,
@@ -222,9 +222,9 @@ app = FastAPI(
 
 if "*" in settings.cors_origins:
     logger.warning(
-        "NQAI_CORS_ORIGINS contains '*' — admin cookie cross-origin "
+        "NEUROVOICE_CORS_ORIGINS contains '*' — admin cookie cross-origin "
         "will NOT work (Starlette silently drops credentials with a "
-        "wildcard origin). Set NQAI_CORS_ORIGINS to an explicit "
+        "wildcard origin). Set NEUROVOICE_CORS_ORIGINS to an explicit "
         "allow-list in production.",
     )
 
@@ -252,22 +252,22 @@ async def _sync_tts_deprecation_headers(request: Request, call_next):
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
-    # True (not False) — spec auth-multi-tenant.md §6 requires it so the
-    # admin SPA can carry the `nqai_admin_access` cookie cross-origin.
+    # True (not False) — the admin SPA must carry the `nv_admin_access`
+    # cookie cross-origin.
     allow_credentials=True,
     allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=[
-        "X-NQAI-Sample-Rate",
-        "X-NQAI-Voice-Id",
-        "X-NQAI-Model-Id",
-        "X-NQAI-Output-Format",
-        "X-NQAI-Character-Count",
-        "X-NQAI-Sentences",
-        "X-NQAI-Duration-Seconds",
-        "X-NQAI-Elapsed-Seconds",
-        "X-NQAI-RTF",
-        "X-NQAI-Request-Id",
+        "X-NV-Sample-Rate",
+        "X-NV-Voice-Id",
+        "X-NV-Model-Id",
+        "X-NV-Output-Format",
+        "X-NV-Character-Count",
+        "X-NV-Sentences",
+        "X-NV-Duration-Seconds",
+        "X-NV-Elapsed-Seconds",
+        "X-NV-RTF",
+        "X-NV-Request-Id",
     ],
 )
 
@@ -282,7 +282,7 @@ app.include_router(admin_router)
 async def health() -> HealthResponse:
     """Gateway liveness — DB / Redis health is not checked here so the
     probe stays cheap. Worker engine state lives behind metrics in
-    Faz C; gateway never knows whether a GPU worker is warmed up.
+    ; gateway never knows whether a GPU worker is warmed up.
 
     `loaded` / `sample_rate` are advisory legacy fields kept for the
     admin UI's existing rendering; they're filled with static settings
@@ -290,7 +290,7 @@ async def health() -> HealthResponse:
     return HealthResponse(
         status="ok",
         model_id=settings.model_id,
-        device="gateway",  # gateway never holds the model after Faz B.1
+        device="gateway",  # gateway never holds the model now
         sample_rate=settings.target_sample_rate,
         loaded=True,  # gateway is always "loaded" — engine lives in workers
         voice_count=0,
@@ -299,7 +299,7 @@ async def health() -> HealthResponse:
 
 
 # --------------------------------------------------------------------------- #
-# /metrics — Prometheus exposition (Faz C step 2)
+# /metrics — Prometheus exposition ( step 2)
 # --------------------------------------------------------------------------- #
 @app.get("/metrics", tags=["meta"], include_in_schema=False)
 async def metrics(
@@ -332,7 +332,7 @@ async def metrics(
 # Voice catalog (tenant-scoped, DB-backed)
 # --------------------------------------------------------------------------- #
 def _slugify_voice_id(display_name: str) -> str:
-    """Faz B.5 Dalga 2.5 — derive a voice_id slug from a display name.
+    """derive a voice_id slug from a display name.
 
     ElevenLabs `POST /v1/voices/add` lets callers omit the requested
     voice_id and returns the platform-assigned one. We mirror that by
@@ -357,7 +357,7 @@ def _slugify_voice_id(display_name: str) -> str:
 
 
 def _voice_to_public(v, viewer_tenant_id: uuid.UUID | None = None) -> VoicePublic:
-    # Faz B.5 Dalga 2.4 — vendor-parity fields surfaced. Settings
+    # vendor-parity fields surfaced. Settings
     # defaults are stored as a plain dict (JSONB) on the row; pydantic
     # parses them into VoiceSettings here, validating bounds.
     from .schemas import VoiceSettings
@@ -370,7 +370,7 @@ def _voice_to_public(v, viewer_tenant_id: uuid.UUID | None = None) -> VoicePubli
                 "voice_settings_defaults parse failed for voice=%s — skipping",
                 v.voice_id,
             )
-    # Faz B.5 hotfix (2026-05-25 D-08 audit) — `created_by` discloses the
+    # hotfix (2026-05-25 D-08 audit) — `created_by` discloses the
     # owner's `api_key_id` UUID. For owned voices the viewer already has
     # that key, so showing it is fine; for public/shared voices it leaks
     # a foreign-tenant attribute. Default-mask to "system" unless the
@@ -408,7 +408,7 @@ def _voice_to_public(v, viewer_tenant_id: uuid.UUID | None = None) -> VoicePubli
 # --------------------------------------------------------------------------- #
 @app.get("/v1/models", response_model=ModelListResponse, tags=["meta"])
 async def list_tts_models() -> ModelListResponse:
-    """Faz B.5 Dalga 1.2 — public model registry.
+    """public model registry.
 
     Clients call this to discover available `model_id` values
     (turbo / hd / character presets on the VoxCPM2 base) along with
@@ -444,7 +444,7 @@ async def list_voices(
 ) -> VoiceListResponse:
     """Catalog visible to this tenant: owned + shared-with-me + public.
 
-    Faz B.5 Dalga 2.4 — pagination via `limit` (1..200) + `offset`.
+    — pagination via `limit` (1..200) + `offset`.
     Default limit 100; caller bumps until they receive < limit rows.
     Total tenant-visible count returned so clients can render
     progress / "X of Y" UI without an extra request."""
@@ -502,7 +502,7 @@ async def _enroll_voice_impl(
     remove_background_noise: bool,
     voice_talent_consent: bool,
 ) -> EnrollResponse:
-    """Faz B.5 Dalga 2.5 — shared clone/enroll implementation.
+    """shared clone/enroll implementation.
 
     Backs both `POST /v1/voices` and the ElevenLabs-style alias
     `POST /v1/voices/add`. Multipart fields mirror ElevenLabs IVC plus
@@ -512,8 +512,8 @@ async def _enroll_voice_impl(
 
     Sample validation (vendor-parity envelope):
       * format suffix in ALLOWED_AUDIO_SUFFIXES (wav/mp3/m4a/ogg/flac)
-      * size 1 KB .. NQAI_ENROLL_MAX_MB (default 20 MB)
-      * trimmed duration ≥ NQAI_ENROLL_MIN_SECONDS (default 1.0 s in tests;
+      * size 1 KB .. NEUROVOICE_ENROLL_MAX_MB (default 20 MB)
+      * trimmed duration ≥ NEUROVOICE_ENROLL_MIN_SECONDS (default 1.0 s in tests;
         production deployments set it to 3-10 s per FSEK rider)
 
     `remove_background_noise` is captured today (stored in
@@ -555,7 +555,7 @@ async def _enroll_voice_impl(
         )
 
     # Land the trimmed WAV on local disk under data/reference-audio/<tenant>/<voice>.wav
-    # for now. Faz B's R2 helper will replace this with bucket upload + s3:// URI.
+    # for now. 's R2 helper will replace this with bucket upload + s3:// URI.
     tenant_dir = settings.reference_audio_dir / "tenants" / str(ctx.tenant_id)
     tenant_dir.mkdir(parents=True, exist_ok=True)
     target = tenant_dir / f"{voice_id}.wav"
@@ -667,7 +667,7 @@ async def enroll_voice(
     remove_background_noise: Annotated[bool, Form()] = False,
     voice_talent_consent: Annotated[bool, Form()] = False,
 ) -> EnrollResponse:
-    """Faz B.5 Dalga 2.5 — first-class voice clone API.
+    """first-class voice clone API.
 
     Drop-in target for ElevenLabs/MiniMax SDK shapes. See
     [_enroll_voice_impl][] for the validation envelope and the consent /
@@ -715,7 +715,7 @@ async def enroll_voice_alias(
     remove_background_noise: Annotated[bool, Form()] = False,
     voice_talent_consent: Annotated[bool, Form()] = False,
 ) -> EnrollResponse:
-    """Faz B.5 Dalga 2.5 — ElevenLabs `POST /v1/voices/add` shape alias.
+    """ElevenLabs `POST /v1/voices/add` shape alias.
 
     Field names follow the vendor: `name` → display_name, `files` →
     reference_audio (single file; multi-file IVC stitches in a follow-up).
@@ -755,7 +755,7 @@ async def update_voice(
     ctx: Annotated[AuthContext, Depends(require_auth("voice:write"))],
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> VoicePublic:
-    """Faz B.5 Dalga 2.4 — vendor-parity voice metadata edit.
+    """vendor-parity voice metadata edit.
 
     Owner-only (same existence-leak rule as delete): a tenant that
     can READ a shared/public voice cannot PATCH it; 404 returned.
@@ -763,7 +763,7 @@ async def update_voice(
     via POST /v1/voices for those changes.
 
     Body fields are all optional; only the provided ones are written.
-    `voice_settings_defaults` (Dalga 2.1 schema) becomes the per-voice
+    `voice_settings_defaults` ( schema) becomes the per-voice
     baseline that per-request voice_settings layer on top of at
     synthesis time."""
     try:
@@ -850,11 +850,11 @@ def _request_id_for(request: Request) -> uuid.UUID:
 
 
 def _app_label_from(request: Request) -> str | None:
-    """Product attribution from `X-NQAI-App` request header (refactor R,
+    """Product attribution from `X-NV-App` request header (refactor R,
     2026-05-24). Caps length at 64 chars to stay within the metric
     cardinality budget (D-15). Returns None if header absent or empty
     after trimming."""
-    raw = request.headers.get("X-NQAI-App")
+    raw = request.headers.get("X-NV-App")
     if not raw:
         return None
     val = raw.strip()[:64]
@@ -896,7 +896,7 @@ async def _record_usage(
         await session.commit()
     except Exception:
         # Usage logging is non-critical-path; structured log lands when
-        # Faz C structlog ships. Swallow but roll back to keep session sane.
+        #  structlog ships. Swallow but roll back to keep session sane.
         await session.rollback()
 
 
@@ -910,7 +910,7 @@ async def synthesize(
 ) -> Response:
     """**Deprecated** — backward-compat queue proxy.
 
-    Faz B.1 step 3 cutover: gateway no longer holds the engine. This
+    cutover: gateway no longer holds the engine. This
     endpoint XADD's the job to the same Redis Streams queue the async
     `/v1/tts/jobs` path uses, awaits chunks on the per-request result
     stream, concatenates them into a single WAV body, and returns it
@@ -941,7 +941,7 @@ async def synthesize(
         body.voice_id, ctx.tenant_id, session,
     )
 
-    # Faz B.5 Dalga 1.2 — validate model_id early so the client gets
+    # validate model_id early so the client gets
     # a clean 400 instead of a worker-side PoisonJob. Resolves to the
     # registry default when body.model_id is None.
     try:
@@ -1023,7 +1023,7 @@ async def synthesize(
             redis, str(rid),
             block_ms=200,
             overall_timeout_s=float(
-                os.environ.get("NQAI_SYNC_TIMEOUT_S", "30")
+                os.environ.get("NEUROVOICE_SYNC_TIMEOUT_S", "30")
             ),
         )
     except ResultStreamTimeout as e:
@@ -1050,20 +1050,20 @@ async def synthesize(
 
     headers = {
         **_SYNC_DEPRECATION_HEADERS,
-        "X-NQAI-Request-Id": str(rid),
-        "X-NQAI-Sample-Rate": str(sample_rate),
-        "X-NQAI-Voice-Id": db_voice.voice_id,
-        "X-NQAI-Model-Id": preset.model_id,
-        # Faz B.5 Dalga 2.3 — billing primary signal + echo of the
+        "X-NV-Request-Id": str(rid),
+        "X-NV-Sample-Rate": str(sample_rate),
+        "X-NV-Voice-Id": db_voice.voice_id,
+        "X-NV-Model-Id": preset.model_id,
+        # billing primary signal + echo of the
         # actually-returned format (vendor parity).
-        "X-NQAI-Character-Count": str(len(body.text)),
-        "X-NQAI-Output-Format": body.audio_format,
-        "X-NQAI-Sentences": str(sentences),
-        "X-NQAI-Duration-Seconds": f"{duration_ms / 1000.0:.3f}",
-        "X-NQAI-Elapsed-Seconds": f"{elapsed_ms / 1000.0:.3f}",
-        "X-NQAI-RTF": f"{rtf:.3f}" if rtf is not None else "inf",
+        "X-NV-Character-Count": str(len(body.text)),
+        "X-NV-Output-Format": body.audio_format,
+        "X-NV-Sentences": str(sentences),
+        "X-NV-Duration-Seconds": f"{duration_ms / 1000.0:.3f}",
+        "X-NV-Elapsed-Seconds": f"{elapsed_ms / 1000.0:.3f}",
+        "X-NV-RTF": f"{rtf:.3f}" if rtf is not None else "inf",
     }
-    # Faz B.5 Dalga 1 — codec layer dispatch on the sync path too.
+    # codec layer dispatch on the sync path too.
     # Sync /v1/tts buffers all PCM into one body before encoding, so
     # we run the encoder to completion in one shot. mp3 + opus = real
     # bandwidth savings (mp3 ~3-5x, opus ~10x) for the deprecated
@@ -1106,14 +1106,14 @@ async def synthesize_stream(
 
     Sentence-streamed via the same Redis queue path that drives async
     jobs and the deprecated sync ``/v1/tts``. The worker pipeline uses
-    ``iter_engine_chunks`` (Faz B.1.5) to bridge the engine generator
+    ``iter_engine_chunks``  to bridge the engine generator
     onto the result stream frame-by-frame, so the first byte hits the
     client wire as soon as the engine emits its first sentence — full
     generation does NOT drain before publishing.
 
     This is the canonical industry-standard one-way streaming TTS
     surface (ElevenLabs / OpenAI Audio / Cartesia / MiniMax mental
-    model). Duplex voice-agent (NIVA call-center, real bidirectional
+    model). Duplex voice-agent (call-center, real bidirectional
     conversation) is a separate product surface — if that product
     ships it will use a different transport (WebRTC / gRPC) on a
     different endpoint, not this one. See
@@ -1137,7 +1137,7 @@ async def synthesize_stream(
         body.voice_id, ctx.tenant_id, session,
     )
 
-    # Faz B.5 Dalga 1.2 — validate model_id early (400 instead of poison).
+    # validate model_id early (400 instead of poison).
     try:
         preset = resolve_model(body.model_id)
     except UnknownModelError as e:
@@ -1205,19 +1205,19 @@ async def synthesize_stream(
     # honouring RFC 8594 would have been silently nudged off the
     # primary endpoint (audit L1 2026-05-25).
     headers = {
-        "X-NQAI-Request-Id": str(rid),
-        "X-NQAI-Sample-Rate": str(sample_rate),
-        "X-NQAI-Voice-Id": db_voice.voice_id,
-        "X-NQAI-Model-Id": preset.model_id,
-        # Faz B.5 Dalga 2.3 — billing + format echo. Duration / RTF /
+        "X-NV-Request-Id": str(rid),
+        "X-NV-Sample-Rate": str(sample_rate),
+        "X-NV-Voice-Id": db_voice.voice_id,
+        "X-NV-Model-Id": preset.model_id,
+        # billing + format echo. Duration / RTF /
         # sentence count aren't known yet on the streaming path (worker
         # writes them post-stream in usage_records); the streaming
         # response only exposes what's known at request time.
-        "X-NQAI-Character-Count": str(len(body.text)),
-        "X-NQAI-Output-Format": body.audio_format,
+        "X-NV-Character-Count": str(len(body.text)),
+        "X-NV-Output-Format": body.audio_format,
     }
 
-    # Faz C v1 item 1 — gateway-side TTFB measurement.
+    # Gateway-side TTFB measurement.
     # request_received_ns was captured at the TOP of the handler so the
     # measurement INCLUDES auth + voice check + idempotency + queue
     # submit (audit L3 H2). The instrumented wrapper records first-byte
@@ -1237,7 +1237,7 @@ async def synthesize_stream(
                 redis, str(rid),
                 block_ms=100,
                 overall_timeout_s=float(
-                    os.environ.get("NQAI_SYNC_TIMEOUT_S", "30")
+                    os.environ.get("NEUROVOICE_SYNC_TIMEOUT_S", "30")
                 ),
             ):
                 if chunk.error:
@@ -1326,7 +1326,7 @@ async def synthesize_stream(
                         "ignoring",
                     )
 
-    # Faz B.5 Dalga 1 — codec layer dispatch:
+    # codec layer dispatch:
     # * wav  — inline RIFF "infinite size" trick (predates this layer;
     #          ffmpeg can't write WAV streaming-safely, so the inline
     #          path is the right answer).
@@ -1400,14 +1400,13 @@ async def synthesize_stream(
 
 
 # --------------------------------------------------------------------------- #
-# Vendor-compat URL aliases — Dalga 2.2
+# Vendor-compat URL aliases — 
 # --------------------------------------------------------------------------- #
 # ElevenLabs ships `POST /v1/text-to-speech/{voice_id}` (sync) and
 # `POST /v1/text-to-speech/{voice_id}/stream`. SDKs they generate
-# expect these exact paths. To make NEEKO/NIVA/NeuroCourse and any
-# external customer's ElevenLabs-shaped client work after one
-# base-URL swap, we accept the path-prefixed shape and delegate to
-# the canonical handler internally.
+# expect these exact paths. To make any ElevenLabs-shaped client work
+# after one base-URL swap, we accept the path-prefixed shape and
+# delegate to the canonical handler internally.
 #
 # `voice_id` is validated here too (not just inside
 # `_assert_voice_accessible_or_404`) so an obviously-malformed path
@@ -1464,7 +1463,7 @@ async def synthesize_stream_alias(
 
 
 # --------------------------------------------------------------------------- #
-# Faz B.5 Dalga 3.1 — WebSocket input streaming
+# WebSocket input streaming
 # --------------------------------------------------------------------------- #
 @app.websocket("/v1/text-to-speech/{voice_id}/stream-input")
 async def text_to_speech_stream_input(
@@ -1510,19 +1509,19 @@ def _hash_sync_body(body) -> str:
 # Hard ceiling on live queue backlog. With a consumer group available this
 # is Redis Streams pending + lag, not XLEN; XLEN includes ACKed historical
 # messages and would falsely 503 sequential smoke calls.
-QUEUE_DEPTH_BACKPRESSURE = int(os.environ.get("NQAI_QUEUE_DEPTH_LIMIT", "200"))
+QUEUE_DEPTH_BACKPRESSURE = int(os.environ.get("NEUROVOICE_QUEUE_DEPTH_LIMIT", "200"))
 
 
 async def _compute_backpressure_decision(
     queue: TtsJobQueue,
 ) -> tuple[bool, str | None, dict]:
-    """Faz B.5 hotfix — pure decision function shared by HTTP and WS.
+    """ hotfix — pure decision function shared by HTTP and WS.
 
     Returns ``(admit, denied_reason, payload)``. Caller is responsible
     for audit-log write, metric increment, and the actual refusal
     response (HTTPException for HTTP, error frame for WS).
 
-    Decision logic mirrors `_check_queue_depth_or_503` Faz C strategy:
+    Decision logic mirrors `_check_queue_depth_or_503`  strategy:
       1. Capacity-aware admission when workers are healthy
          (``depth ≤ headroom + total_capacity``).
       2. XLEN-only fallback when the heartbeat plane is degraded.
@@ -1569,7 +1568,7 @@ async def _check_queue_depth_or_503(
     *,
     voice_id: str | None = None,
 ) -> None:
-    """Faz C capacity-aware backpressure (HTTP wrapper).
+    """ capacity-aware backpressure (HTTP wrapper).
 
     See `_compute_backpressure_decision` for the admission logic. On
     refusal this writes an audit row, bumps the SLO denominator
@@ -1624,8 +1623,8 @@ async def create_tts_job(
     the existing job's id, never enqueues twice. Worker side completes
     the job and writes the output to R2; clients poll the status endpoint.
 
-    Faz B.5 Dalga 3.2 — async surface accepts long-form text up to
-    `async_max_chars` (default 100 000, env NQAI_ASYNC_MAX_CHARS). The
+    — async surface accepts long-form text up to
+    `async_max_chars` (default 100 000, env NEUROVOICE_ASYNC_MAX_CHARS). The
     sync `/v1/tts` paths stay bound to `max_chars_per_request` (4 000)
     so they don't 504 against the result-stream gateway timeout.
     """
@@ -1634,7 +1633,7 @@ async def create_tts_job(
             status.HTTP_400_BAD_REQUEST,
             detail=(
                 f"text exceeds async_max_chars={settings.async_max_chars}; "
-                "split the request or raise NQAI_ASYNC_MAX_CHARS"
+                "split the request or raise NEUROVOICE_ASYNC_MAX_CHARS"
             ),
         )
 
@@ -1648,7 +1647,7 @@ async def create_tts_job(
         body.voice_id, ctx.tenant_id, session,
     )
 
-    # Faz B.5 Dalga 1.2 — model_id validation up front.
+    # model_id validation up front.
     try:
         preset = resolve_model(body.model_id)
     except UnknownModelError as e:
@@ -1806,7 +1805,7 @@ async def get_tts_job(
                 content_type="audio/wav",
             )
         # Per-job metrics come from usage_records via request_id.
-        # Faz B.5 Dalga 2.3 — extended with first_audio_ms,
+        # extended with first_audio_ms,
         # character_count, model_id so the response matches the vendor
         # metadata shape (ElevenLabs raw headers + MiniMax extra_info).
         usage_row = await _find_usage_row(session, ctx.tenant_id, rid)
@@ -1820,8 +1819,8 @@ async def get_tts_job(
                 character_count=usage_row.text_char_count,
                 model_id=usage_row.model_version,
             )
-        # Faz B.5 Dalga 3.2 — per-sentence alignment. NULL on rows
-        # written before Dalga 3.2 (or short jobs the worker chose not
+        # per-sentence alignment. NULL on rows
+        # written before this contract (or short jobs the worker chose not
         # to record). Defensive: a malformed row shouldn't 500 the
         # status endpoint — log + return without alignment.
         if row.sentence_alignment:
@@ -1845,7 +1844,7 @@ def _hash_job_body(body: TTSJobCreate) -> str:
     """Stable hash of the request shape so an Idempotency-Key replayed
     with *different* content doesn't silently return the old job. (Stripe
     surfaces a 409 in that case; we just record the hash for now and
-    Faz B can wire the conflict response.)
+     can wire the conflict response.)
     """
     import hashlib
 
@@ -1858,7 +1857,7 @@ def _map_idempotency_status_to_job_status(s: str) -> str:
     client-facing job model is {queued, running, complete, failed}.
 
     For now `processing` always maps to `queued`. Once workers heartbeat
-    a "running" state into the row (Faz B), this branches.
+    a "running" state into the row , this branches.
     """
     if s == "complete":
         return "complete"
@@ -1923,7 +1922,7 @@ def run() -> None:
     uvicorn.run(
         "server.main:app",
         host="0.0.0.0",
-        port=int(os.environ.get("NQAI_PORT", "8000")),
+        port=int(os.environ.get("NEUROVOICE_PORT", "8000")),
         log_level="info",
     )
 

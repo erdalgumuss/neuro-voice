@@ -1,4 +1,4 @@
-"""NQAI Voice — GPU worker process.
+"""NeuroVoice — GPU worker process.
 
 This package owns synthesis: VoxCPM2 inference + sentence-chunked
 streaming + result-stream publication + idempotency completion + usage
