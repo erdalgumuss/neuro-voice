@@ -109,6 +109,12 @@ class Settings:
     enroll_max_upload_mb: int = field(default_factory=lambda: int(
         os.environ.get("NEUROVOICE_ENROLL_MAX_MB", "20")
     ))
+    # ADR-13 forensics — operator uploads can be longer-form than
+    # enrollment clips (full episodes / podcasts when investigating).
+    # Still bounded so a single API call can't OOM the gateway.
+    forensics_max_upload_mb: int = field(default_factory=lambda: int(
+        os.environ.get("NEUROVOICE_FORENSICS_MAX_MB", "100")
+    ))
     # minimum trimmed reference duration accepted on
     # POST /v1/voices. ElevenLabs/MiniMax enforce ≥10s; we default to 1.0s
     # so test fixtures (1-second tones) keep working and operators ramp

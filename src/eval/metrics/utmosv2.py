@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from . import MetricResult
 
@@ -58,14 +58,12 @@ class UTMOSv2Metric:
     device: str = "auto"
 
     _model: object | None = None
-    _lock: threading.Lock = threading.Lock()  # type: ignore[assignment]
+    # field(default_factory=threading.Lock) gives every instance its
+    # own lock — the previous pattern (class-level Lock() default +
+    # __post_init__ rebind) worked but masked the smell that a
+    # mutable shared default would cause cross-instance contention.
+    _lock: threading.Lock = field(default_factory=threading.Lock)
     _import_error: str | None = None
-
-    def __post_init__(self) -> None:
-        # threading.Lock() returns a fresh instance per call — the
-        # dataclass default would share a single lock across all
-        # instances, so re-create per-instance.
-        object.__setattr__(self, "_lock", threading.Lock())
 
     def _load(self) -> object | None:
         """Return the loaded predictor, or None if the upstream package
@@ -94,7 +92,7 @@ class UTMOSv2Metric:
                     "pip install git+https://github.com/sarulab-speech/UTMOSv2.git"
                 )
                 logger.warning("%s — %s", msg, e)
-                object.__setattr__(self, "_import_error", msg)
+                self._import_error = msg
                 return None
             logger.info(
                 "loading UTMOSv2 predictor (device=%s)", self.device,
@@ -109,7 +107,7 @@ class UTMOSv2Metric:
             except Exception as e:  # noqa: BLE001 — surface as nan
                 msg = f"UTMOSv2 model load failed: {type(e).__name__}: {e}"
                 logger.exception(msg)
-                object.__setattr__(self, "_import_error", msg)
+                self._import_error = msg
                 return None
         return self._model
 

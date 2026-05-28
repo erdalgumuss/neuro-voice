@@ -465,6 +465,22 @@ def _voice_to_public(v, viewer_tenant_id: uuid.UUID | None = None) -> VoicePubli
         created_by = str(v.created_by_key_id) if v.created_by_key_id else "system"
     else:
         created_by = "system"
+    # ADR-11 / ADR-12 expose policy:
+    # `lifecycle_state` + `purge_after_at` are integration-essential
+    # (an SDK client needs to know a public voice is going away) and
+    # safe to surface across tenant boundaries.
+    # `frozen_reason` is operator free-text — may carry sensitive
+    # context like "frozen for legal review of abuse claim" — and
+    # `eval_metrics` is a JSONB blob whose `test_set` / `model.*` /
+    # `operator_id` fields are internal. Mask both for non-owner
+    # viewers on public/shared voices, mirroring the `created_by`
+    # rule above (D-08 audit precedent).
+    if is_owner or viewer_tenant_id is None:
+        frozen_reason = getattr(v, "frozen_reason", None)
+        eval_metrics = getattr(v, "eval_metrics", None)
+    else:
+        frozen_reason = None
+        eval_metrics = None
     return VoicePublic(
         voice_id=v.voice_id,
         display_name=v.display_name,
@@ -477,14 +493,12 @@ def _voice_to_public(v, viewer_tenant_id: uuid.UUID | None = None) -> VoicePubli
         license_ref=v.license_ref,
         visibility=v.visibility,
         lifecycle_state=lifecycle_state(v),
-        frozen_reason=getattr(v, "frozen_reason", None),
+        frozen_reason=frozen_reason,
         purge_after_at=(
             v.purge_after_at.isoformat()
             if getattr(v, "purge_after_at", None) is not None else None
         ),
-        # ADR-12 — eval pin blob exposed verbatim. NULL on un-pinned
-        # voices; SDK clients decide their own quality threshold.
-        eval_metrics=getattr(v, "eval_metrics", None),
+        eval_metrics=eval_metrics,
         created_at=v.created_at.isoformat(),
         created_by=created_by,
         description=getattr(v, "description", None),
@@ -769,9 +783,16 @@ async def _enroll_voice_impl(
     # this to False via the governance flow (separate ADR).
     requires_verification = consent_kind == "tenant-asserted"
 
+    # `requires_verification` lives in the EnrollResponse for vendor-
+    # parity (ElevenLabs IVC clients read it) but is NOT mirrored
+    # into voices.engine_params anymore — no code path read the
+    # engine_params copy, so it was a dead write. The canonical
+    # answer for "does this voice need consent verification still?"
+    # is derived live from VoiceConsentRecordRepo.latest_active
+    # (returns tenant-asserted → True; signed-contract/recorded-
+    # statement/estate-permission → False).
     engine_params: dict[str, Any] = {
         "remove_background_noise": remove_background_noise,
-        "requires_verification": requires_verification,
     }
 
     voice = await repo.create(

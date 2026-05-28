@@ -116,7 +116,7 @@ class WatermarkApplier:
                     "pip install neurovoice[watermark]"
                 )
                 logger.warning("%s — %s", msg, e)
-                object.__setattr__(self, "_import_error", msg)
+                self._import_error = msg
                 return None
             try:
                 logger.info(
@@ -136,21 +136,35 @@ class WatermarkApplier:
             except Exception as e:  # noqa: BLE001 — degrade
                 msg = f"AudioSeal load failed: {type(e).__name__}: {e}"
                 logger.exception(msg)
-                object.__setattr__(self, "_import_error", msg)
+                self._import_error = msg
                 return None
-            object.__setattr__(self, "_model", model)
+            self._model = model
         return self._model
 
     def watermark_pcm(
         self, pcm_int16: bytes, sample_rate: int, *, message_bits: int,
     ) -> bytes:
-        """Return PCM with the 16-bit `message_bits` embedded. On
-        graceful degrade (model missing / load failed), returns the
-        INPUT pcm unchanged — callers MUST emit a metric so operators
-        see the gap; this module logs it but doesn't double-count.
+        """Return PCM with the 16-bit `message_bits` embedded.
 
-        `message_bits` is 0..65535. The model embeds the bits inaudibly
-        and the detector recovers them (AudioSeal default).
+        Failure modes:
+
+        * **Import / model-load failure** — the upstream package is
+          missing or the checkpoint won't load. We treat this as a
+          permanent process-wide degrade (sentinel-cached) and return
+          the INPUT pcm unchanged. Callers MUST emit a metric; the
+          worker pipeline also enforces a license-kind check before
+          calling — talent-contract / public-figure / partner-licensed
+          voices refuse to synthesize against an unavailable applier
+          (ADR-13 §5 + worker-side TransientFailure).
+        * **Per-call runtime exception** — torch OOM, transient CUDA
+          hiccup, model produces NaN. We log + raise. The exception
+          does NOT mark the singleton unhealthy — one bad chunk on
+          one tenant must not silently disable watermarking for every
+          other voice on this worker. The pipeline maps the raise to
+          a TransientFailure so the job is reattempted on the same or
+          another worker.
+
+        `message_bits` is 0..65535.
         """
         if not (0 <= message_bits <= 0xFFFF):
             raise ValueError(
@@ -158,42 +172,38 @@ class WatermarkApplier:
             )
         model = self._load()
         if model is None:
-            # Graceful degrade — return input unchanged so the synth
-            # stream proceeds. Worker side counts the skip.
+            # Graceful degrade for import-time failures. Worker side
+            # decides whether to also fail the request based on the
+            # voice's license_kind.
             return pcm_int16
-        try:
-            import numpy as np
-            import torch
+        import numpy as np
+        import torch
 
-            arr_f32 = _pcm16_to_float32(pcm_int16)
-            arr_16k = _resample_to(arr_f32, sample_rate, 16000)
-            # AudioSeal expects (batch=1, channels=1, samples).
-            wav = torch.from_numpy(arr_16k).reshape(1, 1, -1)
-            device = next(model.parameters()).device
-            wav = wav.to(device)
-            # 16-bit payload as a (1, 16) tensor of {0, 1} bits.
-            bits = [(message_bits >> i) & 1 for i in range(16)]
-            msg = torch.tensor([bits], dtype=torch.int32, device=device)
-            with torch.no_grad():
-                watermark = model.get_watermark(
-                    wav, sample_rate=16000, message=msg,
-                )
-                watermarked = (wav + watermark).clamp(-1.0, 1.0)
-            out_arr = watermarked.squeeze().cpu().numpy().astype(np.float32)
-            # Restore the caller's sample rate so downstream encoders
-            # (mp3/opus/wav) keep working without rate-mismatch errors.
-            out_arr = _resample_to(out_arr, 16000, sample_rate)
-            return _float32_to_pcm16(out_arr)
-        except Exception as e:  # noqa: BLE001 — degrade
-            logger.exception(
-                "AudioSeal watermarking failed; emitting unwatermarked PCM"
+        arr_f32 = _pcm16_to_float32(pcm_int16)
+        arr_16k = _resample_to(arr_f32, sample_rate, 16000)
+        # AudioSeal expects (batch=1, channels=1, samples).
+        wav = torch.from_numpy(arr_16k).reshape(1, 1, -1)
+        device = next(model.parameters()).device
+        wav = wav.to(device)
+        # 16-bit payload as a (1, 16) tensor of {0, 1} bits, LSB-first.
+        # The detector at WatermarkDetector.detect() reconstructs the
+        # int with the same LSB-first convention — both ends must
+        # match or the round-trip silently corrupts payloads.
+        bits = [(message_bits >> i) & 1 for i in range(16)]
+        msg = torch.tensor([bits], dtype=torch.int32, device=device)
+        with torch.no_grad():
+            watermark = model.get_watermark(
+                wav, sample_rate=16000, message=msg,
             )
-            # Sentinel the failure so subsequent calls fast-skip.
-            object.__setattr__(
-                self, "_import_error",
-                f"runtime: {type(e).__name__}: {e}",
-            )
-            return pcm_int16
+            watermarked = (wav + watermark).clamp(-1.0, 1.0)
+        # Explicit dim-by-dim squeeze so a degenerate 1-sample chunk
+        # doesn't collapse the array to 0-d (which would then write
+        # 2 bytes via float32_to_pcm16).
+        out_arr = watermarked[0, 0].cpu().numpy().astype(np.float32)
+        # Restore the caller's sample rate so downstream encoders
+        # (mp3/opus/wav) keep working without rate-mismatch errors.
+        out_arr = _resample_to(out_arr, 16000, sample_rate)
+        return _float32_to_pcm16(out_arr)
 
 
 @dataclass
@@ -237,7 +247,7 @@ class WatermarkDetector:
                     "pip install neurovoice[watermark]"
                 )
                 logger.warning("%s — %s", msg, e)
-                object.__setattr__(self, "_import_error", msg)
+                self._import_error = msg
                 return None
             try:
                 logger.info(
@@ -257,9 +267,9 @@ class WatermarkDetector:
             except Exception as e:  # noqa: BLE001
                 msg = f"AudioSeal detector load failed: {type(e).__name__}: {e}"
                 logger.exception(msg)
-                object.__setattr__(self, "_import_error", msg)
+                self._import_error = msg
                 return None
-            object.__setattr__(self, "_model", model)
+            self._model = model
         return self._model
 
     def detect(

@@ -72,7 +72,14 @@ def main() -> int:
     if not args.metrics:
         parser.error("--metrics is required for a real run")
 
-    _register_real_metrics(whisper_model_size=args.whisper_model)
+    neurovoice_voices = args.neurovoice_voice or []
+    elevenlabs_voices = args.elevenlabs_voice or []
+    voice_count = len(neurovoice_voices) + len(elevenlabs_voices)
+    _register_real_metrics(
+        whisper_model_size=args.whisper_model,
+        secs_reference_audio=args.secs_reference_audio,
+        voice_count=voice_count,
+    )
     _register_real_systems(args)
 
     from eval.dataset import load_test_set
@@ -144,6 +151,16 @@ def _build_argparser() -> argparse.ArgumentParser:
                    help="audio cache (skip vendor re-bills across re-runs)")
     p.add_argument("--slug", default="baseline",
                    help="report subdirectory name suffix")
+    # ADR-12 — SECS reference audio. SECS scores TTS output similarity
+    # against the voice's clone reference, so it needs a per-voice
+    # reference path. v0 only supports SINGLE-voice runs when SECS is
+    # enabled (the metric registry is global and SECSMetric binds at
+    # construction). Multi-voice + SECS would require a runner refactor
+    # to per-voice metric resolution; tracked as ADR-12 follow-up.
+    p.add_argument("--secs-reference-audio", type=Path,
+                   help="path to the voice's reference audio (required "
+                        "when --metrics includes 'secs'); single-voice "
+                        "runs only in v0")
 
     p.add_argument("--list-test-sets", action="store_true")
     p.add_argument("--list-metrics", action="store_true")
@@ -151,19 +168,56 @@ def _build_argparser() -> argparse.ArgumentParser:
     return p
 
 
-def _register_real_metrics(*, whisper_model_size: str) -> None:
+def _register_real_metrics(
+    *,
+    whisper_model_size: str,
+    secs_reference_audio: "Path | None" = None,
+    voice_count: int = 0,
+) -> None:
     """Lazy: only import the heavy metric modules when asked. Keeps
-    the CLI startup fast for --list-* probes."""
+    the CLI startup fast for --list-* probes.
+
+    Registers the four metrics ADR-12 ships: whisper_wer, whisper_cer
+    (sharing one Whisper model load), utmosv2, secs. SECS requires a
+    reference audio path supplied via --secs-reference-audio and is
+    restricted to single-voice runs in v0 (see module docstring of
+    secs.py — global registry + per-voice binding is incompatible
+    with multi-voice runs).
+    """
     from eval.metrics import register_metric
-    from eval.metrics.whisper_wer import WhisperWERMetric
+    from eval.metrics.whisper_wer import WhisperCERMetric, WhisperWERMetric
+
+    wer_metric = WhisperWERMetric(model_size=whisper_model_size)
+    register_metric("whisper_wer", wer_metric)
+    # Share the same Whisper model load for CER (~3 GB checkpoint
+    # otherwise loaded twice).
     register_metric(
-        "whisper_wer",
-        WhisperWERMetric(model_size=whisper_model_size),
+        "whisper_cer",
+        WhisperCERMetric(shared_metric=wer_metric),
     )
-    # UTMOSv2 placeholder — registers a metric that raises on score().
-    # Operators wire the real backend per the module's docstring.
     from eval.metrics.utmosv2 import UTMOSv2Metric
     register_metric("utmosv2", UTMOSv2Metric())
+
+    if secs_reference_audio is not None:
+        if voice_count > 1:
+            raise SystemExit(
+                "SECS is single-voice per run in v0; "
+                "drop --secs-reference-audio or restrict --neurovoice-voice "
+                "to a single slug. Multi-voice SECS is tracked as an ADR-12 "
+                "follow-up (runner needs per-voice metric resolution)."
+            )
+        if not secs_reference_audio.is_file():
+            raise SystemExit(
+                f"--secs-reference-audio path not found: {secs_reference_audio}"
+            )
+        from eval.metrics.secs import SECSMetric
+        import soundfile as sf
+        data, sr = sf.read(str(secs_reference_audio), dtype="int16", always_2d=False)
+        if data.ndim == 2:
+            import numpy as np
+            data = data.mean(axis=1).astype(np.int16)
+        secs = SECSMetric.from_reference_pcm(data.tobytes(), int(sr))
+        register_metric("secs", secs)
 
 
 def _register_real_systems(args) -> None:

@@ -30,6 +30,30 @@ from db import AsyncSessionLocal
 from repos import AuditRepo, TenantRepo, VoiceRepo
 
 
+_LICENSE_KIND_VALUES = {
+    "example", "synthetic", "user-owned",
+    "talent-contract", "public-figure", "partner-licensed",
+}
+
+
+def _legacy_license_to_kind(raw: dict) -> str:
+    """Map a legacy YAML manifest's license field onto ADR-10's closed
+    list. New manifests already carry `license_kind` directly; this is
+    the migration-time bridge for old `license: <freeform>` shapes.
+    """
+    if "license_kind" in raw and raw["license_kind"] in _LICENSE_KIND_VALUES:
+        return raw["license_kind"]
+    legacy = raw.get("license")
+    if isinstance(legacy, str):
+        if legacy in {"internal-bridge", "internal-placeholder", "example"}:
+            return "example"
+        if legacy.startswith("talent-contract"):
+            return "talent-contract"
+        if legacy in _LICENSE_KIND_VALUES:
+            return legacy
+    return "user-owned"  # safest fallback for an unknown manifest
+
+
 def _sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -161,7 +185,12 @@ async def _migrate(args) -> int:
                 reference_seconds=duration,
                 reference_sample_rate=sample_rate,
                 source=raw.get("source", "bootstrap"),
-                license=raw.get("license", "internal-bridge"),
+                # ADR-10 — closed-list license_kind. Legacy YAML may
+                # carry a freeform `license` key; map known values onto
+                # the new vocabulary, else default to user-owned
+                # (safest fallback for unknown manifests).
+                license_kind=_legacy_license_to_kind(raw),
+                license_ref=raw.get("license_ref"),
             )
             await AuditRepo(session).record(
                 actor_type="system",

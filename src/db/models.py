@@ -205,7 +205,7 @@ class ApiKey(Base):
 
     __table_args__ = (
         CheckConstraint(
-            r"prefix ~ '^nqai_(prod|staging|dev)_[a-zA-Z0-9]{14}$'",
+            r"prefix ~ '^nv_(prod|staging|dev)_[a-zA-Z0-9]{14}$'",
             name="prefix_format",
         ),
         CheckConstraint("rate_limit_per_minute > 0", name="rate_limit_positive"),

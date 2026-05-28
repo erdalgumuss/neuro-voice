@@ -144,7 +144,7 @@ class SECSMetric:
                     "(they are pinned in pyproject's main deps)."
                 )
                 logger.warning("%s — %s", msg, e)
-                object.__setattr__(self, "_import_error", msg)
+                self._import_error = msg
                 return False
             logger.info(
                 "loading SECS speaker encoder (model=%s device=%s)",
@@ -156,15 +156,15 @@ class SECSMetric:
             except Exception as e:  # noqa: BLE001 — surface as nan
                 msg = f"WavLM load failed: {type(e).__name__}: {e}"
                 logger.exception(msg)
-                object.__setattr__(self, "_import_error", msg)
+                self._import_error = msg
                 return False
             if self.device != "auto":
                 model = model.to(self.device)
             elif torch.cuda.is_available():
                 model = model.to("cuda")
             model.eval()
-            object.__setattr__(self, "_feature_extractor", feature_extractor)
-            object.__setattr__(self, "_model", model)
+            self._feature_extractor = feature_extractor
+            self._model = model
         return True
 
     def _embed(self, waveform_f32: Any) -> Any:
@@ -187,8 +187,15 @@ class SECSMetric:
             output = self._model(
                 input_values, attention_mask=attention_mask,
             )
-            # `embeddings` is already L2-normalized by the X-Vector head.
-            return output.embeddings.squeeze(0)
+            # WavLMForXVector's `embeddings` is the raw X-vector
+            # projection — the AMSoftmax head normalizes during
+            # training, but inference-time output is NOT L2-normalized
+            # (typical norm 8-15). Cosine similarity downstream requires
+            # explicit normalization, otherwise the dot product is a
+            # scaled inner product that can exceed [-1, 1] and the
+            # clamp at score() masks a real correctness bug.
+            emb = output.embeddings.squeeze(0)
+            return torch.nn.functional.normalize(emb, dim=-1)
 
     def _target_embedding(self) -> Any:
         """Cached reference embedding. Computed on first use; subsequent
@@ -199,7 +206,7 @@ class SECSMetric:
             if self._reference_embedding is not None:
                 return self._reference_embedding
             emb = self._embed(self._reference_pcm)
-            object.__setattr__(self, "_reference_embedding", emb)
+            self._reference_embedding = emb
         return emb
 
     def score(

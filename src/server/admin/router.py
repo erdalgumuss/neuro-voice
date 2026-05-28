@@ -39,15 +39,17 @@ from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from db.models import ApiKey
+from db.models import ApiKey, Voice
 from db.session import get_session
 from repos import (
     ApiKeyRepo,
     AuditRepo,
     DataDeletionRequestRepo,
     OperatorRepo,
+    TalentContractRepo,
     TenantRepo,
     UsageRepo,
+    VoiceConsentRecordRepo,
     VoiceRepo,
     WatermarkKeyRepo,
 )
@@ -466,24 +468,53 @@ async def admin_purge_voice(
             "already_purged": True,
         }
 
-    # Try R2 deletes; record what happened. Don't abort on per-object
-    # failure — the DB scrub is the irreversible part and we want to
-    # land it deterministically.
-    r2_deletes: list[dict] = []
+    # Try artifact deletes (R2 + local file://); record what happened.
+    # Don't abort on per-object failure — the DB scrub is the
+    # irreversible part and we want to land it deterministically.
+    # ADR-11 KVKK/GDPR right-to-erasure requires that EVERY artifact
+    # location be addressed, including the local file:// path used by
+    # the legacy enrollment flow (main.py writes
+    # `file://{tenant_dir}/{voice_id}.wav`). Leaving those files on
+    # disk after purge violates the erasure obligation.
+    from pathlib import Path
+
+    artifact_deletes: list[dict] = []
     storage = get_r2_storage()
     for label, uri in (
         ("reference", voice.reference_uri),
         ("adapter", voice.adapter_uri),
     ):
-        if not uri or not uri.startswith("s3://"):
-            r2_deletes.append({"label": label, "uri": uri, "skipped": True})
+        if not uri:
+            artifact_deletes.append(
+                {"label": label, "uri": uri, "skipped": "no_uri"}
+            )
             continue
-        try:
-            storage.delete(uri)
-            r2_deletes.append({"label": label, "uri": uri, "ok": True})
-        except Exception as e:  # noqa: BLE001 — log + continue
-            r2_deletes.append(
-                {"label": label, "uri": uri, "ok": False, "error": str(e)},
+        if uri.startswith("s3://") or uri.startswith("r2://"):
+            try:
+                storage.delete(uri)
+                artifact_deletes.append(
+                    {"label": label, "uri": uri, "ok": True, "kind": "r2"}
+                )
+            except Exception as e:  # noqa: BLE001 — log + continue
+                artifact_deletes.append(
+                    {"label": label, "uri": uri, "ok": False,
+                     "kind": "r2", "error": str(e)},
+                )
+        elif uri.startswith("file://"):
+            local_path = Path(uri.removeprefix("file://"))
+            try:
+                local_path.unlink(missing_ok=True)
+                artifact_deletes.append(
+                    {"label": label, "uri": uri, "ok": True, "kind": "file"}
+                )
+            except Exception as e:  # noqa: BLE001 — log + continue
+                artifact_deletes.append(
+                    {"label": label, "uri": uri, "ok": False,
+                     "kind": "file", "error": str(e)},
+                )
+        else:
+            artifact_deletes.append(
+                {"label": label, "uri": uri, "skipped": "unknown_scheme"}
             )
 
     purged = await repo.execute_purge(voice_db_id)
@@ -499,14 +530,14 @@ async def admin_purge_voice(
         payload={
             "voice_slug": purged.voice_id,
             "notes": notes,
-            "r2_deletes": r2_deletes,
+            "artifact_deletes": artifact_deletes,
         },
     )
     await session.commit()
     return {
         "voice_id": purged.voice_id,
         "purged_at": purged.purged_at.isoformat(),
-        "r2_deletes": r2_deletes,
+        "artifact_deletes": artifact_deletes,
     }
 
 
@@ -880,12 +911,25 @@ async def admin_detect_watermark(
     from datetime import datetime, timezone
 
     from audio.watermark import WatermarkDetector
-    from db.models import Voice, WatermarkKey
+    from server.config import settings
 
+    # Bound the upload BEFORE the read so a 5 GB submission can't OOM
+    # the gateway worker. The operator-only gate doesn't mean the
+    # endpoint is safe — a compromised operator JWT or a fat-fingered
+    # rsync should still get a 413, not a kernel OOM kill.
+    max_bytes = settings.forensics_max_upload_mb * 1024 * 1024
     audio_bytes = await audio.read()
     if not audio_bytes:
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST, detail="empty audio upload",
+        )
+    if len(audio_bytes) > max_bytes:
+        raise HTTPException(
+            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=(
+                f"audio upload exceeds {settings.forensics_max_upload_mb} MB "
+                f"(got {len(audio_bytes) // (1024*1024)} MB)"
+            ),
         )
 
     # Decode whatever format the operator uploaded → mono int16 PCM.
@@ -926,16 +970,48 @@ async def admin_detect_watermark(
 
     matched_key_id: str | None = None
     matched_key_label: str | None = None
+    matched_key_history: list[dict[str, str | None]] = []
     matched_voice_ids: list[str] = []
     if result.message is not None:
-        key = await WatermarkKeyRepo(session).get_active_by_bits(result.message)
-        if key is not None:
-            matched_key_id = str(key.id)
-            matched_key_label = key.label
+        # Use list_by_bits (active + retired) so audio generated by a
+        # since-retired key still matches. A retired allocation may
+        # legitimately share its 16-bit slot with a newer active key
+        # (partial unique on retired_at IS NULL — see ADR-13 §1); the
+        # full history lets the operator pick the right allocation
+        # context for the audio's vintage.
+        history = await WatermarkKeyRepo(session).list_by_bits(result.message)
+        matched_key_history = [
+            {
+                "id": str(k.id),
+                "label": k.label,
+                "allocated_at": k.allocated_at.isoformat(),
+                "retired_at": k.retired_at.isoformat() if k.retired_at else None,
+            }
+            for k in history
+        ]
+        if history:
+            # Primary = most-recent allocation (active or retired).
+            primary = history[0]
+            matched_key_id = str(primary.id)
+            matched_key_label = primary.label
+            # Voice membership: every voice that has EVER been bound
+            # to any of these key allocations. Today voices reference
+            # via FK only, but the FK history shows what's currently
+            # bound; future "voice unbinds key" events would need to
+            # leave a trail to fully restore this set.
+            key_ids = [k.id for k in history]
             voices = (await session.execute(
-                select(Voice).where(Voice.watermark_key_id == key.id)
+                select(Voice).where(Voice.watermark_key_id.in_(key_ids))
             )).scalars().all()
             matched_voice_ids = [v.voice_id for v in voices]
+
+    # Truncate operator-supplied filename to a short, control-char-free
+    # form before logging — defense against log-injection / stored-XSS
+    # on a future audit log viewer.
+    raw_filename = audio.filename or "(no-filename)"
+    safe_filename = "".join(
+        c for c in raw_filename if c.isprintable() and c not in "\r\n"
+    )[:256]
 
     await AuditRepo(session).record(
         actor_type="operator",
@@ -944,15 +1020,16 @@ async def admin_detect_watermark(
         action="forensics.detect",
         result="success",
         tenant_id=None,
-        target_type="watermark_key" if matched_key_id else "audio",
-        target_id=matched_key_id or "anonymous",
+        target_type="watermark_key" if matched_key_id else "forensics_probe",
+        target_id=matched_key_id or str(uuid.uuid4()),
         payload={
             "probability": result.probability,
             "decoded_message": result.message,
             "threshold": threshold,
             "matched_key_id": matched_key_id,
+            "matched_key_history_count": len(matched_key_history),
             "matched_voice_ids": matched_voice_ids,
-            "uploaded_filename": audio.filename,
+            "uploaded_filename": safe_filename,
             "uploaded_size_bytes": len(audio_bytes),
         },
     )
@@ -963,6 +1040,7 @@ async def admin_detect_watermark(
         message=result.message,
         matched_key_id=matched_key_id,
         matched_key_label=matched_key_label,
+        matched_key_history=matched_key_history,
         matched_voice_ids=matched_voice_ids,
         sample_rate_used=result.sample_rate_used,
         duration_seconds=result.duration_seconds,
@@ -1002,3 +1080,142 @@ async def admin_reject_deletion_request(
     )
     await session.commit()
     return {"id": str(ticket.id), "status": ticket.status}
+
+
+# --------------------------------------------------------------------------- #
+# Cascade endpoints — consent + talent contract revoke (ADR-11 follow-up)
+# --------------------------------------------------------------------------- #
+# ADR-11 promised: "consent revoke triggers voice freeze; talent_contract
+# revoke triggers freeze on all dependent voices". The repo revoke()
+# methods existed but had no call sites — synthesis was blocked by the
+# gate (no active consent → 410), but `voices.frozen_at` stayed NULL so
+# lifecycle_state reported 'active', misleading operator UI + downstream
+# audit/automation. These endpoints close that cascade gap.
+@admin_router.post("/voice-consents/{consent_id}/revoke")
+async def admin_revoke_voice_consent(
+    consent_id: uuid.UUID,
+    reason: Annotated[str, Form(min_length=1, max_length=2048)],
+    op = Depends(_current_operator),
+    session: Annotated[AsyncSession, Depends(get_session)] = ...,
+):
+    """Revoke a consent record AND freeze the affected voice in the
+    same transaction. Idempotent: if the consent is already revoked,
+    the voice freeze step still runs (defensive — operators relying
+    on this endpoint to fix a previously-uncascaded revoke get the
+    expected state)."""
+    consent_repo = VoiceConsentRecordRepo(session)
+    consent = await consent_repo.revoke(consent_id, reason=reason)
+    if consent is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            detail=f"voice consent '{consent_id}' not found",
+        )
+
+    voice_repo = VoiceRepo(session, uuid.uuid4())
+    voice = await voice_repo.freeze(
+        consent.voice_id,
+        reason=f"consent revoked: {reason}",
+        purge_after_days=None,
+    )
+    if voice is None:
+        # Consent row exists but voice already gone — log + commit
+        # the consent revoke; nothing to freeze.
+        logger.warning(
+            "voice id=%s referenced by consent %s not found at cascade time",
+            consent.voice_id, consent_id,
+        )
+
+    await AuditRepo(session).record(
+        actor_type="operator",
+        actor_id=op.id,
+        actor_label=op.email,
+        action="voice_consent.revoke",
+        result="success",
+        tenant_id=voice.owner_tenant_id if voice is not None else None,
+        target_type="voice_consent_record",
+        target_id=str(consent.id),
+        payload={
+            "voice_id": str(consent.voice_id),
+            "reason": reason,
+            "cascade_frozen_voice": (
+                voice.voice_id if voice is not None else None
+            ),
+        },
+    )
+    await session.commit()
+    return {
+        "consent_id": str(consent.id),
+        "revoked_at": (
+            consent.revoked_at.isoformat() if consent.revoked_at else None
+        ),
+        "cascade_frozen_voice_id": (
+            voice.voice_id if voice is not None else None
+        ),
+    }
+
+
+@admin_router.post("/talent-contracts/{contract_id}/revoke")
+async def admin_revoke_talent_contract(
+    contract_id: uuid.UUID,
+    reason: Annotated[str, Form(min_length=1, max_length=2048)],
+    op = Depends(_current_operator),
+    session: Annotated[AsyncSession, Depends(get_session)] = ...,
+):
+    """Revoke a talent contract AND freeze every voice that references
+    it via license_ref. Cascade is route-orchestrated (per ADR-11
+    "trigger orchestration route'ta, repos thin")."""
+    contract_repo = TalentContractRepo(session)
+    contract = await contract_repo.revoke(contract_id, revoked_at=None)
+    if contract is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            detail=f"talent contract '{contract_id}' not found",
+        )
+
+    # license_ref is TEXT (polymorphic); contract IDs land as the
+    # stringified UUID. Match the in-DB representation exactly.
+    contract_id_str = str(contract.id)
+    dependents = list((await session.execute(
+        select(Voice).where(
+            Voice.license_kind == "talent-contract",
+            Voice.license_ref == contract_id_str,
+            Voice.purged_at.is_(None),
+        )
+    )).scalars().all())
+
+    voice_repo = VoiceRepo(session, uuid.uuid4())
+    frozen_voice_slugs: list[str] = []
+    for v in dependents:
+        result = await voice_repo.freeze(
+            v.id,
+            reason=f"talent contract revoked: {reason}",
+            purge_after_days=None,
+        )
+        if result is not None:
+            frozen_voice_slugs.append(result.voice_id)
+
+    await AuditRepo(session).record(
+        actor_type="operator",
+        actor_id=op.id,
+        actor_label=op.email,
+        action="talent_contract.revoke",
+        result="success",
+        tenant_id=None,
+        target_type="talent_contract",
+        target_id=str(contract.id),
+        payload={
+            "reason": reason,
+            "talent_full_name": contract.talent_full_name,
+            "cascade_frozen_voice_count": len(frozen_voice_slugs),
+            "cascade_frozen_voice_slugs": frozen_voice_slugs,
+        },
+    )
+    await session.commit()
+    return {
+        "contract_id": str(contract.id),
+        "revoked_at": (
+            contract.revoked_at.isoformat() if contract.revoked_at else None
+        ),
+        "cascade_frozen_voice_count": len(frozen_voice_slugs),
+        "cascade_frozen_voice_slugs": frozen_voice_slugs,
+    }

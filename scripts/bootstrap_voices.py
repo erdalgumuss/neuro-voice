@@ -68,6 +68,11 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"skip {vid}: reference {ref_path} missing", file=sys.stderr)
                 continue
             with ref_path.open("rb") as fh:
+                # ADR-10 — license_kind + consent_kind are required by
+                # POST /v1/voices. The seed YAML uses `license_kind`
+                # (not the legacy `license` key); seed voices are
+                # example-grade and consent is tenant-asserted (no
+                # talent contract to gate on).
                 resp = client.post(
                     "/v1/voices",
                     data={
@@ -76,8 +81,10 @@ def main(argv: list[str] | None = None) -> int:
                         "language": voice.get("language", "tr"),
                         "gender": voice.get("gender", "neutral"),
                         "style_tags": ",".join(voice.get("style_tags", [])),
-                        "source": voice.get("source", "bootstrap"),
-                        "license": voice.get("license", "internal-bridge"),
+                        "license_kind": voice.get("license_kind", "example"),
+                        "consent_kind": voice.get(
+                            "consent_kind", "tenant-asserted",
+                        ),
                     },
                     files={"reference_audio": (ref_path.name, fh, _content_type(ref_path))},
                 )

@@ -605,14 +605,24 @@ class WatermarkKeyRetireRequest(BaseModel):
 
 
 class WatermarkDetectionResultPublic(BaseModel):
-    """Admin-visible forensics result. `matched_voice_ids` enumerates
-    voices currently assigned this key (active + historical via the
-    retired-key lookup path). `message` is None when the detection
-    probability is below threshold."""
+    """Admin-visible forensics result.
+
+    `matched_key_id` / `matched_key_label` point at the MOST-RECENT
+    allocation that carries the decoded payload (active or retired).
+    `matched_key_history` enumerates every allocation that has ever
+    held this 16-bit pattern, newest first — needed when auditing
+    older audio whose generating key has since been retired and a
+    new active key allocated on the same slot.
+
+    `matched_voice_ids` are voices currently bound (via foreign key)
+    to any of those allocations. `message` is None when the detection
+    probability is below threshold.
+    """
     probability: float = Field(ge=0.0, le=1.0)
     message: int | None = Field(default=None, ge=0, le=65535)
     matched_key_id: str | None = None
     matched_key_label: str | None = None
+    matched_key_history: list[dict[str, Any]] = Field(default_factory=list)
     matched_voice_ids: list[str] = Field(default_factory=list)
     sample_rate_used: int
     duration_seconds: float

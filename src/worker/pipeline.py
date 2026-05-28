@@ -307,7 +307,7 @@ async def process_one_job(
     # Also look up the watermark key payload (ADR-13) in the same
     # session — the worker needs the 16-bit message_bits to embed
     # into each synth chunk. NULL when watermarking is disabled OR
-    # no key is allocated; the applier treats NULL as a skip.
+    # no key is allocated.
     watermark_message_bits: int | None = None
     async with session_factory() as s:
         voice_row = await VoiceRepo(s, tenant_id).get_accessible(job.voice_id)
@@ -325,6 +325,50 @@ async def process_one_job(
                     "but no active key row found",
                     voice_row.voice_id, voice_row.watermark_key_id,
                 )
+
+    # ADR-13 §5 — talent-contract / public-figure / partner-licensed
+    # voices are legally watermarked. Refuse synthesis if the chain
+    # cannot deliver: PoisonJob for "no key bound" (operator must
+    # allocate + bind), TransientFailure for "applier unavailable"
+    # (this worker doesn't have audioseal, but another might).
+    _WATERMARK_REQUIRED_LICENSE_KINDS = {
+        "talent-contract", "public-figure", "partner-licensed",
+    }
+    if (
+        voice_row is not None
+        and voice_row.license_kind in _WATERMARK_REQUIRED_LICENSE_KINDS
+    ):
+        if watermark_message_bits is None:
+            await mark_terminal_failure(
+                job,
+                redis=redis,
+                error_code="watermark_required_no_key",
+                message=(
+                    f"voice license_kind={voice_row.license_kind!r} requires "
+                    "watermark but no active watermark_key is bound; "
+                    "operator must allocate + bind a key before synthesis"
+                ),
+                seq=0,
+                worker_id=worker_id,
+                elapsed_ms=int((time.monotonic() - started) * 1000),
+                session_factory=session_factory,
+                attempt=attempt,
+            )
+            raise PoisonJob(
+                f"voice {voice_row.voice_id!r} requires watermark but no key bound"
+            )
+        # Probe the applier upfront so we fail the job ONCE at
+        # boot-of-inference rather than mid-stream after the first
+        # chunk goes out. _load returning None == permanent (this
+        # process can't recover); raise TransientFailure so XAUTOCLAIM
+        # hands the job to a sibling worker that may have the dep.
+        from audio.watermark import get_applier
+        if get_applier()._load() is None:
+            raise TransientFailure(
+                f"voice {voice_row.voice_id!r} requires watermark but "
+                "audioseal package unavailable on this worker"
+            )
+
     if voice_row is None:
         await mark_terminal_failure(
             job,

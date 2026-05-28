@@ -374,7 +374,11 @@ WORKER_MODEL_INFO: Gauge = Gauge(
 )
 
 QUEUE_DEPTH: Gauge = Gauge(
-    "nqai_queue_depth",
+    # ADR-1 brand alignment — was `nqai_queue_depth`. Operator
+    # dashboards referencing the old name MUST be updated alongside
+    # this rename; metric labels are stable identifiers in
+    # PromQL / Grafana, so this is a deliberate breaking change.
+    "neurovoice_queue_depth",
     "Snapshot of XLEN per Redis Streams stream the gateway/worker manages.",
     labelnames=("stream",),
     registry=REGISTRY,
