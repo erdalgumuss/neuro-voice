@@ -1,19 +1,19 @@
-"""MLOps PR #3 — eval harness CLI.
+"""Eval harness CLI.
 
 Single command to produce the comparison table the audit asks for:
 
     PYTHONPATH=src python scripts/eval_run.py \\
         --test-set v0.1-mini \\
-        --systems nqai elevenlabs \\
-        --nqai-voice neeko-v01 \\
+        --systems neurovoice elevenlabs \\
+        --neurovoice-voice neeko-v01 \\
         --elevenlabs-voice 21m00Tcm4TlvDq8ikWAM \\
         --metrics whisper_wer \\
         --output-dir experiments \\
-        --slug nqai-vs-elevenlabs-baseline
+        --slug neurovoice-vs-elevenlabs-baseline
 
 Auth:
-  - NQAI_API_KEY     — bearer for NQAI rows
-  - ELEVENLABS_API_KEY — for vendor rows
+  - NEUROVOICE_API_KEY  — bearer for NeuroVoice rows
+  - ELEVENLABS_API_KEY  — for ElevenLabs rows
 
 Default behaviour is INTENTIONALLY conservative: nothing real runs
 unless you ask for it by name. `--list-*` flags introspect the
@@ -36,7 +36,7 @@ def _repo_root() -> Path:
 
 def main() -> int:
     logging.basicConfig(
-        level=os.environ.get("NQAI_LOG_LEVEL", "INFO").upper(),
+        level=os.environ.get("NEUROVOICE_LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
 
@@ -83,10 +83,10 @@ def main() -> int:
     test_set = load_test_set(args.test_set)
 
     voices_per_system: dict[str, list[str]] = {}
-    if "nqai" in args.systems:
-        if not args.nqai_voice:
-            parser.error("--nqai-voice required when --systems includes nqai")
-        voices_per_system["nqai"] = args.nqai_voice
+    if "neurovoice" in args.systems:
+        if not args.neurovoice_voice:
+            parser.error("--neurovoice-voice required when --systems includes neurovoice")
+        voices_per_system["neurovoice"] = args.neurovoice_voice
     if "elevenlabs" in args.systems:
         if not args.elevenlabs_voice:
             parser.error(
@@ -119,28 +119,28 @@ def main() -> int:
 def _build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="eval_run",
-        description="Run NQAI Voice eval comparison and produce a report.",
+        description="Run NeuroVoice eval comparison and produce a report.",
     )
     p.add_argument("--test-set", default="v0.1-mini",
                    help="registered test-set slug (default: v0.1-mini)")
     p.add_argument("--systems", nargs="+",
-                   choices=["nqai", "elevenlabs"],
+                   choices=["neurovoice", "elevenlabs"],
                    help="systems to score (one or more)")
     p.add_argument("--metrics", nargs="+",
                    help="metric names to apply (e.g. whisper_wer)")
-    p.add_argument("--nqai-voice", nargs="+",
-                   help="NQAI voice slug(s) — required if `nqai` in --systems")
+    p.add_argument("--neurovoice-voice", nargs="+",
+                   help="NeuroVoice voice slug(s) — required if `neurovoice` in --systems")
     p.add_argument("--elevenlabs-voice", nargs="+",
                    help="ElevenLabs voice id(s) — required if `elevenlabs`")
-    p.add_argument("--nqai-model-id", default="nqai-voxcpm2-tr-hd",
-                   help="NQAI preset (default: nqai-voxcpm2-tr-hd)")
-    p.add_argument("--nqai-base-url", default="http://localhost:8000")
+    p.add_argument("--neurovoice-model-id", default="voxcpm2-tr-hd",
+                   help="NeuroVoice preset (default: voxcpm2-tr-hd)")
+    p.add_argument("--neurovoice-base-url", default="http://localhost:8000")
     p.add_argument("--elevenlabs-model-id", default="eleven_multilingual_v2")
     p.add_argument("--whisper-model", default="large-v3",
                    help="Whisper size (large-v3 default, medium for cheap)")
     p.add_argument("--output-dir", default="experiments",
                    help="where to write `<date>-<slug>/REPORT.md`")
-    p.add_argument("--cache-dir", default="/tmp/nqai-eval-cache",
+    p.add_argument("--cache-dir", default="/tmp/neurovoice-eval-cache",
                    help="audio cache (skip vendor re-bills across re-runs)")
     p.add_argument("--slug", default="baseline",
                    help="report subdirectory name suffix")
@@ -171,12 +171,12 @@ def _register_real_systems(args) -> None:
     is imported lazily for the same reason as metrics — we don't
     want a no-network probe to fail because httpx wasn't installed."""
     from eval.systems import register_system
-    if "nqai" in (args.systems or []) or args.list_systems:
-        from eval.systems.nqai import NQAISystem
-        register_system("nqai", NQAISystem(
-            api_key=os.environ.get("NQAI_API_KEY", ""),
-            base_url=args.nqai_base_url,
-            model_id=args.nqai_model_id,
+    if "neurovoice" in (args.systems or []) or args.list_systems:
+        from eval.systems.neurovoice import NeuroVoiceSystem
+        register_system("neurovoice", NeuroVoiceSystem(
+            api_key=os.environ.get("NEUROVOICE_API_KEY", ""),
+            base_url=args.neurovoice_base_url,
+            model_id=args.neurovoice_model_id,
         ))
     if "elevenlabs" in (args.systems or []) or args.list_systems:
         from eval.systems.elevenlabs import ElevenLabsSystem

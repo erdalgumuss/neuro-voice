@@ -1,15 +1,15 @@
 """TTS system abstraction for the eval harness.
 
 A `TTSSystem` synthesizes a test sentence into int16 PCM bytes. The
-runner doesn't care HOW (HTTP call to NQAI, REST call to ElevenLabs,
-local synthesis call) — only that it gets back audio that the metric
-backends can score.
+runner doesn't care HOW (HTTP call to NeuroVoice, REST call to
+ElevenLabs, local synthesis call) — only that it gets back audio that
+the metric backends can score.
 
 The reason for this abstraction is the most important number in the
-audit: a side-by-side table of "NQAI VoxCPM2 vs ElevenLabs vs MiniMax
-vs OpenAI" on the same test set. Without a system-level abstraction
-each comparison is a one-off script that drifts. With it, adding
-a new vendor is one file in `src/eval/systems/`.
+audit: a side-by-side table of "NeuroVoice VoxCPM2 vs ElevenLabs vs
+MiniMax vs OpenAI" on the same test set. Without a system-level
+abstraction each comparison is a one-off script that drifts. With it,
+adding a new vendor is one file in `src/eval/systems/`.
 
 Reproducibility contract: every system MUST return a `SystemMetadata`
 dict alongside its PCM (model id, voice id, latency, version). The
@@ -29,7 +29,7 @@ class SystemMetadata:
     the report is "VoxCPM2-hd vs ElevenLabs" without a recoverable
     "which preset, which voice, when, how long" trail."""
 
-    system: str             # canonical name: "nqai", "elevenlabs", ...
+    system: str             # canonical name: "neurovoice", "elevenlabs", ...
     model_id: str           # vendor preset / model identifier
     voice_id: str
     elapsed_ms: int

@@ -1,4 +1,4 @@
-"""NQAI Voice TTS system adapter for the eval harness.
+"""NeuroVoice TTS system adapter for the eval harness.
 
 Calls our own HTTP API just like an external client would. This is
 on purpose — running the eval through our public surface catches
@@ -9,15 +9,15 @@ Two paths:
 
   * **HTTP path** (default): POST /v1/tts/jobs + poll. Async-only —
     we deliberately don't use the deprecated sync /v1/tts. Records
-    `engine_inputs` (PR #1) automatically because the worker pipeline
-    runs unchanged.
+    `engine_inputs` automatically because the worker pipeline runs
+    unchanged.
 
   * **In-process path** (`--in-process`): for benchmarks where the
     operator wants to bypass HTTP overhead and measure pure model
     performance. NOT for cross-vendor comparison runs.
 
 Authentication is via the same Bearer API key the operator already
-uses for other clients (`NQAI_API_KEY` env or `--api-key` flag).
+uses for other clients (`NEUROVOICE_API_KEY` env or `--api-key` flag).
 """
 
 from __future__ import annotations
@@ -31,17 +31,17 @@ import httpx
 
 from . import SystemMetadata, SystemOutput
 
-logger = logging.getLogger("nqai_voice.eval.systems.nqai")
+logger = logging.getLogger("neurovoice.eval.systems.neurovoice")
 
 
 @dataclass
-class NQAISystem:
-    """HTTP adapter — calls the NQAI Voice public API."""
+class NeuroVoiceSystem:
+    """HTTP adapter — calls the NeuroVoice public API."""
 
-    name: str = "nqai"
+    name: str = "neurovoice"
     base_url: str = "http://localhost:8000"
     api_key: str = ""
-    model_id: str = "nqai-voxcpm2-tr-hd"
+    model_id: str = "voxcpm2-tr-hd"
     audio_format: str = "wav"
     poll_timeout_s: float = 60.0
     poll_interval_s: float = 0.5
@@ -54,14 +54,14 @@ class NQAISystem:
     ) -> SystemOutput:
         if not self.api_key:
             raise RuntimeError(
-                "NQAISystem.api_key is empty — set NQAI_API_KEY in the "
-                "environment or pass --api-key. Eval refuses to run with "
+                "NeuroVoiceSystem.api_key is empty — set NEUROVOICE_API_KEY in "
+                "the environment or pass --api-key. Eval refuses to run with "
                 "anonymous auth so report rows stay traceable to a tenant."
             )
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Idempotency-Key": str(uuid.uuid4()),
-            "X-NQAI-App": "nqai-eval-harness",
+            "X-NV-App": "neurovoice-eval-harness",
         }
         t0 = time.monotonic()
         with httpx.Client(base_url=self.base_url, timeout=30.0) as client:
@@ -92,13 +92,13 @@ class NQAISystem:
                     break
                 if body["status"] == "failed":
                     raise RuntimeError(
-                        f"NQAI eval job {job_id} failed: "
+                        f"NeuroVoice eval job {job_id} failed: "
                         f"{body.get('error_code')} {body.get('error_detail')}"
                     )
                 time.sleep(self.poll_interval_s)
             if output_url is None:
                 raise TimeoutError(
-                    f"NQAI eval job {job_id} did not complete in "
+                    f"NeuroVoice eval job {job_id} did not complete in "
                     f"{self.poll_timeout_s:.0f}s"
                 )
 
