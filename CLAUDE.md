@@ -129,15 +129,30 @@ Built-in (ihtiyaca göre): `/code-review`, `/run`, `/verify`, `/security-review`
 
 Model checkpoint (`*.safetensors`, `*.bin`) — Git LFS olmadan commit etme. Ağırlıklar R2'de, manifest'le referans.
 
-## Bilinçli ertelenmiş kararlar (ADR'leri sırada)
+## Kararlaştırılmış ADR'ler
 
-1. Multi-language text frontend / G2P stratejisi (`src/g2p/` doldurma planı).
-2. LoRA training kodunu notebook'tan kod tabanına taşıma şekli (`src/finetune/` mimari).
-3. Voice manifest schema v2 (dil + karakter + lisans + watermark + eval pin).
-4. Public API spec'i (kendi spec mi, OpenAI/ElevenLabs uyumlu mu, ikisi de mi).
-5. Billing / metering / quota modeli.
-6. Multi-region deployment (R2 + worker pool coğrafyası).
-7. Voice ownership + KVKK/GDPR/voice-talent kontrat çerçevesi (uluslararası).
-8. `docs/research/` LEGACY işaretleme stratejisi.
+`docs/decisions/` altında yaşar:
+
+| ADR | Konu | Tarih |
+| --- | --- | --- |
+| ADR-1 | HTTP header + env var prefix → NeuroVoice (`X-NV-*`, `NEUROVOICE_*`) | 2026-05-28 |
+| ADR-2 | Eval harness system slug `nqai` → `neurovoice` (dosya + class + CLI) | 2026-05-28 |
+| ADR-3 | Model_id preset slug'lardan brand prefix'i kaldır (`voxcpm2-tr-*`) | 2026-05-28 |
+| ADR-4 | API key format + admin auth cookie isimleri `nv_` prefix | 2026-05-28 |
+| ADR-5 | `docs/research/` LEGACY işaretleme (`00-LEGACY.md` üst-marker) | 2026-05-28 |
+| ADR-6 | Multilingual frontend — pluggable `lang_packs/<iso>/` mimarisi | 2026-05-28 |
+| ADR-7 | Voice manifest schema v2 (`schema_version`, `base_model_id`, `lexicon`, `watermark`, `eval_pin`) + brand-neutral sample voice | 2026-05-28 |
+| ADR-8 | LoRA fine-tune pipeline: notebook → `src/finetune/` paketi + `scripts/finetune.py` CLI | 2026-05-28 |
+
+## Bilinçli ertelenmiş kararlar (sıradaki ADR'ler)
+
+1. **Public API spec'i** — kendi spec mi, OpenAI/ElevenLabs uyumlu mu, ikisi birden mi. Vendor-parity URL alias'ları zaten var; formal spec/OpenAPI doc'u henüz yok.
+2. **Billing / metering / quota modeli** — usage_records'tan billing'e bağlanma mantığı; per-tenant quota enforcement; subscription tier'ları.
+3. **Multi-region deployment** — R2 region seçimi + worker pool coğrafyası + cross-region eviction politikası.
+4. **Voice ownership + KVKK/GDPR/voice-talent kontrat çerçevesi** (uluslararası) — `voices.license` taksonomi tipi netleşmeli (`example` / `synthetic` / `user-owned` / `talent-contract:<id>`); consent verification flow.
+5. **Eval pin entegrasyonu** — `infer` çıktısını `voices.eval_metrics` JSONB sütununa yazan production-edilebilir adım (ADR-8 kapsamı dışında bırakıldı).
+6. **Watermark generation** — `voices.watermark_key_id` runtime synthesis'te imzalama; ayrı bir ADR konusu (fine-tune değil).
+7. **Multi-tenant fine-tune servisi** — `src/finetune/`'ı queue-backed multi-tenant servisle sarmak (`POST /v1/finetune-jobs`); şu an CLI-only.
+8. **Test suite (Codex authoring)** — `tests/` boş, `old_tests/` parkta; Codex mimariye göre adım-adım yeniden yazıyor (bkz. `feedback_codex_writes_tests` memory).
 
 Her biri kararlaştığında `/nqv-adr <slug>` ile kayda geçer.
