@@ -482,6 +482,9 @@ def _voice_to_public(v, viewer_tenant_id: uuid.UUID | None = None) -> VoicePubli
             v.purge_after_at.isoformat()
             if getattr(v, "purge_after_at", None) is not None else None
         ),
+        # ADR-12 — eval pin blob exposed verbatim. NULL on un-pinned
+        # voices; SDK clients decide their own quality threshold.
+        eval_metrics=getattr(v, "eval_metrics", None),
         created_at=v.created_at.isoformat(),
         created_by=created_by,
         description=getattr(v, "description", None),

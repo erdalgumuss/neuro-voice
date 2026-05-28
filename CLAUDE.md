@@ -146,6 +146,7 @@ Model checkpoint (`*.safetensors`, `*.bin`) — Git LFS olmadan commit etme. Ağ
 | ADR-9 | Public API spec stratejisi — native = FastAPI auto-OpenAPI + CI snapshot; parity = ElevenLabs spec'i `vendors/elevenlabs/` altında pin'lenip contract test ile sözleşmeye alınır (MiniMax v0 dışı; SDK gen ayrı ADR) | 2026-05-28 |
 | ADR-10 | Voice license taxonomy + consent records + talent contracts — `voices.license_kind` kapalı liste CHECK constraint (6 değer); polymorphic `license_ref`; yeni `talent_contracts` + `voice_consent_records` tabloları; v0'da tenant-asserted consent yeterli, esnek genişletilebilir mimari | 2026-05-28 |
 | ADR-11 | Voice lifecycle + right-to-be-forgotten — `voices.{frozen_at, frozen_reason, purge_after_at, purged_at}` kolonları + computed `lifecycle_state`; yeni `data_deletion_requests` tablosu; synthesis gate (HTTP 410 / WS 1008); operator freeze/unfreeze/purge + tenant deletion-request endpoint'leri; 30 gün GDPR retention default | 2026-05-28 |
+| ADR-12 | Eval pin — 3-metric suite (Whisper-WER+CER mevcut, UTMOSv2 wire, yeni SECS via WavLM-base-plus-sv), `VoiceRepo.pin_eval` + `POST /admin/voices/{id}/eval-pin` + `scripts/eval_pin.py`, `VoicePublic.eval_metrics` expose, `[project.optional-dependencies] eval` grubu | 2026-05-28 |
 
 ## Bilinçli ertelenmiş kararlar (sıradaki ADR'ler)
 
@@ -153,7 +154,7 @@ Model checkpoint (`*.safetensors`, `*.bin`) — Git LFS olmadan commit etme. Ağ
 2. **Multi-region deployment** — R2 region seçimi + worker pool coğrafyası + cross-region eviction politikası + jurisdiction-spesifik retention override'ları (ADR-11'in default 30 gününü EU/TR/US başına override etmek).
 3. **Cron worker / scheduler infra** — periyodik expired-contract scan, scheduled purge auto-execute, operator notification queue. ADR-11 manuel/operator-driven path'i kurdu; otomatik scheduler yatırımı bu ADR'de.
 4. **Worker-side synthesis re-check** — ADR-11 gateway-side gate'i kurdu; queue'da bekleyen job freeze sonrası worker re-validate etmiyor (race window ~3-30s). Yüksek-trafikte gerekirse.
-5. **Eval pin entegrasyonu** — `infer` çıktısını `voices.eval_metrics` JSONB sütununa yazan production-edilebilir adım (ADR-8 kapsamı dışında bırakıldı).
+5. **Eval promotion gate** — `release_status='production'` transition'ında `eval_metrics IS NOT NULL` zorunluluğu. ADR-12 pin path'i kurdu; mevcut voice'lar pin'lendikten sonra gate eklenir.
 6. **Watermark generation** — `voices.watermark_key_id` runtime synthesis'te imzalama; ayrı bir ADR konusu (fine-tune değil).
 7. **Multi-tenant fine-tune servisi** — `src/finetune/`'ı queue-backed multi-tenant servisle sarmak (`POST /v1/finetune-jobs`); şu an CLI-only.
 8. **SDK generation** — kendi Python/TS SDK'larımızın üretimi ve yayın disiplini (ADR-9 kapsamı dışında bırakıldı; pyproject yayın disiplini önce oturmalı).

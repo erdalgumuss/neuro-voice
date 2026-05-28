@@ -366,6 +366,41 @@ class VoiceRepo:
         await self.session.flush()
         return v
 
+    async def pin_eval(
+        self,
+        voice_db_id: uuid.UUID,
+        *,
+        payload: dict[str, Any],
+    ) -> Voice | None:
+        """Stamp an eval result onto `voices.eval_metrics` (ADR-12).
+
+        Payload schema is the blob written under `voices.eval_metrics`
+        — see `docs/decisions/2026-05-28-eval-pin.md` §4 for the full
+        shape. Required top-level keys: `schema_version`, `evaluated_at`,
+        `metrics`. Idempotent — re-pinning overwrites.
+
+        Returns the mutated voice row (or None if voice_db_id is
+        unknown / purged). Purged voices cannot be re-pinned; pinning
+        a deleted-but-not-purged voice is allowed (operator may want
+        to record a final eval before purging).
+        """
+        required = ("schema_version", "evaluated_at", "metrics")
+        missing = [k for k in required if k not in payload]
+        if missing:
+            raise ValueError(
+                f"eval_metrics payload missing required keys: {missing}"
+            )
+        if not isinstance(payload["metrics"], dict) or not payload["metrics"]:
+            raise ValueError(
+                "eval_metrics payload `metrics` must be a non-empty dict"
+            )
+        v = await self.get_by_id(voice_db_id)
+        if v is None or v.purged_at is not None:
+            return v
+        v.eval_metrics = payload
+        await self.session.flush()
+        return v
+
     async def execute_purge(
         self,
         voice_db_id: uuid.UUID,

@@ -23,6 +23,7 @@ from typing import Annotated
 
 from fastapi import (
     APIRouter,
+    Body,
     Cookie,
     Depends,
     Form,
@@ -47,6 +48,7 @@ from repos import (
     VoiceRepo,
 )
 from storage.r2 import get_r2_storage
+from server.schemas import EvalPinRequest
 from server.security import (
     decode_operator_jwt,
     generate_api_key,
@@ -563,6 +565,72 @@ async def admin_complete_deletion_request(
         "completed_at": (
             ticket.completed_at.isoformat() if ticket.completed_at else None
         ),
+    }
+
+
+@admin_router.post("/voices/{voice_db_id}/eval-pin")
+async def admin_pin_voice_eval(
+    voice_db_id: uuid.UUID,
+    body: Annotated[EvalPinRequest, Body()],
+    op = Depends(_current_operator),
+    session: Annotated[AsyncSession, Depends(get_session)] = ...,
+):
+    """Pin an eval result onto the voice (ADR-12).
+
+    The payload body matches the `voices.eval_metrics` blob shape — see
+    docs/decisions/2026-05-28-eval-pin.md §4. Idempotent (overwrites).
+    Pinning a purged voice is a no-op; pinning a frozen/deleted voice
+    is allowed (operator may want a final pre-purge eval on record).
+
+    The endpoint accepts unknown extra keys (forward-compat with newer
+    eval harnesses). Pydantic strict validation only enforces the
+    required envelope: schema_version, evaluated_at, test_set, metrics.
+    """
+    repo = VoiceRepo(session, uuid.uuid4())
+    # Convert the validated Pydantic model back to a plain dict for
+    # the JSONB column. mode="json" produces stable JSON-serializable
+    # primitives (strings for datetimes, etc.) so the blob round-trips
+    # identically across re-reads.
+    payload = body.model_dump(mode="json", exclude_none=False)
+    try:
+        voice = await repo.pin_eval(voice_db_id, payload=payload)
+    except ValueError as e:
+        # Required-key violations from the repo's app-layer guard.
+        # Pydantic catches the envelope; the repo catches the
+        # `metrics` empty-dict edge case.
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, detail=str(e),
+        ) from e
+    _voice_or_404(voice, voice_db_id)
+    if voice.purged_at is not None:
+        # repo.pin_eval is a no-op on tombstones; surface the state
+        # explicitly so an operator script doesn't silently believe
+        # the pin succeeded.
+        raise HTTPException(
+            status.HTTP_410_GONE,
+            detail=f"voice id='{voice_db_id}' is purged; cannot pin eval",
+        )
+    await AuditRepo(session).record(
+        actor_type="operator",
+        actor_id=op.id,
+        actor_label=op.email,
+        action="voice.eval_pin",
+        result="success",
+        tenant_id=voice.owner_tenant_id,
+        target_type="voice",
+        target_id=str(voice.id),
+        payload={
+            "voice_slug": voice.voice_id,
+            "schema_version": body.schema_version,
+            "evaluated_at": body.evaluated_at,
+            "test_set_slug": body.test_set.slug,
+            "metric_names": sorted(body.metrics.keys()),
+        },
+    )
+    await session.commit()
+    return {
+        "voice_id": voice.voice_id,
+        "eval_metrics": voice.eval_metrics,
     }
 
 

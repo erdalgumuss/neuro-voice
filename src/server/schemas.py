@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -214,6 +214,12 @@ class VoicePublic(BaseModel):
     ] = "active"
     frozen_reason: str | None = None
     purge_after_at: str | None = None
+    # ADR-12 — eval pin payload. NULL until an operator pins an eval
+    # result via POST /admin/voices/{id}/eval-pin. Shape documented in
+    # docs/decisions/2026-05-28-eval-pin.md §4. Integrators can read
+    # `eval_metrics.metrics.whisper_wer.score` etc. to classify voices
+    # by quality without making opaque tier promises.
+    eval_metrics: dict[str, Any] | None = None
     created_at: str
     created_by: str
     # Vendor-parity metadata fields:
@@ -529,5 +535,60 @@ class VoicePurgeRequest(BaseModel):
     pass `confirm=True` for the route to actually scrub the row."""
     confirm: bool = False
     notes: str | None = Field(default=None, max_length=2048)
+
+
+# --------------------------------------------------------------------------- #
+# Eval pin (ADR-12)
+# --------------------------------------------------------------------------- #
+class EvalMetricEntry(BaseModel):
+    """One metric's stamped result on a voice. `direction` mirrors
+    MetricResult.direction in the eval harness so SDK clients can
+    sort / compare without re-deriving sign."""
+    model_config = ConfigDict(extra="allow")
+
+    score: float
+    direction: Literal["higher", "lower"]
+    n: int | None = None
+    p95: float | None = None
+
+
+class EvalPinTestSet(BaseModel):
+    slug: str
+    version: int
+    sentence_count: int
+
+
+class EvalPinModel(BaseModel):
+    """Reproducibility shape — which engine + adapter + frontend pack
+    produced the audio that was scored. NULL when unknown / not
+    applicable. Forward-shape; pinning workflows fill what they know."""
+    model_config = ConfigDict(extra="allow", protected_namespaces=())
+
+    voxcpm_version: str | None = None
+    lora_adapter_uri: str | None = None
+    lora_adapter_sha256: str | None = None
+    frontend_pack_id: str | None = None
+    lexicon_id: str | None = None
+
+
+class EvalPinRequest(BaseModel):
+    """Operator-side body for POST /admin/voices/{voice_db_id}/eval-pin.
+
+    Full shape documented in docs/decisions/2026-05-28-eval-pin.md §4.
+    `schema_version=1` in v0; future metric additions bump it. Unknown
+    keys are accepted (`extra="allow"`) so frontier metrics from a
+    newer eval harness can pin against an older server without
+    coordination.
+    """
+    model_config = ConfigDict(extra="allow")
+
+    schema_version: int = Field(ge=1)
+    evaluated_at: str
+    test_set: EvalPinTestSet
+    model: EvalPinModel | None = None
+    metrics: dict[str, EvalMetricEntry] = Field(min_length=1)
+    report_uri: str | None = None
+    operator_id: str | None = None
+    notes: str | None = Field(default=None, max_length=4096)
 
 

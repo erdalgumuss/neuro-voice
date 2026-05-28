@@ -89,6 +89,15 @@ client = [
     "rich>=13.0",
     "websockets>=13",
 ]
+# ADR-12 — eval harness backends. Opt-in; not pulled by default so
+# the gateway / worker minimum install stays slim.
+# `transformers` (used for WavLM-base-plus-sv SECS) is in main deps.
+# UTMOSv2 is git-only — install separately with:
+#     pip install git+https://github.com/sarulab-speech/UTMOSv2.git
+eval = [
+    "openai-whisper>=20240930",   # Whisper-large-v3 WER + CER backend
+    "jiwer>=3.0",                  # WER / CER computation
+]
 
 [project.scripts]
 neurovoice-server = "server.main:run"
