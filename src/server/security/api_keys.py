@@ -1,10 +1,11 @@
-"""API key generation + parsing — format anchored in
-docs/architecture/auth-multi-tenant.md §1.1:
+"""API key generation + parsing.
 
-    nqai_<env>_<14-prefix>_<40-secret>
-       │       │              └─ base62 random, ~238 bits entropy
-       │       └─ base62 random, DB lookup index
-       └─ environment: prod | staging | dev
+Canonical shape:
+
+    nv_<env>_<14-prefix>_<40-secret>
+     │     │              └─ base62 random, ~238 bits entropy
+     │     └─ base62 random, DB lookup index
+     └─ environment: prod | staging | dev
 """
 
 from __future__ import annotations
@@ -23,8 +24,8 @@ _ALPHABET = string.ascii_letters + string.digits  # base62, no padding
 PREFIX_LEN = 14
 SECRET_LEN = 40
 
-KEY_PREFIX_REGEX = re.compile(r"^nqai_(prod|staging|dev)_[a-zA-Z0-9]{14}$")
-KEY_FULL_REGEX = re.compile(r"^nqai_(prod|staging|dev)_[a-zA-Z0-9]{14}_[a-zA-Z0-9]{40}$")
+KEY_PREFIX_REGEX = re.compile(r"^nv_(prod|staging|dev)_[a-zA-Z0-9]{14}$")
+KEY_FULL_REGEX = re.compile(r"^nv_(prod|staging|dev)_[a-zA-Z0-9]{14}_[a-zA-Z0-9]{40}$")
 
 
 class APIKeyFormatError(ValueError):
@@ -34,7 +35,7 @@ class APIKeyFormatError(ValueError):
 @dataclass(frozen=True)
 class ParsedApiKey:
     environment: Environment
-    prefix: str        # "nqai_<env>_<14>"
+    prefix: str        # "nv_<env>_<14>"
     secret: str        # 40-char random
 
 
@@ -53,8 +54,8 @@ def generate_api_key(environment: Environment = "prod") -> tuple[str, str, str]:
         raise ValueError(f"environment must be prod|staging|dev, got {environment!r}")
     prefix_random = _rand_base62(PREFIX_LEN)
     secret = _rand_base62(SECRET_LEN)
-    full_key = f"nqai_{environment}_{prefix_random}_{secret}"
-    prefix = f"nqai_{environment}_{prefix_random}"
+    full_key = f"nv_{environment}_{prefix_random}_{secret}"
+    prefix = f"nv_{environment}_{prefix_random}"
     return full_key, prefix, hash_secret(secret)
 
 
@@ -67,14 +68,14 @@ def parse_api_key(token: str) -> ParsedApiKey:
     if not token or not isinstance(token, str):
         raise APIKeyFormatError("empty token")
     if not KEY_FULL_REGEX.match(token):
-        raise APIKeyFormatError("token does not match nqai_<env>_<14>_<40> format")
-    # parts[0]="nqai", parts[1]=env, parts[2]=prefix_random, parts[3]=secret
+        raise APIKeyFormatError("token does not match nv_<env>_<14>_<40> format")
+    # parts[0]="nv", parts[1]=env, parts[2]=prefix_random, parts[3]=secret
     parts = token.split("_")
     if len(parts) != 4:
         raise APIKeyFormatError("token must contain exactly three underscores")
     _, env, prefix_random, secret = parts
     return ParsedApiKey(
         environment=env,  # type: ignore[arg-type]
-        prefix=f"nqai_{env}_{prefix_random}",
+        prefix=f"nv_{env}_{prefix_random}",
         secret=secret,
     )

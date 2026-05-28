@@ -3,7 +3,7 @@
 Auth model:
     POST /admin/auth/login           email + password → set HttpOnly cookies
     POST /admin/auth/logout          clear cookies
-    POST /admin/auth/refresh         refresh access token (TODO Faz D family)
+    POST /admin/auth/refresh         refresh access token (TODO  family)
 
     GET  /admin                      dashboard (HTMX-rendered)
     GET  /admin/tenants              list + create form (HTML)
@@ -57,12 +57,12 @@ templates = Jinja2Templates(directory=str(_TEMPLATE_DIR))
 
 admin_router = APIRouter(prefix="/admin", tags=["admin"])
 
-ACCESS_COOKIE = "nqai_admin_access"
-REFRESH_COOKIE = "nqai_admin_refresh"
-# NQAI_COOKIE_SECURE=false only in tests / local HTTP dev. Production stays on.
+ACCESS_COOKIE = "nv_admin_access"
+REFRESH_COOKIE = "nv_admin_refresh"
+# NEUROVOICE_COOKIE_SECURE=false only in tests / local HTTP dev. Production stays on.
 COOKIE_KWARGS = dict(
     httponly=True,
-    secure=os.environ.get("NQAI_COOKIE_SECURE", "true").lower() == "true",
+    secure=os.environ.get("NEUROVOICE_COOKIE_SECURE", "true").lower() == "true",
     samesite="strict",
 )
 
@@ -71,13 +71,13 @@ COOKIE_KWARGS = dict(
 # Operator auth dependency
 # --------------------------------------------------------------------------- #
 async def _current_operator(
-    nqai_admin_access: Annotated[str | None, Cookie()] = None,
+    nv_admin_access: Annotated[str | None, Cookie()] = None,
     session: Annotated[AsyncSession, Depends(get_session)] = ...,
 ):
-    if not nqai_admin_access:
+    if not nv_admin_access:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "operator login required")
     try:
-        claims = decode_operator_jwt(nqai_admin_access, expected_type="access")
+        claims = decode_operator_jwt(nv_admin_access, expected_type="access")
     except JWTError as e:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "session invalid") from e
     op = await OperatorRepo(session).get(claims.operator_id)
@@ -287,14 +287,14 @@ async def revoke_api_key(
 @admin_router.get("/", response_class=HTMLResponse)
 async def dashboard(
     request: Request,
-    nqai_admin_access: Annotated[str | None, Cookie()] = None,
+    nv_admin_access: Annotated[str | None, Cookie()] = None,
 ):
     template_name = "dashboard.html"
-    if not nqai_admin_access:
+    if not nv_admin_access:
         template_name = "login.html"
     else:
         try:
-            decode_operator_jwt(nqai_admin_access, expected_type="access")
+            decode_operator_jwt(nv_admin_access, expected_type="access")
         except JWTError:
             template_name = "login.html"
     return templates.TemplateResponse(request, template_name)
@@ -306,7 +306,7 @@ async def usage_summary(
     op = Depends(_current_operator),
     session: Annotated[AsyncSession, Depends(get_session)] = ...,
 ):
-    """Per-tenant aggregate. Inexpensive at the current scale; Faz D
+    """Per-tenant aggregate. Inexpensive at the current scale; 
     materialized view if needed."""
     tenants = await TenantRepo(session).list_active()
     out = {}
