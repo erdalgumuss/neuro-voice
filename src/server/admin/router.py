@@ -16,10 +16,13 @@ Auth model:
 
 from __future__ import annotations
 
+import logging
 import os
 import uuid
 from pathlib import Path
 from typing import Annotated
+
+logger = logging.getLogger("neurovoice.admin")
 
 from fastapi import (
     APIRouter,
